@@ -90,6 +90,7 @@ const AUTH_CLIENT_ID = "qm-portal";
 
 export const AUTH_BROKER_ENV_KEYS = [
   "AUTH_BROKER_UPSTREAM",
+  "AUTH_BROKER_SERVICE_HOST",
   "AUTH_BROKER_PREFIX",
   "OIDC_CLIENT_ID",
   "OIDC_ISSUER",
@@ -110,8 +111,10 @@ export function brokerWiring(
   const internal = o.authBaseUrl.replace(/\/$/, "");
   const issuer = `${base}${AUTH_PATH_PREFIX}`;
   if (service === "portal") {
+    const serviceHost = new URL(internal).hostname;
     return {
       AUTH_BROKER_UPSTREAM: internal,
+      AUTH_BROKER_SERVICE_HOST: serviceHost,
       AUTH_BROKER_PREFIX: AUTH_PATH_PREFIX,
       OIDC_CLIENT_ID: AUTH_CLIENT_ID,
       OIDC_ISSUER: issuer,
@@ -230,6 +233,7 @@ const CATALOG: Record<ServiceName, ServiceDef> = {
         "OIDC_SCOPES",
         "OIDC_PRINCIPAL_CLAIM",
         "AUTH_BROKER_UPSTREAM",
+        "AUTH_BROKER_SERVICE_HOST",
         "AUTH_BROKER_PREFIX",
       ],
       deployFlags: ["--ha=false"],

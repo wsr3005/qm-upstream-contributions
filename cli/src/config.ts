@@ -13,6 +13,7 @@ import {
   type DeclaredServiceName,
   type ServiceName,
 } from "./services.ts";
+import { validHttpsOidcUrl, validOidcServerEndpoint, type OidcServerEndpointKind } from "./oidc-url.ts";
 import { hostingProviderChoices, isTarget, type Target } from "./providers.ts";
 import { envNum, isEnvVarName, isMissingOrPlaceholder } from "./util.ts";
 
@@ -805,11 +806,31 @@ export function validatePortalTrust(config: QmConfig, path = "config", secrets?:
   if (issuer !== "https://slack.com" && isMissingOrPlaceholder(jwksUri)) {
     throw new CliError(`${path}: portal requires env.portal.OIDC_JWKS_URI when using a non-Slack OIDC issuer`);
   }
-  if (jwksUri !== undefined) {
-    try {
-      if (new URL(jwksUri).protocol !== "https:") throw new Error("protocol");
-    } catch {
-      throw new CliError(`${path}: env.portal.OIDC_JWKS_URI must be a non-placeholder HTTPS URL`);
+  const configuredServiceHost = env.AUTH_BROKER_SERVICE_HOST?.trim().toLowerCase() ?? "";
+  const declaredServiceHost = config.plugins.some((plugin) => plugin.name.toLowerCase() === configuredServiceHost)
+    ? configuredServiceHost
+    : "";
+  const broker = env.AUTH_BROKER_UPSTREAM
+    ? { upstream: env.AUTH_BROKER_UPSTREAM, ...(declaredServiceHost ? { declaredServiceHost } : {}) }
+    : null;
+  if (env.OIDC_AUTH_ENDPOINT !== undefined && !validHttpsOidcUrl(env.OIDC_AUTH_ENDPOINT)) {
+    throw new CliError(`${path}: env.portal.OIDC_AUTH_ENDPOINT must be an HTTPS URL without credentials`);
+  }
+  const endpoints: Array<[OidcServerEndpointKind, string | undefined]> = [
+    ["token", env.OIDC_TOKEN_ENDPOINT],
+    ["userinfo", env.OIDC_USERINFO_ENDPOINT],
+    ["jwks", jwksUri],
+  ];
+  const endpointKeys: Record<OidcServerEndpointKind, string> = {
+    token: "OIDC_TOKEN_ENDPOINT",
+    userinfo: "OIDC_USERINFO_ENDPOINT",
+    jwks: "OIDC_JWKS_URI",
+  };
+  for (const [kind, endpoint] of endpoints) {
+    if (endpoint !== undefined && !validOidcServerEndpoint(endpoint, kind, broker)) {
+      throw new CliError(
+        `${path}: env.portal.${endpointKeys[kind]} must be a non-placeholder HTTPS URL without credentials or the exact service-local AUTH_BROKER_UPSTREAM endpoint`,
+      );
     }
   }
   if (env.OIDC_CLIENT_ID !== undefined && isMissingOrPlaceholder(env.OIDC_CLIENT_ID)) {

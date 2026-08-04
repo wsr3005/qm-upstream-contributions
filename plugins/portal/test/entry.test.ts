@@ -161,6 +161,29 @@ test("production accepts cleartext OIDC only on private-network hosts, and only 
   const wired = boot(brokerEnv);
   assert.equal(wired.status, 0, wired.stderr);
 
+  const dockerWired = boot({
+    ...brokerEnv,
+    OIDC_TOKEN_ENDPOINT: "http://dingtalk:8080/token",
+    OIDC_USERINFO_ENDPOINT: "http://dingtalk:8080/userinfo",
+    OIDC_JWKS_URI: "http://dingtalk:8080/.well-known/jwks.json",
+    AUTH_BROKER_UPSTREAM: "http://dingtalk:8080",
+    AUTH_BROKER_SERVICE_HOST: "dingtalk",
+  });
+  assert.equal(dockerWired.status, 0, dockerWired.stderr);
+
+  for (const host of ["10.0.0.5", "[fd00::1]", "auth.local"]) {
+    const origin = `http://${host}:8080`;
+    const privateWired = boot({
+      ...brokerEnv,
+      OIDC_AUTH_ENDPOINT: "HTTPS://AGENT.EXAMPLE.COM/idp/authorize",
+      OIDC_TOKEN_ENDPOINT: `${origin}/token`,
+      OIDC_USERINFO_ENDPOINT: `${origin}/userinfo`,
+      OIDC_JWKS_URI: `${origin}/.well-known/jwks.json`,
+      AUTH_BROKER_UPSTREAM: origin,
+    });
+    assert.equal(privateWired.status, 0, privateWired.stderr);
+  }
+
   for (const [override, pattern] of [
     [
       { OIDC_TOKEN_ENDPOINT: "http://tokens.example.com/token" },
@@ -169,6 +192,48 @@ test("production accepts cleartext OIDC only on private-network hosts, and only 
     [{ OIDC_JWKS_URI: "http://10.0.0.5/keys" }, /OIDC endpoint must be https unless it is the built-in broker/],
     [{ OIDC_AUTH_ENDPOINT: "http://agent.example.com/idp/authorize" }, /OIDC_AUTH_ENDPOINT must be https/],
     [{ AUTH_BROKER_UPSTREAM: "https://auth.example.com" }, /AUTH_BROKER_UPSTREAM must address a private-network host/],
+    [
+      {
+        AUTH_BROKER_UPSTREAM: "http://ws:8080",
+        AUTH_BROKER_SERVICE_HOST: "dingtalk",
+        OIDC_TOKEN_ENDPOINT: "http://ws:8080/token",
+        OIDC_USERINFO_ENDPOINT: "http://ws:8080/userinfo",
+        OIDC_JWKS_URI: "http://ws:8080/.well-known/jwks.json",
+      },
+      /AUTH_BROKER_UPSTREAM must address a private-network host/,
+    ],
+    [
+      { OIDC_JWKS_URI: "http://acme-auth.internal:8080/token" },
+      /OIDC endpoint must be https unless it is the built-in broker/,
+    ],
+    [
+      { OIDC_JWKS_URI: "http://acme-auth.internal:8080/.well-known/jwks.json?key=1" },
+      /OIDC endpoint must be https unless it is the built-in broker/,
+    ],
+    [
+      { OIDC_TOKEN_ENDPOINT: "http://acme-auth.internal:8080/admin" },
+      /OIDC endpoint must be https unless it is the built-in broker/,
+    ],
+    [
+      { OIDC_USERINFO_ENDPOINT: "http://acme-auth.internal:8080/userinfo?leak=1" },
+      /OIDC endpoint must be https unless it is the built-in broker/,
+    ],
+    [
+      { OIDC_TOKEN_ENDPOINT: "https://attacker.example/collect" },
+      /OIDC endpoint must be https unless it is the built-in broker/,
+    ],
+    [
+      { OIDC_USERINFO_ENDPOINT: "https://attacker.example/collect" },
+      /OIDC endpoint must be https unless it is the built-in broker/,
+    ],
+    [
+      { OIDC_JWKS_URI: "https://attacker.example/keys" },
+      /OIDC endpoint must be https unless it is the built-in broker/,
+    ],
+    [
+      { OIDC_TOKEN_ENDPOINT: "https://user:pass@auth.example.com/token" },
+      /OIDC endpoint must be https unless it is the built-in broker/,
+    ],
     [
       { OIDC_AUTH_ENDPOINT: "https://elsewhere.example.com/idp/authorize" },
       /OIDC_AUTH_ENDPOINT must be https:\/\/agent\.example\.com\/idp\/authorize/,

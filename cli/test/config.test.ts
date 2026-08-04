@@ -124,6 +124,145 @@ test("env (per-service) and imageOverrides validate by service name", () => {
   });
 });
 
+test("a private OIDC broker may serve JWKS over its matching service-local HTTP origin", () => {
+  for (const upstream of ["http://dingtalk:8080", "http://dingtalk.acme.internal:8080", "http://dingtalk.flycast"]) {
+    withConfig(
+      {
+        services: ["core", "web-ui", "portal"],
+        plugins: [{ name: "dingtalk" }],
+        env: {
+          portal: {
+            AUTH_BROKER_UPSTREAM: upstream,
+            AUTH_BROKER_SERVICE_HOST: "dingtalk",
+            OIDC_CLIENT_ID: "client",
+            OIDC_ISSUER: "https://agent.acme.example/idp",
+            OIDC_JWKS_URI: `${upstream}/.well-known/jwks.json`,
+            PORTAL_EXPECTED_TEAM_ID: "corp-a",
+          },
+        },
+      },
+      ({ path }) => assert.doesNotThrow(() => loadConfigAt(path)),
+    );
+  }
+});
+
+test("an HTTP OIDC JWKS endpoint must match a service-local broker origin", () => {
+  for (const [upstream, jwks] of [
+    ["http://auth.example.com", "http://auth.example.com/.well-known/jwks.json"],
+    ["http://dingtalk:8080", "http://other:8080/.well-known/jwks.json"],
+  ]) {
+    withConfig(
+      {
+        services: ["core", "web-ui", "portal"],
+        env: {
+          portal: {
+            AUTH_BROKER_UPSTREAM: upstream,
+            OIDC_CLIENT_ID: "client",
+            OIDC_ISSUER: "https://agent.acme.example/idp",
+            OIDC_JWKS_URI: jwks,
+            PORTAL_EXPECTED_TEAM_ID: "corp-a",
+          },
+        },
+      },
+      ({ path }) => assert.throws(() => loadConfigAt(path), /service-local AUTH_BROKER_UPSTREAM endpoint/),
+    );
+  }
+});
+
+test("a Docker OIDC broker must name a declared plugin and use the exact JWKS endpoint", () => {
+  for (const portal of [
+    {
+      AUTH_BROKER_UPSTREAM: "http://ws:8080",
+      AUTH_BROKER_SERVICE_HOST: "ws",
+      OIDC_JWKS_URI: "http://ws:8080/.well-known/jwks.json",
+    },
+    {
+      AUTH_BROKER_UPSTREAM: "http://dingtalk:8080",
+      AUTH_BROKER_SERVICE_HOST: "dingtalk",
+      OIDC_JWKS_URI: "http://dingtalk:8080/token",
+    },
+    {
+      AUTH_BROKER_UPSTREAM: "http://dingtalk:8080",
+      AUTH_BROKER_SERVICE_HOST: "dingtalk",
+      OIDC_JWKS_URI: "http://dingtalk:8080/.well-known/jwks.json?key=1",
+    },
+  ]) {
+    withConfig(
+      {
+        services: ["core", "web-ui", "portal"],
+        plugins: [{ name: "dingtalk" }],
+        env: {
+          portal: {
+            ...portal,
+            OIDC_CLIENT_ID: "client",
+            OIDC_ISSUER: "https://agent.acme.example/idp",
+            PORTAL_EXPECTED_TEAM_ID: "corp-a",
+          },
+        },
+      },
+      ({ path }) => assert.throws(() => loadConfigAt(path), /service-local AUTH_BROKER_UPSTREAM endpoint/),
+    );
+  }
+});
+
+test("CLI and Portal share exact server-side OIDC endpoint trust rules", () => {
+  const accepted = ["http://10.0.0.5:8080", "http://[fd00::1]:8080", "http://auth.local:8080"];
+  for (const upstream of accepted) {
+    withConfig(
+      {
+        services: ["core", "web-ui", "portal"],
+        env: {
+          portal: {
+            AUTH_BROKER_UPSTREAM: upstream,
+            OIDC_CLIENT_ID: "client",
+            OIDC_ISSUER: "https://agent.acme.example/idp",
+            OIDC_AUTH_ENDPOINT: "HTTPS://AGENT.ACME.EXAMPLE/idp/authorize",
+            OIDC_TOKEN_ENDPOINT: `${upstream}/token`,
+            OIDC_USERINFO_ENDPOINT: `${upstream}/userinfo`,
+            OIDC_JWKS_URI: `${upstream}/.well-known/jwks.json`,
+            PORTAL_EXPECTED_TEAM_ID: "corp-a",
+          },
+        },
+      },
+      ({ path }) => assert.doesNotThrow(() => loadConfigAt(path)),
+    );
+  }
+
+  for (const override of [
+    { OIDC_TOKEN_ENDPOINT: "http://dingtalk:8080/admin" },
+    { OIDC_USERINFO_ENDPOINT: "http://dingtalk:8080/userinfo?leak=1" },
+    { OIDC_TOKEN_ENDPOINT: "http://user:pass@dingtalk:8080/token" },
+    { OIDC_TOKEN_ENDPOINT: "https://attacker.example/collect" },
+    { OIDC_USERINFO_ENDPOINT: "https://attacker.example/collect" },
+    { OIDC_JWKS_URI: "https://attacker.example/keys" },
+    { OIDC_TOKEN_ENDPOINT: "https://user:pass@auth.example.com/token" },
+    { OIDC_AUTH_ENDPOINT: "https://user:pass@auth.example.com/authorize" },
+  ]) {
+    withConfig(
+      {
+        services: ["core", "web-ui", "portal"],
+        plugins: [{ name: "dingtalk" }],
+        env: {
+          portal: {
+            AUTH_BROKER_UPSTREAM: "http://dingtalk:8080",
+            AUTH_BROKER_SERVICE_HOST: "dingtalk",
+            OIDC_CLIENT_ID: "client",
+            OIDC_ISSUER: "https://agent.acme.example/idp",
+            OIDC_AUTH_ENDPOINT: "https://agent.acme.example/idp/authorize",
+            OIDC_TOKEN_ENDPOINT: "http://dingtalk:8080/token",
+            OIDC_USERINFO_ENDPOINT: "http://dingtalk:8080/userinfo",
+            OIDC_JWKS_URI: "http://dingtalk:8080/.well-known/jwks.json",
+            PORTAL_EXPECTED_TEAM_ID: "corp-a",
+            ...override,
+          },
+        },
+      },
+      ({ path }) =>
+        assert.throws(() => loadConfigAt(path), /HTTPS URL without credentials|service-local AUTH_BROKER_UPSTREAM/),
+    );
+  }
+});
+
 test("listen ports are managed consistently across deployment targets", () => {
   withConfig({ env: { core: { PORT: "9000" } } }, ({ path }) => {
     assert.throws(() => loadConfigAt(path), /env\.core\.PORT.*managed/);

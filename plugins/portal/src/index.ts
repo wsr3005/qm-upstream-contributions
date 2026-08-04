@@ -41,6 +41,7 @@ import { coreClaimStore, withinRateLimit } from "../../chassis/src/claims.ts";
 import { mintPortalIdentity, PORTAL_IDENTITY_HEADER } from "../../chassis/src/portal-identity.ts";
 import { errMessage } from "../../chassis/src/errors.ts";
 import { json, escapeHtml, serveEmojiFavicon } from "../../chassis/src/http.ts";
+import { brokerOrigin, sameOidcUrl, validHttpsOidcUrl, validOidcServerEndpoint } from "./oidc-url.ts";
 import {
   CORE_API_URL as CORE,
   CORE_ORG_ID as ORG,
@@ -133,6 +134,7 @@ const OIDC: OidcConfig = {
 const OIDC_JWKS_CONFIGURED = Boolean(process.env.OIDC_JWKS_URI?.trim());
 
 const AUTH_BROKER_UPSTREAM = (process.env.AUTH_BROKER_UPSTREAM ?? "").replace(/\/$/, "");
+const AUTH_BROKER_SERVICE_HOST = process.env.AUTH_BROKER_SERVICE_HOST?.trim().toLowerCase() ?? "";
 const AUTH_BROKER_PREFIX = (process.env.AUTH_BROKER_PREFIX ?? "/idp").replace(/\/$/, "");
 const BROKER_PUBLIC_ROUTES: ReadonlyArray<{ method: string; path: string }> = [
   { method: "GET", path: "/authorize" },
@@ -288,31 +290,8 @@ function isLocalPortalUrl(raw: string): boolean {
   }
 }
 
-function originOf(raw: string): string {
-  try {
-    return new URL(raw).origin;
-  } catch {
-    return "";
-  }
-}
-
 export function isPrivateNetworkUrl(raw: string): boolean {
-  let url: URL;
-  try {
-    url = new URL(raw);
-  } catch {
-    return false;
-  }
-  if (url.protocol !== "http:" && url.protocol !== "https:") return false;
-  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (host === "localhost" || host.endsWith(".localhost")) return true;
-  if (host.endsWith(".internal") || host.endsWith(".flycast") || host.endsWith(".local")) return true;
-  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host) || /^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
-  if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
-  if (/^172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
-  if (host === "::1" || host === "0:0:0:0:0:0:0:1") return true;
-  if (/^f[cd][0-9a-f]{2}:/.test(host)) return true;
-  return false;
+  return Boolean(brokerOrigin(raw));
 }
 
 export function isLoopbackAddress(address: string | null | undefined): boolean {
@@ -1267,26 +1246,36 @@ export function bootChecks(): void {
       problems.push("PORTAL_SESSION_SECRET must differ from CORE_SIGNING_SECRET");
     }
     if (!PUBLIC_URL.startsWith("https://")) problems.push("PORTAL_PUBLIC_URL must be https in production");
-    if (!OIDC.authEndpoint.startsWith("https://")) {
+    if (!validHttpsOidcUrl(OIDC.authEndpoint)) {
       problems.push(`OIDC_AUTH_ENDPOINT must be https — the browser is sent there: ${OIDC.authEndpoint}`);
     }
-    const brokerOrigin =
-      AUTH_BROKER_UPSTREAM && isPrivateNetworkUrl(AUTH_BROKER_UPSTREAM) ? originOf(AUTH_BROKER_UPSTREAM) : "";
-    for (const ep of [OIDC.tokenEndpoint, OIDC.userinfoEndpoint, OIDC.jwksUri]) {
-      if (!ep.startsWith("https://") && !(brokerOrigin && originOf(ep) === brokerOrigin)) {
-        problems.push(`OIDC endpoint must be https unless it is the built-in broker on the private network: ${ep}`);
+    const broker = AUTH_BROKER_UPSTREAM
+      ? {
+          upstream: AUTH_BROKER_UPSTREAM,
+          ...(AUTH_BROKER_SERVICE_HOST ? { declaredServiceHost: AUTH_BROKER_SERVICE_HOST } : {}),
+        }
+      : null;
+    for (const [kind, endpoint] of [
+      ["token", OIDC.tokenEndpoint],
+      ["userinfo", OIDC.userinfoEndpoint],
+      ["jwks", OIDC.jwksUri],
+    ] as const) {
+      if (!validOidcServerEndpoint(endpoint, kind, broker)) {
+        problems.push(
+          `OIDC endpoint must be https unless it is the built-in broker on the private network: ${endpoint}`,
+        );
       }
     }
     if (AUTH_BROKER_UPSTREAM) {
-      if (!isPrivateNetworkUrl(AUTH_BROKER_UPSTREAM)) {
+      if (!brokerOrigin(AUTH_BROKER_UPSTREAM, AUTH_BROKER_SERVICE_HOST)) {
         problems.push(
           "AUTH_BROKER_UPSTREAM must address a private-network host — the broker is never exposed directly",
         );
       }
-      if (OIDC.issuer !== `${PUBLIC_URL}${AUTH_BROKER_PREFIX}`) {
+      if (!sameOidcUrl(OIDC.issuer, `${PUBLIC_URL}${AUTH_BROKER_PREFIX}`)) {
         problems.push(`OIDC_ISSUER must be ${PUBLIC_URL}${AUTH_BROKER_PREFIX} when the built-in broker is wired`);
       }
-      if (OIDC.authEndpoint !== `${PUBLIC_URL}${AUTH_BROKER_PREFIX}/authorize`) {
+      if (!sameOidcUrl(OIDC.authEndpoint, `${PUBLIC_URL}${AUTH_BROKER_PREFIX}/authorize`)) {
         problems.push(
           `OIDC_AUTH_ENDPOINT must be ${PUBLIC_URL}${AUTH_BROKER_PREFIX}/authorize when the built-in broker is wired`,
         );
