@@ -194,7 +194,10 @@ export interface DeliveryProvenance {
   sourceSessionId?: string;
   sourceUserSeq?: number;
   sourceAssistantEntrySeq?: number;
+  notice?: { code: DeliveryNoticeCode };
 }
+
+export type DeliveryNoticeCode = "background_approval_required";
 
 export interface CronSchedule {
   cron?: string;
@@ -252,7 +255,36 @@ export interface Delivery {
   recipientThreadRef?: string;
   deliverLatencyMs?: number;
   slackApiMs?: number;
+  claim?: DeliveryClaim;
+  failure?: DeliveryFailure;
 }
+
+export interface DeliveryClaim {
+  token: string;
+  expiresAt: number;
+}
+
+export const DELIVERY_FAILURE_CODES = [
+  "recipient_unavailable",
+  "recipient_unauthorized",
+  "destination_unavailable",
+  "content_rejected",
+  "platform_rejected",
+] as const;
+
+export type DeliveryFailureCode = (typeof DELIVERY_FAILURE_CODES)[number];
+
+export interface DeliveryFailure {
+  at: number;
+  code: DeliveryFailureCode;
+}
+
+export function isDeliveryFailureCode(value: unknown): value is DeliveryFailureCode {
+  return typeof value === "string" && (DELIVERY_FAILURE_CODES as readonly string[]).includes(value);
+}
+
+export type DeliveryResolution =
+  { kind: "delivered"; at: number } | { kind: "failed"; at: number; code: DeliveryFailureCode };
 
 export interface SurfaceContextQuery {
   conversationTarget?: string;

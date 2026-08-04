@@ -236,4 +236,60 @@ export async function exerciseDeliveryStore(store: DeliveryStore): Promise<void>
     "an expired claim re-surfaces (at-least-once)",
   );
   await store.ack(abandoned.id, 700);
+
+  const fenced = await store.enqueue({
+    destination: { type: "office", target: "member-a" },
+    text: "must stop when the recipient is no longer eligible",
+    idempotencyKey: "fire-fenced",
+  });
+  const firstClaims = await store.claimPending("office", 50);
+  assert.equal(firstClaims.length, 1);
+  const firstClaim = firstClaims[0]!;
+  assert.equal(firstClaim.id, fenced.id);
+  assert.ok(firstClaim.claim?.token);
+  assert.ok(firstClaim.claim?.expiresAt);
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  const secondClaim = (await store.claimPending("office", 60_000))[0]!;
+  assert.notEqual(secondClaim.claim?.token, firstClaim.claim?.token, "a new owner receives a new fencing token");
+  assert.equal(
+    await store.resolveClaim(firstClaim.id, firstClaim.claim!.token, {
+      kind: "delivered",
+      at: 800,
+    }),
+    "stale",
+    "an expired owner cannot acknowledge the new owner's claim",
+  );
+  assert.equal(
+    await store.renewClaim(firstClaim.id, firstClaim.claim!.token, 60_000),
+    false,
+    "an expired owner cannot renew the new owner's claim",
+  );
+  assert.equal(
+    await store.resolveClaim(secondClaim.id, secondClaim.claim!.token, {
+      kind: "failed",
+      at: 900,
+      code: "recipient_unauthorized",
+    }),
+    "resolved",
+    "the current owner can terminally fail an undeliverable destination",
+  );
+  assert.equal(
+    await store.resolveClaim(secondClaim.id, secondClaim.claim!.token, {
+      kind: "failed",
+      at: 901,
+      code: "recipient_unauthorized",
+    }),
+    "duplicate",
+    "a lost resolution response can be retried idempotently",
+  );
+  assert.deepEqual(await store.pending("office"), [], "a terminal failure leaves the delivery queue");
+  assert.deepEqual(await store.claimPending("office", 60_000), [], "a terminal failure cannot be reclaimed");
+  assert.deepEqual((await store.get(fenced.id))?.failure, { at: 900, code: "recipient_unauthorized" });
+  await store.ack(fenced.id, 1_000);
+  await store.ackByKey("fire-fenced", 1_001);
+  assert.equal(
+    (await store.get(fenced.id))?.deliveredAt,
+    null,
+    "legacy acknowledgements cannot reverse a terminal failure",
+  );
 }

@@ -106,7 +106,7 @@ export async function putAdminCronDestination(ctx: ApiCtx): Promise<void> {
     });
   }
   const next = destination === null ? undefined : destination;
-  const updated = await app.setCronDestination(id, next);
+  const updated = await app.setCronDestination(id, next, actor.id);
   await notifyOwnerOfCronEdit(app, {
     cron,
     editorId: actor.id,

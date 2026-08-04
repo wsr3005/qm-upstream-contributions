@@ -154,6 +154,10 @@ test("an admin can edit and clear a cron destination inside the administered sco
       ),
       "the admin edit is audited",
     );
+    assert.ok(
+      (await s.built.auditLog.events()).some((e) => e.action === "cron_retarget" && e.principalId === "admin-alice"),
+      "the shared cron audit records the administrator instead of the owner",
+    );
   } finally {
     await s.close();
   }

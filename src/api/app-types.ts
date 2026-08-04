@@ -53,6 +53,7 @@ import type {
 import type {
   Cron,
   Delivery,
+  DeliveryResolution,
   Destination,
   RecipientConsent,
   SurfaceContextQuery,
@@ -322,12 +323,18 @@ export interface App {
   getCron(id: string): Promise<Cron | null>;
   listCrons(): Promise<Cron[]>;
   listCronsForViewer(principalId: string): Promise<{ owned: Cron[]; visible: VisibleCron[] }>;
-  updateCron(id: string, patch: CronPatch): Promise<Cron | null>;
-  deleteCron(id: string): Promise<void>;
-  setCronEnabled(id: string, enabled: boolean): Promise<void>;
-  setCronDestination(id: string, destination: Destination | undefined): Promise<Cron | null>;
-  setCronRecipientConsent(id: string, recipientConsent: RecipientConsent): Promise<void>;
+  updateCron(id: string, patch: CronPatch, actorId: string): Promise<Cron | null>;
+  deleteCron(id: string, actorId: string): Promise<void>;
+  setCronEnabled(id: string, enabled: boolean, actorId: string): Promise<void>;
+  setCronDestination(id: string, destination: Destination | undefined, actorId: string): Promise<Cron | null>;
+  setCronRecipientConsent(id: string, recipientConsent: RecipientConsent, actorId: string): Promise<void>;
   pendingDeliveries(type: string, claimMs?: number): Promise<Delivery[]>;
+  renewDeliveryClaim(id: string, token: string, ttlMs: number): Promise<boolean>;
+  resolveDeliveryClaim(
+    id: string,
+    token: string,
+    resolution: DeliveryResolution,
+  ): Promise<"resolved" | "duplicate" | "stale">;
   enqueueDelivery(input: { destination: Destination; text: string; idempotencyKey: string }): Promise<void>;
   createContextRequest(source: string, query: SurfaceContextQuery): Promise<SurfaceContextRequest>;
   getContextRequest(id: string): Promise<SurfaceContextRequest | null>;

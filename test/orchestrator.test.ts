@@ -1432,7 +1432,7 @@ test("finish_silently on a poll fire wins over a coexisting collected approval",
   assert.equal(res.pendingApprovals, undefined, "no approval prompt is surfaced on a silenced poll fire");
 });
 
-test("a poll fire that PAUSED on a gated command is never silenced — the approval persists", async () => {
+test("a poll fire that pauses on a gated command fails without leaving a resumable approval", async () => {
   const { app } = freshApp();
   const res = await app.turn({
     surface: "cron",
@@ -1441,12 +1441,13 @@ test("a poll fire that PAUSED on a gated command is never silenced — the appro
     text: "!finish-silent-paused",
     triggered: true,
   });
-  assert.equal(
-    res.status,
-    "pending_approval",
-    "a paused turn outranks explicit silence — silencing it would starve the cron with no trace",
+  assert.equal(res.status, "pending_approval", "the scheduler still receives an explicit approval-required failure");
+  assert.equal(res.pendingApprovals, undefined, "an automated execution never exposes a resumable approval");
+  assert.deepEqual(
+    await app.listSessionApprovals(res.sessionId!, internalActor.externalId),
+    [],
+    "an automated execution never leaves a durable approval behind",
   );
-  assert.ok(res.pendingApprovals?.length, "the approval stays durable so it can be approved and the run resumed");
 });
 
 test("an unprompted acknowledgement gets an emoji reaction, not a reply (no run, no writes)", async () => {
@@ -2217,7 +2218,7 @@ test("Auto does not let one quarantined thread file poison later attachments", a
   assert.doesNotMatch(JSON.stringify(classifier?.request), /ignore previous instructions/);
 });
 
-test("an approved automation replay preserves and re-screens its external event provenance", async () => {
+test("an automated approval fails closed without replay and preserves its external screening provenance", async () => {
   const built = freshApp();
   built.config.setCommandPolicy(scopeId("org", "default-org"), {
     mode: "denylist",
@@ -2231,25 +2232,16 @@ test("an approved automation replay preserves and re-screens its external event 
     }),
   );
   assert.equal(first.status, "pending_approval");
-  const pending = await built.app.getApproval(first.pendingApprovals![0]!.requestId);
-  assert.ok(pending?.request);
-  assert.equal(pending.request.triggered, true);
-  assert.match(pending.request.securityScreenData ?? "", /benign external marker/);
-
-  const resumed = await built.app.turn(
-    dm("!run printf replay-ok", {
-      surface: "monitor",
-      triggered: true,
-      securityScreenData: '{"event":"benign external marker"}',
-      approval: { requestId: first.pendingApprovals![0]!.requestId, approved: true, scope: "once" },
-    }),
+  assert.equal(first.pendingApprovals, undefined);
+  assert.deepEqual(
+    await built.app.listSessionApprovals(first.sessionId!, internalActor.externalId),
+    [],
+    "the stopped automation leaves no durable approval that could resume it",
   );
-  assert.equal(resumed.status, "ok");
-  assert.match(resumed.reply ?? "", /replay-ok/);
-  const screens = (await built.sessions.listLlmRequests(resumed.sessionId!)).filter(
+  const screens = (await built.sessions.listLlmRequests(first.sessionId!)).filter(
     (rec) => rec.model === "mock-security",
   );
-  assert.equal(screens.length, 2);
+  assert.equal(screens.length, 1);
   assert.ok(screens.every((rec) => JSON.stringify(rec.request).includes("benign external marker")));
 });
 

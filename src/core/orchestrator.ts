@@ -2677,6 +2677,8 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         const sourceAssistantEntrySeq = [...emittedEntries].reverse().find((e) => e.type === "assistant")?.seq;
         if (isPollFire && result.silent && result.pausedOnApproval !== true) {
           finalResult = { status: "silent", sessionId: session.id };
+        } else if (result.pendingApprovals?.length && automatedTurn) {
+          finalResult = { status: "pending_approval", sessionId: session.id };
         } else if (result.pendingApprovals?.length) {
           const approvals: PendingApproval[] = [];
           const grantModesField =
@@ -2773,6 +2775,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           };
         }
         if (err instanceof NeedsApproval) {
+          if (automatedTurn) return { status: "pending_approval", sessionId: session.id };
           const requestId = commandApprovalId(session.id, err.command);
           const grantModesField =
             resolution.approvalGrantModes.session && resolution.approvalGrantModes.always

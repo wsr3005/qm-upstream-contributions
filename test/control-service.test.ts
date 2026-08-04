@@ -407,8 +407,30 @@ test("authority follows the person, not the conversation: members administer a c
   const disabled = await control.setCronEnabled(made.cron.id, false, dmClaims);
   assert.ok(disabled.ok, JSON.stringify(disabled));
 
-  const memberFromDm = await control.deleteCron(made.cron.id, claims("U2", scopeId("personal", "U2")));
+  const memberClaims = claims("U2", scopeId("personal", "U2"));
+  const memberPatch = await control.patchCron(made.cron.id, { title: "member update" }, memberClaims);
+  assert.ok(memberPatch.ok, JSON.stringify(memberPatch));
+  const memberEnable = await control.setCronEnabled(made.cron.id, true, memberClaims);
+  assert.ok(memberEnable.ok, JSON.stringify(memberEnable));
+  const memberRetarget = await control.retargetCron(made.cron.id, ROOM.key, memberClaims);
+  assert.ok(memberRetarget.ok, JSON.stringify(memberRetarget));
+  const memberFromDm = await control.deleteCron(made.cron.id, memberClaims);
   assert.ok(memberFromDm.ok, "a current member administers the team cron from anywhere");
+  const memberAudit = (await built.auditLog.events()).filter(
+    (event) =>
+      event.resource === made.cron.id &&
+      ["cron_update", "cron_enable", "cron_retarget", "cron_delete"].includes(event.action),
+  );
+  assert.deepEqual(
+    memberAudit.map((event) => [event.action, event.principalId]),
+    [
+      ["cron_update", "U2"],
+      ["cron_enable", "U2"],
+      ["cron_retarget", "U2"],
+      ["cron_delete", "U2"],
+    ],
+    "shared-task audit names the member who modified, resumed, retargeted, and deleted the task",
+  );
   const outsider = await control.createCron(
     { title: "digest", schedule: { everyMs: 60_000 }, action: "digest", runAs: "scopeShared" },
     chanClaims("U1"),
@@ -543,7 +565,7 @@ test("app.createCron/updateCron backstop: scopeShared needs a shared scope + a m
   assert.equal(ok.runAs, "scopeShared");
 
   const ownerCron = await built.app.createCron({ ...base, ownerScopeId: scopeId("personal", "U1") });
-  await assert.rejects(built.app.updateCron(ownerCron.id, { runAs: "scopeShared", members }), /shared/);
+  await assert.rejects(built.app.updateCron(ownerCron.id, { runAs: "scopeShared", members }, "U1"), /shared/);
 });
 
 test("a cron's mode (runAs) is editable in place, but only by the owner", async () => {
@@ -698,7 +720,7 @@ test("cron get honors read-only visibility: a delivery-targeted viewer reads, ne
   const before = await control.getCron(id, claims("U9"));
   assert.equal(before.ok, false, "no visibility yet — get stays forbidden");
 
-  await built.app.setCronDestination(id, { type: "principal", target: "U9" });
+  await built.app.setCronDestination(id, { type: "principal", target: "U9" }, "U1");
   const seen = await control.getCron(id, claims("U9"));
   assert.ok(seen.ok, `a viewer in the visible set can read: ${JSON.stringify(seen)}`);
   assert.equal(seen.ok ? seen.cron.id : "", id);
