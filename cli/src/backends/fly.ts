@@ -1,4 +1,4 @@
-import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -39,6 +39,8 @@ import { computedSecrets, runtimeSecretNames, secretDestinations, secretsForServ
 import { flySandboxRepository, imageRepository, pinnedByDigest, recordSandboxPin } from "../commands/sandbox.ts";
 import { manifestRef } from "../manifest.ts";
 import { doctorCommon, localDoctorSecrets, requireFlyAuth } from "./doctor.ts";
+import { withSourcePluginBuildContextAsync } from "../plugin-build-context.ts";
+import { runTrackedChild } from "../process-cleanup.ts";
 
 export interface FlyUpOpts {
   dryRun?: boolean;
@@ -874,23 +876,27 @@ async function buildPluginImage(
   const app = pluginApp(ctx, plugin.name);
   note(`\n=== building plugin image ${flyTaggedImage(ctx.appPrefix, plugin.name, label)} ===`);
   const cfgPath = pluginCfgPath(ctx, plugin.name);
-  const args = [
-    "deploy",
-    "--yes",
-    "--build-only",
-    "--push",
-    "--image-label",
-    label,
-    "-c",
-    cfgPath,
-    "--ha=false",
-    "--remote-only",
-    "--dockerfile",
-    plugin.dockerfile!,
-    plugin.sourceDir!,
-  ];
-  step(`fly ${args.join(" ")}`);
-  await timing.timeAsync(plugin.name, "image build", () => runFlyDeploy(args, ctx.commandCwd));
+  await withSourcePluginBuildContextAsync(plugin, async (prepared) => {
+    const args = [
+      "deploy",
+      "--yes",
+      "--build-only",
+      "--push",
+      "--image-label",
+      label,
+      "-c",
+      cfgPath,
+      "--ha=false",
+      "--remote-only",
+      "--dockerfile",
+      prepared.dockerfile,
+      "--ignorefile",
+      prepared.ignorefile,
+      prepared.directory,
+    ];
+    step(`fly ${args.join(" ")}`);
+    await timing.timeAsync(plugin.name, "image build", () => runFlyDeploy(args, ctx.commandCwd));
+  });
   note(`image: ${app} -> ${flyTaggedImage(ctx.appPrefix, plugin.name, label)}`);
 }
 
@@ -914,7 +920,19 @@ async function deployPlugin(
   } else if (plugin.kind === "image") {
     args.push("--image", plugin.image!);
   } else {
-    args.push("--remote-only", "--dockerfile", plugin.dockerfile!, plugin.sourceDir!);
+    await withSourcePluginBuildContextAsync(plugin, async (prepared) => {
+      args.push(
+        "--remote-only",
+        "--dockerfile",
+        prepared.dockerfile,
+        "--ignorefile",
+        prepared.ignorefile,
+        prepared.directory,
+      );
+      step(`fly ${args.join(" ")}`);
+      await timing.timeAsync(plugin.name, "fly deploy", () => runFlyDeploy(args, ctx.commandCwd));
+    });
+    return;
   }
   step(`fly ${args.join(" ")}`);
   await timing.timeAsync(plugin.name, "fly deploy", () => runFlyDeploy(args, ctx.commandCwd));
@@ -932,17 +950,17 @@ async function deployPlugins(
 }
 
 function runFlyDeploy(args: string[], cwd: string): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    const child = spawn(flyBin(), args, { stdio: "inherit", cwd });
-    child.on("error", (err) => reject(new CliError(`fly ${args.join(" ")} failed:\n${err.message}`)));
-    child.on("close", (code, signal) => {
-      if (code === 0) resolve();
-      else
-        reject(
-          new CliError(`fly ${args.join(" ")} failed${signal ? ` with signal ${signal}` : ` with exit code ${code}`}`),
+  return runTrackedChild(flyBin(), args, { stdio: "inherit", cwd })
+    .catch((error) => {
+      throw new CliError(`fly ${args.join(" ")} failed:\n${(error as Error).message}`);
+    })
+    .then(({ code, signal }) => {
+      if (code !== 0) {
+        throw new CliError(
+          `fly ${args.join(" ")} failed${signal ? ` with signal ${signal}` : ` with exit code ${code}`}`,
         );
+      }
     });
-  });
 }
 
 function unsetDisabledSecurityScreenToken(config: QmConfig, appPrefix: string): void {

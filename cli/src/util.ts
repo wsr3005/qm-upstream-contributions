@@ -2,6 +2,7 @@ import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, openSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { CliError, errMessage } from "./log.ts";
+import { runTrackedChild } from "./process-cleanup.ts";
 
 export const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
@@ -61,6 +62,16 @@ export function runInherit(cmd: string, args: string[], opts: { cwd?: string; en
   execFileSync(cmd, args, {
     stdio: "inherit",
     ...procOpts(opts),
+  });
+}
+
+export function runInheritAsync(
+  cmd: string,
+  args: string[],
+  opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {},
+): Promise<void> {
+  return runTrackedChild(cmd, args, { stdio: "inherit", ...procOpts(opts) }).then(({ code, signal }) => {
+    if (code !== 0) throw new Error(`${cmd} failed${signal ? ` with signal ${signal}` : ` with exit code ${code}`}`);
   });
 }
 

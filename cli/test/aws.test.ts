@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import {
   assertAwsDeploymentStorage,
   assertAwsPublicListener,
@@ -1878,13 +1878,42 @@ test("AWS source-plugin provenance records the build source and detects source-m
     },
   };
   const dockerBin = join(dir, "docker");
-  writeFileSync(dockerBin, `#!/bin/sh\necho 'Digest: sha256:${"a".repeat(64)}'\n`);
+  const contextLog = join(dir, "plugin-context.json");
+  writeFileSync(
+    dockerBin,
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+if (args[0] === "buildx" && args[1] === "build") {
+  const context = args.at(-1);
+  const dockerfile = args[args.indexOf("-f") + 1];
+  fs.writeFileSync(${JSON.stringify(contextLog)}, JSON.stringify({
+    context,
+    dockerfile,
+    pluginSource: fs.readFileSync(context + "/handler.js", "utf8"),
+    chassis: fs.existsSync(context + "/plugins/chassis/src/core-client.ts"),
+  }));
+}
+console.log("Digest: sha256:${"a".repeat(64)}");
+`,
+  );
   chmodSync(dockerBin, 0o755);
   const priorPath = process.env.PATH;
   process.env.PATH = `${dir}:${priorPath}`;
   const fake = statefulAws(dir, sourceConfig);
   try {
     await awsUp(sourceConfig, dir, { yes: true });
+    const recorded = JSON.parse(readFileSync(contextLog, "utf8")) as {
+      context: string;
+      dockerfile: string;
+      pluginSource: string;
+      chassis: boolean;
+    };
+    assert.equal(dirname(recorded.dockerfile), recorded.context);
+    assert.match(basename(recorded.dockerfile), /^\.qm-plugin-.+\.Dockerfile$/);
+    assert.equal(recorded.pluginSource, "export const version = 1;\n");
+    assert.equal(recorded.chassis, true);
+    assert.equal(existsSync(recorded.context), false);
     const state = JSON.parse(readFileSync(fake.state, "utf8"));
     const manifestId = state.dynamo["deployment/current"].manifestId.S;
     const manifest = JSON.parse(state.dynamo[`deployment/manifest/${manifestId}`].manifest.S);

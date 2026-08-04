@@ -286,6 +286,9 @@ else if (command === "secretsmanager get-secret-value") {
       assert.ok(packed[0]!.files.some(({ path }) => path === "templates/deployment/deployment.md"));
       assert.ok(packed[0]!.files.some(({ path }) => path === "templates/deployment/references/fly.md"));
       assert.ok(packed[0]!.files.some(({ path }) => path === "templates/fly/core.toml"));
+      assert.ok(packed[0]!.files.some(({ path }) => path === "dist/plugin-chassis/package.json"));
+      assert.ok(packed[0]!.files.some(({ path }) => path === "dist/plugin-chassis/src/errors.ts"));
+      assert.ok(packed[0]!.files.some(({ path }) => path === "node_modules/@balena/dockerignore/ignore.js"));
       assert.ok(!packed[0]!.files.some(({ path }) => path === "src/contract.ts" || path === "bin/qm.ts"));
     } finally {
       if (registry) await new Promise<void>((resolve) => registry!.close(() => resolve()));

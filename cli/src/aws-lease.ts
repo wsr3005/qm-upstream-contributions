@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { AwsConfig } from "./config.ts";
 import { CliError, errMessage, warn } from "./log.ts";
+import { registerProcessCleanup } from "./process-cleanup.ts";
 import { capture, envNum } from "./util.ts";
 
 const LEASE_SECONDS = 60 * 60;
@@ -9,7 +10,7 @@ export interface AwsLease {
   table: string;
   key: string;
   holder: string;
-  releaseOnSignal?: () => void;
+  unregisterCleanup?: () => void;
   renewTimer?: ReturnType<typeof setInterval>;
 }
 
@@ -47,16 +48,7 @@ export function acquireAwsLease(aws: AwsConfig, key = "deploy"): AwsLease {
     throw error;
   }
   const lease: AwsLease = { table, key, holder };
-  const onSignal = (): void => {
-    releaseAwsLease(aws, lease);
-    process.exit(130);
-  };
-  process.once("SIGINT", onSignal);
-  process.once("SIGTERM", onSignal);
-  lease.releaseOnSignal = () => {
-    process.removeListener("SIGINT", onSignal);
-    process.removeListener("SIGTERM", onSignal);
-  };
+  lease.unregisterCleanup = registerProcessCleanup(() => releaseAwsLease(aws, lease));
   lease.renewTimer = setInterval(
     () => renewAwsLease(aws, lease),
     envNum("QM_AWS_LEASE_RENEW_MS", (LEASE_SECONDS / 3) * 1000),
@@ -98,8 +90,8 @@ function renewAwsLease(aws: AwsConfig, lease: AwsLease): void {
 export function releaseAwsLease(aws: AwsConfig, lease: AwsLease): void {
   if (lease.renewTimer) clearInterval(lease.renewTimer);
   lease.renewTimer = undefined;
-  lease.releaseOnSignal?.();
-  lease.releaseOnSignal = undefined;
+  lease.unregisterCleanup?.();
+  lease.unregisterCleanup = undefined;
   try {
     awsText(aws, [
       "dynamodb",

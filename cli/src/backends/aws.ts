@@ -45,6 +45,7 @@ import {
   readEnvFile,
   resolveBuildRepoRoot,
   runInherit,
+  runInheritAsync,
   sleep,
   streamLabeled,
 } from "../util.ts";
@@ -56,6 +57,7 @@ import {
   syncDeploymentLayerBody,
   type DeploymentLayerSyncResult,
 } from "../deployment-layer.ts";
+import { withSourcePluginBuildContextAsync } from "../plugin-build-context.ts";
 
 export interface AwsUpOpts {
   dryRun?: boolean;
@@ -485,34 +487,36 @@ export function imageTransferArgs(source: string, tagged: string): string[] {
   return ["buildx", "imagetools", "create", "--prefer-index=false", "--tag", tagged, source];
 }
 
-function publishWorkloadImage(
+async function publishWorkloadImage(
   config: QmConfig,
   workload: string,
   plugin: ResolvedPlugin | undefined,
   label: string,
   opts: AwsUpOpts,
-): string {
+): Promise<string> {
   const aws = requireAws(config);
   const spec = aws.services[workload]!;
   const tagged = `${ecrHost(aws)}/${spec.ecrRepository}:${label}`;
   const platform = `linux/${workloadArchitecture(config, workload)}`;
   if (plugin?.kind === "source") {
-    const args = [
-      "buildx",
-      "build",
-      "--platform",
-      platform,
-      "--provenance=false",
-      "--push",
-      "-f",
-      plugin.dockerfile!,
-      "-t",
-      tagged,
-    ];
-    for (const [name, value] of Object.entries(workloadBuildArgs(config, workload)))
-      args.push("--build-arg", `${name}=${value}`);
-    args.push(plugin.sourceDir!);
-    runInherit("docker", args);
+    await withSourcePluginBuildContextAsync(plugin, async (prepared) => {
+      const args = [
+        "buildx",
+        "build",
+        "--platform",
+        platform,
+        "--provenance=false",
+        "--push",
+        "-f",
+        prepared.dockerfile,
+        "-t",
+        tagged,
+      ];
+      for (const [name, value] of Object.entries(workloadBuildArgs(config, workload)))
+        args.push("--build-arg", `${name}=${value}`);
+      args.push(prepared.directory);
+      await runInheritAsync("docker", args);
+    });
   } else if (opts.buildFrom && isServiceName(workload)) {
     const root = resolveBuildRepoRoot(opts.buildFromPath, [workload]);
     const dockerfile = join(root, spec.dockerfile ?? join("deploy", workload, "Dockerfile"));
@@ -1715,7 +1719,7 @@ export async function awsUp(config: QmConfig, _configDir: string, opts: AwsUpOpt
     for (const service of services) {
       staged.add(service);
       selectedImageProvenance[service] = workloadImageProvenance(config, service, plugins.get(service), opts);
-      images[service] = publishWorkloadImage(config, service, plugins.get(service), stagingLabel, opts);
+      images[service] = await publishWorkloadImage(config, service, plugins.get(service), stagingLabel, opts);
     }
     const desired = reportTaskChanges(config, services, images, arns);
     const targets: Record<string, string> = {};

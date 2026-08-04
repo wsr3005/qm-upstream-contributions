@@ -11,6 +11,7 @@ import {
   readEnvFile,
   resolveBuildRepoRoot,
   runInherit,
+  runInheritAsync,
   sleep,
   streamLabeled,
   tailString,
@@ -32,6 +33,7 @@ import { dockerBasePort, sandboxCoreEnv, securityScreenEnv, type QmConfig } from
 import { discoverPlugins, type ResolvedPlugin } from "../plugins.ts";
 import { computedSecrets, runtimeSecretNames, secretsForService } from "../secrets.ts";
 import { readDeploymentState, withDeploymentLock, writeDeploymentState, type DeploymentState } from "../state.ts";
+import { withSourcePluginBuildContextAsync } from "../plugin-build-context.ts";
 
 const safe = (s: string): string => s.replace(/[^A-Za-z0-9_.-]/g, "-");
 const ORG_LABEL_KEY = "qm.org";
@@ -151,11 +153,17 @@ function resolveImage(ctx: DockerCtx, service: ServiceName): string {
   return ref;
 }
 
-function resolvePluginImage(ctx: DockerCtx, p: ResolvedPlugin): string {
+async function resolvePluginImage(ctx: DockerCtx, p: ResolvedPlugin): Promise<string> {
   if (p.kind === "source") {
     const tag = `${ctx.prefix}-${p.name}:local`;
     step(`building plugin ${p.name} from ${p.dockerfile}`);
-    dockerInherit(["build", "-f", p.dockerfile!, "-t", tag, p.sourceDir!]);
+    await withSourcePluginBuildContextAsync(p, async (prepared) => {
+      try {
+        await runInheritAsync("docker", ["build", "-f", prepared.dockerfile, "-t", tag, prepared.directory]);
+      } catch {
+        throw new CliError("docker build failed.");
+      }
+    });
     return tag;
   }
   step(`pulling plugin ${p.name} (${p.image})`);
@@ -590,7 +598,7 @@ export async function dockerUp(
   }
 
   for (const p of plugins) {
-    const image = resolvePluginImage(ctx, p);
+    const image = await resolvePluginImage(ctx, p);
     docker(["rm", "-f", cname(ctx, p.name)], /No such container|is not running/);
     step(`starting plugin ${p.name} (${image})`);
     const args = [

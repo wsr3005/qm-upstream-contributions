@@ -33,9 +33,12 @@
     "manifest.json",
     "README.md"
   ],
+  "bundleDependencies": [
+    "@balena/dockerignore"
+  ],
   "scripts": {
     "qm": "node -- bin/qm.ts",
-    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json && node -e \"require('node:fs').cpSync('../plugins/chassis','dist/plugin-chassis',{recursive:true})\"",
     "prepack": "npm run build",
     "typecheck": "tsc -p tsconfig.json",
     "test": "node --test test/*.test.ts",
@@ -46,5 +49,8 @@
   "devDependencies": {
     "@types/node": "^24.0.0",
     "typescript": "^5.8.2"
+  },
+  "dependencies": {
+    "@balena/dockerignore": "^1.0.2"
   }
 }
