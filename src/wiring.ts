@@ -52,6 +52,7 @@ import { createPostgresAuditLog } from "./admin/postgres-audit-log.ts";
 import { createRateLimiter, type RateLimiter } from "./ratelimit/rate-limiter.ts";
 import { createPostgresRateLimiter } from "./ratelimit/postgres-rate-limiter.ts";
 import { createBudgetTracker } from "./ratelimit/budget.ts";
+import type { BudgetTracker } from "./ratelimit/budget.ts";
 import { createPostgresBudgetTracker } from "./ratelimit/postgres-budget.ts";
 import { createCronStore, type CronStore } from "./cron/cron-store.ts";
 import { createDeliveryStore, type DeliveryStore } from "./delivery/delivery-store.ts";
@@ -326,6 +327,7 @@ export interface BuiltApp {
   scheduler: Scheduler;
   admin: AdminService;
   rateLimiter: RateLimiter;
+  budget: BudgetTracker;
   errors: ErrorLog;
   metrics: MetricsSink;
   crons: CronStore;
@@ -1391,6 +1393,7 @@ export function buildApp(
     scheduler,
     admin,
     rateLimiter,
+    budget,
     errors,
     metrics,
     crons,

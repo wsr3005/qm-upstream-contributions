@@ -7,7 +7,7 @@ import {
   retention,
   whoami,
 } from "./admin/scope-config.ts";
-import { egress, listAdminAudit, listAdminErrors, listAdminRuns, metrics } from "./admin/observability.ts";
+import { budgetUsage, egress, listAdminAudit, listAdminErrors, listAdminRuns, metrics } from "./admin/observability.ts";
 import { getAdminSession, getAdminSessionLlm, listAdminSessions, listAdminShadowDeliveries } from "./admin/sessions.ts";
 import { downloadAdminFile, listAdminFiles, readAdminFile, uploadAdminFile } from "./admin/files.ts";
 import { archiveAdminSkill, getAdminSkill, listAdminArtifacts, putAdminCronDestination } from "./admin/artifacts.ts";
@@ -65,6 +65,7 @@ const routes: ReadonlyArray<Route<ApiCtx>> = [
   { method: "GET", path: "/v1/admin/resources", auth: "either", handle: getAdminResources },
   { method: "GET", path: "/v1/admin/retention", auth: "either", handle: retention },
   { method: "GET", path: "/v1/admin/metrics", auth: "either", handle: metrics },
+  { method: "GET", path: "/v1/budget-usage", auth: "source", handle: budgetUsage },
   { method: "GET", path: "/v1/admin/egress", auth: "either", handle: egress },
   { method: "GET", path: "/v1/admin/sessions", auth: "either", handle: listAdminSessions },
   { method: "GET", path: "/v1/admin/sessions/:id/llm", auth: "either", handle: getAdminSessionLlm },

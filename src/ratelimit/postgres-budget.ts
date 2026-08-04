@@ -20,6 +20,22 @@ export function createPostgresBudgetTracker(
     `CREATE INDEX IF NOT EXISTS budget_spend_by_principal_at ON budget_spend(principal_id, at)`,
   ]);
 
+  async function snapshot(principalId: string, now = Date.now()) {
+    const rows = await q(
+      `SELECT principal_id, COALESCE(SUM(usd), 0) AS spent
+       FROM budget_spend
+       WHERE principal_id = ANY($1) AND at >= $2
+       GROUP BY principal_id`,
+      [[principalId, orgKey], now - windowMs],
+    );
+    const spent = new Map(rows.map((row) => [String(row.principal_id), Number(row.spent)]));
+    return {
+      windowMs,
+      member: { spentUsd: spent.get(principalId) ?? 0, limitUsd },
+      organization: { spentUsd: spent.get(orgKey) ?? 0, limitUsd: orgLimitUsd },
+    };
+  }
+
   return {
     async check(principalId, now = Date.now()) {
       const rows = await q(
@@ -48,5 +64,6 @@ export function createPostgresBudgetTracker(
         console.error("[budget] failed to persist spend:", err);
       }
     },
+    snapshot,
   };
 }

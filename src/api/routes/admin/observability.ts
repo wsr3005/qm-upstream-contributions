@@ -1,7 +1,7 @@
 import { parseScopeId, type ScopeId } from "../../../types.ts";
 import { cacheHitRatio, isStablePrefixMiss, type TurnMetricSample } from "../../../admin/metrics-sink.ts";
 import { sendJson } from "../../http.ts";
-import { audit, requireScopedAdmin } from "../shared.ts";
+import { audit, orgScope, requireScopedAdmin } from "../shared.ts";
 import { type ApiCtx } from "../route.ts";
 
 const METRICS_SCAN_LIMIT = 10000;
@@ -226,6 +226,36 @@ export async function metrics(ctx: ApiCtx): Promise<void> {
     anatomy,
     cache,
     phases,
+  });
+}
+
+export async function budgetUsage(ctx: ApiCtx): Promise<void> {
+  const { res, deps, url } = ctx;
+  const authz = await requireScopedAdmin(ctx);
+  if (!authz) return;
+  if (parseScopeId(authz.scope).kind !== "org" || authz.scope !== orgScope(deps)) {
+    return sendJson(res, 400, { error: "bad_request", message: "organization scope required" });
+  }
+  if (!deps.budget) return sendJson(res, 404, { error: "not_found" });
+  const principalId = url.searchParams.get("principalId")?.trim() ?? "";
+  if (!principalId || principalId.length > 512) {
+    return sendJson(res, 400, { error: "bad_request", message: "principalId required" });
+  }
+  audit(deps, {
+    principalId: authz.actor.id,
+    action: "budget-usage.read",
+    resource: principalId,
+    scopeLabel: authz.scope,
+  });
+  const usage = await deps.budget.snapshot(principalId);
+  const finite = (value: number): number | null => (Number.isFinite(value) ? value : null);
+  return sendJson(res, 200, {
+    scopeId: authz.scope,
+    principalId,
+    windowMs: usage.windowMs,
+    member: { spentUsd: usage.member.spentUsd, limitUsd: finite(usage.member.limitUsd) },
+    organization: { spentUsd: usage.organization.spentUsd, limitUsd: finite(usage.organization.limitUsd) },
+    approximate: true,
   });
 }
 

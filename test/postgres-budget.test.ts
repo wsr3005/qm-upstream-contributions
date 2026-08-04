@@ -17,8 +17,8 @@ test(
   "pg budget: spend is shared across trackers (instances), trips at the limit, and expires out of the window",
   { skip },
   async () => {
-    const a = createPostgresBudgetTracker(URL!, { limitUsd: 1, windowMs: 60_000 });
-    const b = createPostgresBudgetTracker(URL!, { limitUsd: 1, windowMs: 60_000 });
+    const a = createPostgresBudgetTracker(URL!, { limitUsd: 1, orgLimitUsd: 10, windowMs: 60_000 });
+    const b = createPostgresBudgetTracker(URL!, { limitUsd: 1, orgLimitUsd: 10, windowMs: 60_000 });
 
     assert.equal((await a.check("U1", 1000)).allowed, true);
     await a.record("U1", 0.6, 1000);
@@ -28,9 +28,19 @@ test(
     const tripped = await a.check("U1", 1000);
     assert.equal(tripped.allowed, false, "the cap holds fleet-wide, not per instance");
     assert.equal(tripped.spentUsd > 1, true);
+    assert.deepEqual(await b.snapshot("U1", 1000), {
+      windowMs: 60_000,
+      member: { spentUsd: 1.2, limitUsd: 1 },
+      organization: { spentUsd: 1.2, limitUsd: 10 },
+    });
 
     assert.equal((await a.check("U2", 1000)).allowed, true, "budgets are per-principal");
     assert.equal((await a.check("U1", 1000 + 61_000)).allowed, true, "spend outside the window no longer counts");
+    assert.deepEqual(await a.snapshot("U1", 1000 + 61_000), {
+      windowMs: 60_000,
+      member: { spentUsd: 0, limitUsd: 1 },
+      organization: { spentUsd: 0, limitUsd: 10 },
+    });
   },
 );
 
