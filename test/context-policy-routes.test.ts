@@ -172,3 +172,25 @@ test("a stale baseUpdatedAt bounces instead of reverting a concurrent edit", asy
   assert.equal(fresh.out.status, 200);
   assert.equal((await store.get("C3"))?.orders, "v2");
 });
+
+test("simultaneous policy writes from the same revision have exactly one winner", async () => {
+  const store = createMemoryChannelPolicyStore();
+  await store.set("C6", "v1", { setBy: "agent" });
+  const revision = (await store.get("C6"))!.updatedAt;
+  const first = makeCtx({
+    contexts: ["channel:C6"],
+    store,
+    body: { principalId: "alice", scope: "channel:C6", orders: "v2-a", bots: {}, baseUpdatedAt: revision },
+  });
+  const second = makeCtx({
+    contexts: ["channel:C6"],
+    store,
+    body: { principalId: "bob", scope: "channel:C6", orders: "v2-b", bots: {}, baseUpdatedAt: revision },
+  });
+
+  await Promise.all([setContextPolicy(first.ctx), setContextPolicy(second.ctx)]);
+
+  assert.deepEqual([first.out.status, second.out.status].sort(), [200, 409]);
+  assert.ok(["v2-a", "v2-b"].includes((await store.get("C6"))!.orders));
+  assert.equal((await store.history("C6")).length, 2);
+});

@@ -63,6 +63,12 @@ export interface ChannelPolicyStore {
     orders: string,
     opts?: { setBy?: string; bots?: Record<string, BotPolicy>; sessionId?: string; ambientEnabled?: boolean | null },
   ): Promise<ChannelPolicy>;
+  compareAndSet(
+    container: string,
+    expectedUpdatedAt: number,
+    orders: string,
+    opts?: { setBy?: string; bots?: Record<string, BotPolicy>; sessionId?: string; ambientEnabled?: boolean | null },
+  ): Promise<ChannelPolicy | null>;
   history(container: string, limit?: number): Promise<ChannelPolicyRevision[]>;
   list(): Promise<ChannelPolicy[]>;
   close(): Promise<void>;
@@ -111,40 +117,60 @@ export function createPostgresChannelPolicyStore(connectionString: string): Chan
     ...(r.session_id != null ? { sessionId: r.session_id as string } : {}),
     createdAt: Number(r.created_at),
   });
+  const write = async (
+    container: string,
+    orders: string,
+    opts:
+      | { setBy?: string; bots?: Record<string, BotPolicy>; sessionId?: string; ambientEnabled?: boolean | null }
+      | undefined,
+    expectedUpdatedAt: number | null,
+  ): Promise<ChannelPolicy | null> => {
+    const now = Date.now();
+    const rows = await q(
+      `WITH up AS (
+         INSERT INTO channel_policy(org_id, container, orders, bots, ambient_enabled, set_by, updated_at)
+         SELECT $1,$2,$3,COALESCE($4::jsonb,'{}'::jsonb),CASE WHEN $9 THEN $8::boolean END,$5,$6
+         WHERE $10::bigint IS NULL OR $10::bigint = 0 OR EXISTS (
+           SELECT 1 FROM channel_policy WHERE org_id = $1 AND container = $2
+         )
+         ON CONFLICT (org_id, container) DO UPDATE SET orders = EXCLUDED.orders,
+           bots = COALESCE($4::jsonb, channel_policy.bots),
+           ambient_enabled = CASE WHEN $9 THEN $8::boolean ELSE channel_policy.ambient_enabled END,
+           set_by = EXCLUDED.set_by,
+           updated_at = GREATEST(EXCLUDED.updated_at, channel_policy.updated_at + 1)
+         WHERE $10::bigint IS NULL OR channel_policy.updated_at = $10::bigint
+         RETURNING *
+       ), hist AS (
+         INSERT INTO channel_policy_history(org_id, container, orders, bots, ambient_enabled, set_by, session_id, created_at)
+         SELECT $1, $2, up.orders, up.bots, up.ambient_enabled, up.set_by, $7, up.updated_at FROM up
+       )
+       SELECT * FROM up`,
+      [
+        orgId,
+        container,
+        orders,
+        opts?.bots ? JSON.stringify(opts.bots) : null,
+        opts?.setBy ?? null,
+        now,
+        opts?.sessionId ?? null,
+        opts?.ambientEnabled ?? null,
+        opts?.ambientEnabled !== undefined,
+        expectedUpdatedAt,
+      ],
+    );
+    return rows[0] ? row(rows[0]) : null;
+  };
   return {
     async get(container) {
       const rows = await q("SELECT * FROM channel_policy WHERE org_id = $1 AND container = $2", [orgId, container]);
       return rows[0] ? row(rows[0]) : null;
     },
     async set(container, orders, opts) {
-      const now = Date.now();
-      const rows = await q(
-        `WITH up AS (
-           INSERT INTO channel_policy(org_id, container, orders, bots, ambient_enabled, set_by, updated_at)
-           VALUES ($1,$2,$3,COALESCE($4::jsonb,'{}'::jsonb),CASE WHEN $9 THEN $8::boolean END,$5,$6)
-           ON CONFLICT (org_id, container) DO UPDATE SET orders = EXCLUDED.orders,
-             bots = COALESCE($4::jsonb, channel_policy.bots),
-             ambient_enabled = CASE WHEN $9 THEN $8::boolean ELSE channel_policy.ambient_enabled END,
-             set_by = EXCLUDED.set_by, updated_at = EXCLUDED.updated_at
-           RETURNING *
-         ), hist AS (
-           INSERT INTO channel_policy_history(org_id, container, orders, bots, ambient_enabled, set_by, session_id, created_at)
-           SELECT $1, $2, $3, up.bots, up.ambient_enabled, $5, $7, $6 FROM up
-         )
-         SELECT * FROM up`,
-        [
-          orgId,
-          container,
-          orders,
-          opts?.bots ? JSON.stringify(opts.bots) : null,
-          opts?.setBy ?? null,
-          now,
-          opts?.sessionId ?? null,
-          opts?.ambientEnabled ?? null,
-          opts?.ambientEnabled !== undefined,
-        ],
-      );
-      return row(rows[0]!);
+      return (await write(container, orders, opts, null))!;
+    },
+    async compareAndSet(container, expectedUpdatedAt, orders, opts) {
+      if (!Number.isSafeInteger(expectedUpdatedAt) || expectedUpdatedAt < 0) return null;
+      return write(container, orders, opts, expectedUpdatedAt);
     },
     async history(container, limit = HISTORY_DEFAULT_LIMIT) {
       const rows = await q(
@@ -164,34 +190,49 @@ export function createPostgresChannelPolicyStore(connectionString: string): Chan
 export function createMemoryChannelPolicyStore(): ChannelPolicyStore {
   const policies = new Map<string, ChannelPolicy>();
   const history: ChannelPolicyRevision[] = [];
+  const write = (
+    container: string,
+    orders: string,
+    opts:
+      | { setBy?: string; bots?: Record<string, BotPolicy>; sessionId?: string; ambientEnabled?: boolean | null }
+      | undefined,
+    expectedUpdatedAt?: number,
+  ): ChannelPolicy | null => {
+    const existing = policies.get(container);
+    if (expectedUpdatedAt !== undefined && (existing?.updatedAt ?? 0) !== expectedUpdatedAt) return null;
+    const updatedAt = Math.max(Date.now(), (existing?.updatedAt ?? 0) + 1);
+    const ambientEnabled =
+      opts?.ambientEnabled === undefined ? existing?.ambientEnabled : (opts.ambientEnabled ?? undefined);
+    const p: ChannelPolicy = {
+      container,
+      orders,
+      bots: opts?.bots ?? existing?.bots ?? {},
+      ...(ambientEnabled !== undefined ? { ambientEnabled } : {}),
+      ...(opts?.setBy ? { setBy: opts.setBy } : {}),
+      updatedAt,
+    };
+    policies.set(container, p);
+    history.push({
+      container,
+      orders,
+      bots: p.bots,
+      ...(p.ambientEnabled !== undefined ? { ambientEnabled: p.ambientEnabled } : {}),
+      ...(opts?.setBy ? { setBy: opts.setBy } : {}),
+      ...(opts?.sessionId ? { sessionId: opts.sessionId } : {}),
+      createdAt: updatedAt,
+    });
+    return p;
+  };
   return {
     async get(container) {
       return policies.get(container) ?? null;
     },
     async set(container, orders, opts) {
-      const existing = policies.get(container);
-      const now = Date.now();
-      const ambientEnabled =
-        opts?.ambientEnabled === undefined ? existing?.ambientEnabled : (opts.ambientEnabled ?? undefined);
-      const p: ChannelPolicy = {
-        container,
-        orders,
-        bots: opts?.bots ?? existing?.bots ?? {},
-        ...(ambientEnabled !== undefined ? { ambientEnabled } : {}),
-        ...(opts?.setBy ? { setBy: opts.setBy } : {}),
-        updatedAt: now,
-      };
-      policies.set(container, p);
-      history.push({
-        container,
-        orders,
-        bots: p.bots,
-        ...(p.ambientEnabled !== undefined ? { ambientEnabled: p.ambientEnabled } : {}),
-        ...(opts?.setBy ? { setBy: opts.setBy } : {}),
-        ...(opts?.sessionId ? { sessionId: opts.sessionId } : {}),
-        createdAt: now,
-      });
-      return p;
+      return write(container, orders, opts)!;
+    },
+    async compareAndSet(container, expectedUpdatedAt, orders, opts) {
+      if (!Number.isSafeInteger(expectedUpdatedAt) || expectedUpdatedAt < 0) return null;
+      return write(container, orders, opts, expectedUpdatedAt);
     },
     async history(container, limit = HISTORY_DEFAULT_LIMIT) {
       return history

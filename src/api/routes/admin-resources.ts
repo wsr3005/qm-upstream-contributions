@@ -199,19 +199,22 @@ export const ADMIN_RESOURCES: readonly AdminResource[] = [
       if ("error" in parsed) return { error: parsed.error };
       if (b.ambientEnabled !== undefined && b.ambientEnabled !== null && typeof b.ambientEnabled !== "boolean")
         return { error: "ambientEnabled must be a boolean or null (null = default rule)" };
-      const current = await deps.channelPolicy.get(ref);
-      if (typeof b.baseUpdatedAt === "number" && (current?.updatedAt ?? 0) !== b.baseUpdatedAt) {
+      const opts = {
+        setBy: actor.id,
+        bots: parsed.bots,
+        ambientEnabled: b.ambientEnabled as boolean | null | undefined,
+      };
+      const saved =
+        typeof b.baseUpdatedAt === "number"
+          ? await deps.channelPolicy.compareAndSet(ref, b.baseUpdatedAt, b.orders, opts)
+          : await deps.channelPolicy.set(ref, b.orders, opts);
+      if (!saved) {
         return {
           error: "this channel's policy changed since you loaded it — reload and re-apply your edit",
           code: "conflict",
           status: 409,
         };
       }
-      await deps.channelPolicy.set(ref, b.orders, {
-        setBy: actor.id,
-        bots: parsed.bots,
-        ambientEnabled: b.ambientEnabled as boolean | null | undefined,
-      });
       audit(ctx.deps, { principalId: actor.id, action: "surface.policy.set", resource: ref, scopeLabel: scope });
       return { ok: true };
     },

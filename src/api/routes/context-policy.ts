@@ -72,18 +72,21 @@ export async function setContextPolicy(ctx: ApiCtx): Promise<void> {
       error: "bad_request",
       message: "ambientEnabled must be a boolean or null (null = default rule)",
     });
-  const current = await deps.channelPolicy.get(container);
-  if (typeof b.baseUpdatedAt === "number" && (current?.updatedAt ?? 0) !== b.baseUpdatedAt) {
+  const opts = {
+    setBy: principalId,
+    bots: parsed.bots,
+    ambientEnabled: b.ambientEnabled as boolean | null | undefined,
+  };
+  const p =
+    typeof b.baseUpdatedAt === "number"
+      ? await deps.channelPolicy.compareAndSet(container, b.baseUpdatedAt, b.orders, opts)
+      : await deps.channelPolicy.set(container, b.orders, opts);
+  if (!p) {
     return sendJson(res, 409, {
       error: "conflict",
       message: "this channel's policy changed since you loaded it — reload and re-apply your edit",
     });
   }
-  const p = await deps.channelPolicy.set(container, b.orders, {
-    setBy: principalId,
-    bots: parsed.bots,
-    ambientEnabled: b.ambientEnabled as boolean | null | undefined,
-  });
   audit(deps, { principalId, action: "surface.policy.set", resource: container, scopeLabel: scope });
   return sendJson(res, 200, {
     policy: { orders: p.orders, bots: p.bots, ambientEnabled: p.ambientEnabled ?? null, updatedAt: p.updatedAt },

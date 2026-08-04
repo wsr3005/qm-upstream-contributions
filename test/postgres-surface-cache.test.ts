@@ -174,6 +174,40 @@ test("pg channel-policy: history appends a revision per set with provenance", { 
   }
 });
 
+test("pg channel-policy: compare-and-set admits one writer across store instances", { skip }, async () => {
+  const first = createPostgresChannelPolicyStore(URL!);
+  const second = createPostgresChannelPolicyStore(URL!);
+  try {
+    const initial = await first.set("CPCAS1", "v1", { setBy: "U-initial" });
+    const [left, right] = await Promise.all([
+      first.compareAndSet("CPCAS1", initial.updatedAt, "v2-left", { setBy: "U-left" }),
+      second.compareAndSet("CPCAS1", initial.updatedAt, "v2-right", { setBy: "U-right" }),
+    ]);
+    assert.equal([left, right].filter(Boolean).length, 1);
+    assert.ok(["v2-left", "v2-right"].includes((await first.get("CPCAS1"))!.orders));
+    assert.equal((await first.history("CPCAS1")).length, 2);
+  } finally {
+    await Promise.all([first.close(), second.close()]);
+  }
+});
+
+test("pg channel-policy: compare-and-set creates only from revision zero", { skip }, async () => {
+  const first = createPostgresChannelPolicyStore(URL!);
+  const second = createPostgresChannelPolicyStore(URL!);
+  try {
+    assert.equal(await first.compareAndSet("CPCAS2", 42, "invalid"), null);
+    const created = await Promise.all([
+      first.compareAndSet("CPCAS2", 0, "created-left", { setBy: "U-left" }),
+      second.compareAndSet("CPCAS2", 0, "created-right", { setBy: "U-right" }),
+    ]);
+    assert.equal(created.filter(Boolean).length, 1);
+    assert.ok(["created-left", "created-right"].includes((await first.get("CPCAS2"))!.orders));
+    assert.equal((await first.history("CPCAS2")).length, 1);
+  } finally {
+    await Promise.all([first.close(), second.close()]);
+  }
+});
+
 test("pg surface-cache: mentions JSONB round-trips and survives a mention-less edit", { skip }, async () => {
   const cache = createPostgresSurfaceCache(URL!);
   try {
