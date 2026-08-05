@@ -135,6 +135,34 @@ describe("runTrigger: scopeShared unions the owner's keychain into the scope run
       ["U3"],
     );
   });
+
+  it("scopeFloor sends an approval-failure notice to the current replacement actor", async () => {
+    const { deps } = captureDeps();
+    deps.currentScopeMembers = async () => [{ id: "U3", type: "internal" }];
+    deps.run = async () => ({
+      status: "pending_approval",
+      runId: "run-floor-approval",
+      backgroundApprovalRequestId: "approval-floor",
+    });
+    await runTrigger(deps, {
+      owner: "U-former",
+      ownerScopeId: scopeId("channel", "C-eng"),
+      input: "x",
+      fireKey: "floor-approval",
+      surface: "cron",
+      runAs: "scopeFloor",
+      members,
+    });
+
+    const [notice] = await deps.deliveries.pending("principal");
+    assert.deepEqual(notice?.destination, {
+      type: "principal",
+      target: "U3",
+      audienceScopeId: scopeId("personal", "U3"),
+      onBehalfOf: "U3",
+    });
+    assert.equal(notice?.provenance?.notice?.approval.requesterPrincipalId, "U3");
+  });
 });
 
 describe("composeCronEditNotice: a heads-up with enough context to skip clicking", () => {

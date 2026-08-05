@@ -194,10 +194,19 @@ export interface DeliveryProvenance {
   sourceSessionId?: string;
   sourceUserSeq?: number;
   sourceAssistantEntrySeq?: number;
-  notice?: { code: DeliveryNoticeCode };
+  notice?: DeliveryNotice;
 }
 
-export type DeliveryNoticeCode = "background_approval_required";
+export type DeliveryNotice = {
+  code: "background_approval_required";
+  approval: {
+    requestId: string;
+    requesterPrincipalId: string;
+    runId: string;
+  };
+};
+
+export type DeliveryNoticeCode = DeliveryNotice["code"];
 
 export interface CronSchedule {
   cron?: string;
@@ -511,6 +520,7 @@ export interface TurnResult {
   refusalKind?: "security_quarantine";
   adminUrl?: string;
   runId?: string;
+  backgroundApprovalRequestId?: string;
   steered?: true;
   stopped?: boolean;
   pendingApprovals?: PendingApproval[];

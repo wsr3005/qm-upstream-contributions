@@ -57,9 +57,10 @@ export async function processRun(deps: ProcessDeps, run: Run, opts?: { backgroun
   };
   try {
     const queueMs = run.startedAt !== null ? Math.max(0, run.startedAt - run.createdAt) : undefined;
-    const result = await deps.orchestrator.handleTurn({
+    const origin = resolveTurnOrigin(run.request);
+    const handled = await deps.orchestrator.handleTurn({
       ...run.request,
-      origin: resolveTurnOrigin(run.request),
+      origin,
       runId: run.id,
       attempt: run.attempts,
       finalAttempt: errorParks(run, deps.runs.maxClaims),
@@ -67,6 +68,17 @@ export async function processRun(deps: ProcessDeps, run: Run, opts?: { backgroun
       cancel: cancel.signal,
       ...(queueMs !== undefined ? { queueMs } : {}),
     });
+    if (
+      origin.kind === "automation" &&
+      handled.status === "pending_approval" &&
+      !handled.backgroundApprovalRequestId?.trim()
+    ) {
+      throw new Error("background approval identity is incomplete");
+    }
+    const result = {
+      ...handled,
+      runId: run.id,
+    };
     stopBeat();
     await deps.runs.complete(run.id, token, result);
     return result;

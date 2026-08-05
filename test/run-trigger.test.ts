@@ -225,6 +225,8 @@ describe("runTrigger: an autonomous cron does NOT go live (it may be conditional
   it("a background approval stops this fire and notifies the owner to retry interactively exactly once", async () => {
     const d = deps(async () => ({
       status: "pending_approval",
+      runId: "run-background-a",
+      backgroundApprovalRequestId: "approval-a",
       pendingApprovals: [{ requestId: "approval-a", command: "dangerous", reason: "needs approval" }],
     }));
     const spec = {
@@ -252,11 +254,32 @@ describe("runTrigger: an autonomous cron does NOT go live (it may be conditional
       audienceScopeId: scopeId("personal", "U1"),
       onBehalfOf: "U1",
     });
-    assert.deepEqual(notices[0]!.provenance?.notice, { code: "background_approval_required" });
+    assert.deepEqual(notices[0]!.provenance?.notice, {
+      code: "background_approval_required",
+      approval: {
+        requestId: "approval-a",
+        requesterPrincipalId: "U1",
+        runId: "run-background-a",
+      },
+    });
     assert.doesNotMatch(
       notices[0]!.text,
       /dangerous|needs approval/u,
       "the notice does not contain gated command detail",
     );
+  });
+
+  it("does not persist a background approval notice with incomplete recovery metadata", async () => {
+    const d = deps(async () => ({ status: "pending_approval", runId: "run-without-request" }));
+    const out = await runTrigger(d, {
+      owner: "U1",
+      ownerScopeId: scopeId("personal", "U1"),
+      input: "run the gated action",
+      fireKey: "cron:legacy:t1",
+      surface: "cron",
+    });
+
+    assert.match(out.note ?? "", /approval identity is incomplete/u);
+    assert.deepEqual(await d.deliveries.pending("principal"), []);
   });
 });

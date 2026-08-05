@@ -242,19 +242,31 @@ export async function runTrigger(deps: TriggerDeps, spec: TriggerSpec): Promise<
     if (res.status === "pending_approval") {
       note = "hit a require_approval command — failed closed (no human at fire/event time)";
       console.warn(`[trigger] ${spec.surface} ${spec.fireKey} ${note}`);
+      if (!res.backgroundApprovalRequestId?.trim() || !res.runId?.trim()) {
+        note = "background approval identity is incomplete — failed closed without notification";
+        console.error(`[trigger] ${spec.surface} ${spec.fireKey} ${note}`);
+        return;
+      }
       await reachEnqueue({
         deliveries: deps.deliveries,
         destination: {
           type: "principal",
-          target: spec.owner,
-          audienceScopeId: scopeId("personal", spec.owner),
-          onBehalfOf: spec.owner,
+          target: actorId,
+          audienceScopeId: scopeId("personal", actorId),
+          onBehalfOf: actorId,
         },
         text: "This background run stopped because it requires approval. Retry the action interactively.",
         idempotencyKey: `${spec.fireKey}:approval-required`,
         provenance: {
           ...deliveryProvenance(spec, threadRef, res),
-          notice: { code: "background_approval_required" },
+          notice: {
+            code: "background_approval_required",
+            approval: {
+              requestId: res.backgroundApprovalRequestId,
+              requesterPrincipalId: actorId,
+              runId: res.runId,
+            },
+          },
         },
         ...(spec.shadow ? { shadow: true } : {}),
       });

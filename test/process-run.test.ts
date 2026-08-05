@@ -69,20 +69,38 @@ test("processRun threads runId + background into the turn and completes the run 
   await runs.enqueue({ sessionId: "s1", request: turn });
   const fg = await runs.claim("w1", 5_000);
   const result = await processRun(deps, fg!);
-  assert.deepEqual(result, { status: "ok", reply: "echo: x" });
+  assert.deepEqual(result, { status: "ok", reply: "echo: x", runId: fg!.id });
   assert.equal(seen[0]?.runId, fg!.id, "the orchestrator sees the run's id");
   assert.equal(seen[0]?.background, false, "foreground by default");
   assert.equal(seen[0]?.attempt, 1, "the orchestrator sees which claim this is");
 
   const done = await runs.get(fg!.id);
   assert.equal(done?.status, "done");
-  assert.deepEqual(done?.result, { status: "ok", reply: "echo: x" });
+  assert.deepEqual(done?.result, { status: "ok", reply: "echo: x", runId: fg!.id });
   assert.equal(done?.leaseToken, null, "the lease is released on completion");
 
   await runs.enqueue({ sessionId: "s2", request: turn });
   const bg = await runs.claim("w1", 5_000);
   await processRun(deps, bg!, { background: true });
   assert.equal(seen[1]?.background, true, "the worker-loop flag reaches the orchestrator");
+});
+
+test("processRun refuses to persist an automated pending approval without a request identity", async () => {
+  const { runs } = createMemoryRunStore();
+  const automated = {
+    ...turn,
+    triggered: true,
+    origin: { kind: "automation" as const, trigger: "cron", fireKey: "cron:c1:t1" },
+  };
+  await runs.enqueue({ sessionId: "s1", request: automated });
+  const run = await runs.claim("w1", 5_000);
+  const orchestrator = fakeOrchestrator(async () => ({ status: "pending_approval" }));
+
+  await assert.rejects(
+    processRun({ runs, orchestrator, leaseTtlMs: 5_000 }, run!),
+    /background approval identity is incomplete/u,
+  );
+  assert.equal((await runs.get(run!.id))?.status, "pending");
 });
 
 test("processRun upgrades legacy queued provenance before orchestration", async () => {

@@ -2233,6 +2233,7 @@ test("an automated approval fails closed without replay and preserves its extern
   );
   assert.equal(first.status, "pending_approval");
   assert.equal(first.pendingApprovals, undefined);
+  assert.match(first.backgroundApprovalRequestId ?? "", /^[a-f0-9]{16}$/u);
   assert.deepEqual(
     await built.app.listSessionApprovals(first.sessionId!, internalActor.externalId),
     [],
