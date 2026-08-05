@@ -7,7 +7,7 @@ import type {
   TurnRequest,
   TurnResult,
 } from "../types.ts";
-import { parseScopeId } from "../types.ts";
+import { parseScopeId, scopeId } from "../types.ts";
 import type { IdentityService } from "../identity/identity-service.ts";
 import type { DeliveryStore } from "../delivery/delivery-store.ts";
 import type { IdempotencyStore } from "../idempotency/idempotency-store.ts";
@@ -242,6 +242,22 @@ export async function runTrigger(deps: TriggerDeps, spec: TriggerSpec): Promise<
     if (res.status === "pending_approval") {
       note = "hit a require_approval command — failed closed (no human at fire/event time)";
       console.warn(`[trigger] ${spec.surface} ${spec.fireKey} ${note}`);
+      await reachEnqueue({
+        deliveries: deps.deliveries,
+        destination: {
+          type: "principal",
+          target: spec.owner,
+          audienceScopeId: scopeId("personal", spec.owner),
+          onBehalfOf: spec.owner,
+        },
+        text: "This background run stopped because it requires approval. Retry the action interactively.",
+        idempotencyKey: `${spec.fireKey}:approval-required`,
+        provenance: {
+          ...deliveryProvenance(spec, threadRef, res),
+          notice: { code: "background_approval_required" },
+        },
+        ...(spec.shadow ? { shadow: true } : {}),
+      });
       return;
     }
     if (res.status === "ok" && (res.reply || res.attachments?.length)) {

@@ -1,4 +1,4 @@
-import type { TurnOrigin, TurnRequest } from "../../types.ts";
+import { isDeliveryFailureCode, type DeliveryResolution, type TurnOrigin, type TurnRequest } from "../../types.ts";
 import { resolveTurnOrigin } from "../../core/turn-origin.ts";
 import { sendJson } from "../http.ts";
 import { isObj } from "./shared.ts";
@@ -123,6 +123,46 @@ async function ackDelivery(ctx: ApiCtx): Promise<void> {
   return sendJson(res, 200, { ok: true });
 }
 
+async function renewDeliveryClaim(ctx: ApiCtx): Promise<void> {
+  const { res, app, body } = ctx;
+  const id = ctx.params.id!;
+  const claimToken = isObj(body) && typeof body.claimToken === "string" ? body.claimToken : "";
+  const claimMs = isObj(body) && typeof body.claimMs === "number" ? body.claimMs : 0;
+  if (!claimToken || !Number.isSafeInteger(claimMs) || claimMs <= 0 || claimMs > 300_000) {
+    return sendJson(res, 400, { error: "bad_request", message: "claimToken and claimMs are required" });
+  }
+  if (!(await app.renewDeliveryClaim(id, claimToken, claimMs))) {
+    return sendJson(res, 409, { error: "stale_claim" });
+  }
+  return sendJson(res, 200, { ok: true });
+}
+
+async function resolveDeliveryClaim(ctx: ApiCtx): Promise<void> {
+  const { res, app, body } = ctx;
+  const id = ctx.params.id!;
+  const claimToken = isObj(body) && typeof body.claimToken === "string" ? body.claimToken : "";
+  const outcome = isObj(body) && typeof body.outcome === "string" ? body.outcome : "";
+  const failureCode = isObj(body) && typeof body.failureCode === "string" ? body.failureCode : "";
+  if (!claimToken || (outcome !== "delivered" && outcome !== "failed")) {
+    return sendJson(res, 400, { error: "bad_request", message: "invalid delivery resolution" });
+  }
+  let resolution: DeliveryResolution;
+  if (outcome === "failed") {
+    if (!isDeliveryFailureCode(failureCode)) {
+      return sendJson(res, 400, { error: "bad_request", message: "invalid delivery resolution" });
+    }
+    resolution = { kind: "failed", at: Date.now(), code: failureCode };
+  } else {
+    if (failureCode) {
+      return sendJson(res, 400, { error: "bad_request", message: "invalid delivery resolution" });
+    }
+    resolution = { kind: "delivered", at: Date.now() };
+  }
+  const result = await app.resolveDeliveryClaim(id, claimToken, resolution);
+  if (result === "stale") return sendJson(res, 409, { error: "stale_claim" });
+  return sendJson(res, 200, { outcome: result });
+}
+
 async function ackDeliveryByKey(ctx: ApiCtx): Promise<void> {
   const { res, app, body } = ctx;
   const idempotencyKey = isObj(body) && typeof body.idempotencyKey === "string" ? body.idempotencyKey : "";
@@ -161,5 +201,7 @@ export const turnRoutes: ReadonlyArray<Route<ApiCtx>> = [
   { method: "GET", path: "/v1/runs", auth: "source", handle: getActiveRunForThread },
   { method: "GET", path: "/v1/deliveries", auth: "source", handle: listDeliveries },
   { method: "POST", path: "/v1/deliveries/:id/ack", auth: "source", handle: ackDelivery },
+  { method: "POST", path: "/v1/deliveries/:id/claim/renew", auth: "source", handle: renewDeliveryClaim },
+  { method: "POST", path: "/v1/deliveries/:id/claim/resolve", auth: "source", handle: resolveDeliveryClaim },
   { method: "POST", path: "/v1/deliveries/ack-by-key", auth: "source", handle: ackDeliveryByKey },
 ];

@@ -88,7 +88,7 @@ function withoutFireLog<T extends Cron>(cron: T): Omit<T, "fireLog"> {
   return rest;
 }
 
-async function gateSourceCron(ctx: ApiCtx, id: string): Promise<Cron | null> {
+async function gateSourceCron(ctx: ApiCtx, id: string): Promise<{ cron: Cron; actorId: string } | null> {
   const { res, app, url } = ctx;
   const cron = await app.getCron(id);
   if (!cron) {
@@ -96,8 +96,11 @@ async function gateSourceCron(ctx: ApiCtx, id: string): Promise<Cron | null> {
     return null;
   }
   const principalId = url.searchParams.get("principalId");
-  if (!principalId) return cron;
-  if (await canAdministerCron(app, cron, principalId)) return cron;
+  if (!principalId) {
+    sendJson(res, 400, { error: "bad_request", message: "principalId is required" });
+    return null;
+  }
+  if (await canAdministerCron(app, cron, principalId)) return { cron, actorId: principalId };
   sendJson(res, 404, { error: "not_found" });
   return null;
 }
@@ -269,8 +272,9 @@ async function disableCron(ctx: ApiCtx): Promise<void> {
     if (!r.ok) return sendJson(res, CRON_ERROR_STATUS[r.code] ?? 400, { error: r.code, message: r.message });
     return sendJson(res, 200, { ok: true });
   }
-  if (!(await gateSourceCron(ctx, id))) return;
-  await app.setCronEnabled(id, false);
+  const authorized = await gateSourceCron(ctx, id);
+  if (!authorized) return;
+  await app.setCronEnabled(id, false, authorized.actorId);
   return sendJson(res, 200, { ok: true });
 }
 
@@ -295,8 +299,9 @@ async function runCronNow(ctx: ApiCtx): Promise<void> {
     if (!r.ok) return sendJson(res, CRON_ERROR_STATUS[r.code] ?? 400, { error: r.code, message: r.message });
     return sendJson(res, 200, { ok: true });
   }
-  const cron = await gateSourceCron(ctx, id);
-  if (!cron) return;
+  const authorized = await gateSourceCron(ctx, id);
+  if (!authorized) return;
+  const { cron } = authorized;
   if (!deps.scheduler) return sendJson(res, 404, { error: "not_found", message: "scheduler not wired" });
   if (cron.archived || !cron.enabled)
     return sendJson(res, 400, {
@@ -317,8 +322,9 @@ async function cronRuns(ctx: ApiCtx): Promise<void> {
     if (!r.ok) return sendJson(res, CRON_ERROR_STATUS[r.code] ?? 400, { error: r.code, message: r.message });
     return sendJson(res, 200, { cron: withoutFireLog(r.cron), runs: r.runs, total: r.total });
   }
-  const cron = await gateSourceCron(ctx, id);
-  if (!cron) return;
+  const authorized = await gateSourceCron(ctx, id);
+  if (!authorized) return;
+  const { cron } = authorized;
   if (limit !== undefined && (!Number.isInteger(limit) || limit < 1)) {
     return sendJson(res, 400, { error: "bad_request", message: "limit must be a positive integer" });
   }
@@ -372,10 +378,11 @@ async function cronById(ctx: ApiCtx): Promise<void> {
     if (!cron) return;
     return sendJson(res, 200, { cron: withoutFireLog(cron) });
   }
-  const cron = await gateSourceCron(ctx, id);
-  if (!cron) return;
+  const authorized = await gateSourceCron(ctx, id);
+  if (!authorized) return;
+  const { cron, actorId } = authorized;
   if (method === "DELETE") {
-    await app.deleteCron(id);
+    await app.deleteCron(id, actorId);
     return sendJson(res, 200, { ok: true });
   }
   if (!isCronPatch(body)) return sendJson(res, 400, { error: "bad_request", message: CRON_PATCH_BAD_REQUEST });
@@ -403,7 +410,7 @@ async function cronById(ctx: ApiCtx): Promise<void> {
       : {}),
   };
   try {
-    const updated = await app.updateCron(id, patch);
+    const updated = await app.updateCron(id, patch, actorId);
     return sendJson(res, 200, { cron: updated ? withoutFireLog(updated) : null });
   } catch (e) {
     return sendJson(res, 400, { error: "cron_update_failed", message: errMessage(e) });
@@ -427,7 +434,7 @@ async function triggerConsent(ctx: ApiCtx): Promise<void> {
       ? sendJson(res, 400, { error: "bad_request", message: "this trigger has no recipient consent to decide on" })
       : sendJson(res, 403, { error: "forbidden", message: "only the delivery recipient can accept or decline this" });
   }
-  await app.setCronRecipientConsent(id, decided.consent);
+  await app.setCronRecipientConsent(id, decided.consent, capability.actorId);
   return sendJson(res, 200, { ok: true, consent: decided.consent });
 }
 

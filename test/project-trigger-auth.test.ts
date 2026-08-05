@@ -179,6 +179,55 @@ test("Project trigger access follows current membership while Slack-group owner 
   );
   const slackGetPath = `/v1/crons/${slackCron.id}?principalId=member`;
   assert.equal((await fetch(`${base}${slackGetPath}`, { headers: signed("GET", slackGetPath) })).status, 200);
+  const anonymousPatchPath = `/v1/crons/${slackCron.id}`;
+  const anonymousPatchBody = JSON.stringify({ title: "anonymous update" });
+  assert.equal(
+    (
+      await fetch(`${base}${anonymousPatchPath}`, {
+        method: "PATCH",
+        headers: signed("PATCH", anonymousPatchPath, anonymousPatchBody),
+        body: anonymousPatchBody,
+      })
+    ).status,
+    400,
+    "source mutations require the actual operator instead of falling back to the owner",
+  );
+  const slackPatchBody = JSON.stringify({ title: "member update" });
+  assert.equal(
+    (
+      await fetch(`${base}${slackGetPath}`, {
+        method: "PATCH",
+        headers: signed("PATCH", slackGetPath, slackPatchBody),
+        body: slackPatchBody,
+      })
+    ).status,
+    200,
+  );
+  const slackDisablePath = `/v1/crons/${slackCron.id}/disable?principalId=member`;
+  assert.equal(
+    (await fetch(`${base}${slackDisablePath}`, { method: "POST", headers: signed("POST", slackDisablePath) })).status,
+    200,
+  );
+  const disposableCron = await built.app.createCron({
+    ownerScopeId: slackScope,
+    owner: "member",
+    createdBy: "member",
+    action: "delete me",
+    schedule: { everyMs: 60_000 },
+  });
+  const disposablePath = `/v1/crons/${disposableCron.id}?principalId=member`;
+  assert.equal(
+    (await fetch(`${base}${disposablePath}`, { method: "DELETE", headers: signed("DELETE", disposablePath) })).status,
+    200,
+  );
+  const memberAudits = (await built.auditLog.events()).filter(
+    (event) => event.principalId === "member" && ["cron_update", "cron_disable", "cron_delete"].includes(event.action),
+  );
+  assert.deepEqual(
+    memberAudits.map((event) => event.action),
+    ["cron_update", "cron_disable", "cron_delete"],
+    "source mutations record the authenticated current member",
+  );
   const publicGetPath = `/v1/crons/${publicCron.id}?principalId=member`;
   assert.equal((await fetch(`${base}${publicGetPath}`, { headers: signed("GET", publicGetPath) })).status, 200);
   const publicRunsPath = `/v1/crons/${publicCron.id}/runs?principalId=member`;

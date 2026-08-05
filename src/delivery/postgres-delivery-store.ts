@@ -18,6 +18,12 @@ function rowToDelivery(r: Record<string, unknown>): Delivery {
     ...(r.recipient_thread_ref != null ? { recipientThreadRef: r.recipient_thread_ref as string } : {}),
     ...(r.deliver_latency_ms != null ? { deliverLatencyMs: Number(r.deliver_latency_ms) } : {}),
     ...(r.slack_api_ms != null ? { slackApiMs: Number(r.slack_api_ms) } : {}),
+    ...(r.claim_token != null && r.claim_expires_at != null
+      ? { claim: { token: r.claim_token as string, expiresAt: Number(r.claim_expires_at) } }
+      : {}),
+    ...(r.failed_at != null && r.failure_code != null
+      ? { failure: { at: Number(r.failed_at), code: r.failure_code as NonNullable<Delivery["failure"]>["code"] } }
+      : {}),
   };
 }
 
@@ -40,6 +46,9 @@ export function createPostgresDeliveryStore(connectionString: string): DeliveryS
     `ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS deliver_latency_ms INT`,
     `ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS slack_api_ms INT`,
     `ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS claim_expires_at BIGINT`,
+    `ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS claim_token TEXT`,
+    `ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS failed_at BIGINT`,
+    `ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS failure_code TEXT`,
     `CREATE INDEX IF NOT EXISTS idx_deliveries_recipient_thread
         ON deliveries (recipient_thread_ref, created_at) WHERE recipient_thread_ref IS NOT NULL`,
     `CREATE INDEX IF NOT EXISTS idx_deliveries_shadow
@@ -80,7 +89,7 @@ export function createPostgresDeliveryStore(connectionString: string): DeliveryS
     },
     async pending(type) {
       const rows = await q(
-        "SELECT * FROM deliveries WHERE delivered_at IS NULL AND NOT shadow AND destination->>'type' = $1 ORDER BY created_at",
+        "SELECT * FROM deliveries WHERE delivered_at IS NULL AND failed_at IS NULL AND NOT shadow AND destination->>'type' = $1 ORDER BY created_at",
         [type],
       );
       return rows.map(rowToDelivery);
@@ -88,19 +97,58 @@ export function createPostgresDeliveryStore(connectionString: string): DeliveryS
     async claimPending(type, ttlMs) {
       const rows = await q(
         `UPDATE deliveries
-            SET claim_expires_at = (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT + $2
+            SET claim_expires_at = (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT + $2,
+                claim_token = $3
           WHERE id IN (
             SELECT id FROM deliveries
-             WHERE delivered_at IS NULL AND NOT shadow AND destination->>'type' = $1
+             WHERE delivered_at IS NULL AND failed_at IS NULL AND NOT shadow AND destination->>'type' = $1
                AND (claim_expires_at IS NULL
                  OR claim_expires_at <= (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT)
              ORDER BY created_at
                FOR UPDATE SKIP LOCKED
           )
           RETURNING *`,
-        [type, ttlMs],
+        [type, ttlMs, randomUUID()],
       );
       return rows.map(rowToDelivery).sort((a, b) => a.createdAt - b.createdAt);
+    },
+    async renewClaim(id, token, ttlMs) {
+      const result = await query(
+        `UPDATE deliveries
+            SET claim_expires_at = (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT + $3
+          WHERE id = $1 AND claim_token = $2 AND delivered_at IS NULL AND failed_at IS NULL
+            AND claim_expires_at > (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT`,
+        [id, token, ttlMs],
+      );
+      return result.rowCount === 1;
+    },
+    async resolveClaim(id, token, resolution) {
+      const resolved =
+        resolution.kind === "delivered"
+          ? await query(
+              `UPDATE deliveries
+                SET delivered_at = $3, deliver_latency_ms = GREATEST(0, $3 - created_at)
+              WHERE id = $1 AND claim_token = $2 AND delivered_at IS NULL AND failed_at IS NULL
+                AND claim_expires_at > (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT`,
+              [id, token, resolution.at],
+            )
+          : await query(
+              `UPDATE deliveries SET failed_at = $3, failure_code = $4
+              WHERE id = $1 AND claim_token = $2 AND delivered_at IS NULL AND failed_at IS NULL
+                AND claim_expires_at > (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT`,
+              [id, token, resolution.at, resolution.code],
+            );
+      if (resolved.rowCount === 1) return "resolved";
+      const rows = await q("SELECT claim_token, delivered_at, failed_at, failure_code FROM deliveries WHERE id = $1", [
+        id,
+      ]);
+      const current = rows[0];
+      if (!current || current.claim_token !== token) return "stale";
+      if (resolution.kind === "delivered" && current.delivered_at != null) return "duplicate";
+      if (resolution.kind === "failed" && current.failed_at != null && current.failure_code === resolution.code) {
+        return "duplicate";
+      }
+      return "stale";
     },
     async listShadow(opts) {
       const limit = Math.max(1, opts?.limit ?? 100);
@@ -116,7 +164,7 @@ export function createPostgresDeliveryStore(connectionString: string): DeliveryS
             SET delivered_at = $2,
                 deliver_latency_ms = GREATEST(0, $2 - created_at),
                 slack_api_ms = COALESCE($3, slack_api_ms)
-          WHERE id = $1 AND delivered_at IS NULL`,
+          WHERE id = $1 AND delivered_at IS NULL AND failed_at IS NULL`,
         [id, at, slackApiMs ?? null],
       );
     },
@@ -125,7 +173,8 @@ export function createPostgresDeliveryStore(connectionString: string): DeliveryS
         `INSERT INTO deliveries (id, idempotency_key, destination, text, created_at, delivered_at)
          VALUES ($1, $2, '{"type":"ack-tombstone","target":""}', '', $3, $3)
          ON CONFLICT (idempotency_key)
-         DO UPDATE SET delivered_at = COALESCE(deliveries.delivered_at, EXCLUDED.delivered_at)`,
+         DO UPDATE SET delivered_at = COALESCE(deliveries.delivered_at, EXCLUDED.delivered_at)
+         WHERE deliveries.failed_at IS NULL`,
         [randomUUID(), idempotencyKey, at],
       );
     },
@@ -145,7 +194,7 @@ export function createPostgresDeliveryStore(connectionString: string): DeliveryS
         `UPDATE deliveries
             SET recipient_thread_ref = $2,
                 delivered_at = COALESCE(delivered_at, $3)
-          WHERE id = $1 AND destination->>'type' = 'principal'`,
+          WHERE id = $1 AND destination->>'type' = 'principal' AND failed_at IS NULL`,
         [id, recipientThreadRef, at],
       );
     },

@@ -221,4 +221,42 @@ describe("runTrigger: an autonomous cron does NOT go live (it may be conditional
     assert.equal(req?.surfaceTools, undefined, "a cron never gets addressed/shed semantics — it may stay silent");
     assert.equal((await d.deliveries.pending("slack")).length, 1, "core delivers the cron reply via the enqueue path");
   });
+
+  it("a background approval stops this fire and notifies the owner to retry interactively exactly once", async () => {
+    const d = deps(async () => ({
+      status: "pending_approval",
+      pendingApprovals: [{ requestId: "approval-a", command: "dangerous", reason: "needs approval" }],
+    }));
+    const spec = {
+      owner: "U1",
+      ownerScopeId: scopeId("channel", "C1"),
+      input: "run the gated action",
+      fireKey: "cron:c2:t1",
+      surface: "cron",
+      threadRef: "cron:c2:t1",
+      destination: { type: "group", target: "G1", audienceScopeId: scopeId("group", "G1") },
+    } as const;
+
+    const first = await runTrigger(d, spec);
+    const second = await runTrigger(d, spec);
+
+    assert.equal(first.status, "pending_approval");
+    assert.match(first.note ?? "", /failed closed/u);
+    assert.equal(second.ran, false, "the same fire is not executed again");
+    assert.deepEqual(await d.deliveries.pending("group"), [], "approval detail never falls back to the group");
+    const notices = await d.deliveries.pending("principal");
+    assert.equal(notices.length, 1);
+    assert.deepEqual(notices[0]!.destination, {
+      type: "principal",
+      target: "U1",
+      audienceScopeId: scopeId("personal", "U1"),
+      onBehalfOf: "U1",
+    });
+    assert.deepEqual(notices[0]!.provenance?.notice, { code: "background_approval_required" });
+    assert.doesNotMatch(
+      notices[0]!.text,
+      /dangerous|needs approval/u,
+      "the notice does not contain gated command detail",
+    );
+  });
 });

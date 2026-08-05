@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { Delivery, DeliveryProvenance, Destination, OutgoingAttachment } from "../types.ts";
+import type { Delivery, DeliveryProvenance, DeliveryResolution, Destination, OutgoingAttachment } from "../types.ts";
 import { cronIdOf } from "../sessions/session-store.ts";
 
 export interface DeliveryStore {
@@ -13,6 +13,8 @@ export interface DeliveryStore {
   }): Promise<Delivery>;
   pending(type: string): Promise<Delivery[]>;
   claimPending(type: string, ttlMs: number): Promise<Delivery[]>;
+  renewClaim(id: string, token: string, ttlMs: number): Promise<boolean>;
+  resolveClaim(id: string, token: string, resolution: DeliveryResolution): Promise<"resolved" | "duplicate" | "stale">;
   listShadow(opts?: { limit?: number }): Promise<Delivery[]>;
   ack(id: string, at: number, slackApiMs?: number): Promise<void>;
   ackByKey(idempotencyKey: string, at: number): Promise<void>;
@@ -29,7 +31,7 @@ export interface DeliveryStore {
 export function createDeliveryStore(): DeliveryStore {
   const deliveries = new Map<string, Delivery>();
   const byKey = new Map<string, string>();
-  const claimedUntil = new Map<string, number>();
+  const claims = new Map<string, { token: string; expiresAt: number }>();
   const enqueueListeners = new Set<() => void>();
 
   return {
@@ -53,16 +55,51 @@ export function createDeliveryStore(): DeliveryStore {
       return delivery;
     },
     async pending(type) {
-      return [...deliveries.values()].filter((d) => d.deliveredAt === null && !d.shadow && d.destination.type === type);
+      return [...deliveries.values()].filter(
+        (d) => d.deliveredAt === null && d.failure === undefined && !d.shadow && d.destination.type === type,
+      );
     },
     async claimPending(type, ttlMs) {
       const now = Date.now();
       const rows = [...deliveries.values()].filter(
         (d) =>
-          d.deliveredAt === null && !d.shadow && d.destination.type === type && (claimedUntil.get(d.id) ?? 0) <= now,
+          d.deliveredAt === null &&
+          d.failure === undefined &&
+          !d.shadow &&
+          d.destination.type === type &&
+          (claims.get(d.id)?.expiresAt ?? 0) <= now,
       );
-      for (const d of rows) claimedUntil.set(d.id, now + ttlMs);
-      return rows;
+      return rows.map((delivery) => {
+        const claim = { token: randomUUID(), expiresAt: now + ttlMs };
+        claims.set(delivery.id, claim);
+        return { ...delivery, claim: { token: claim.token, expiresAt: claim.expiresAt } };
+      });
+    },
+    async renewClaim(id, token, ttlMs) {
+      const delivery = deliveries.get(id);
+      const claim = claims.get(id);
+      const now = Date.now();
+      if (!delivery || delivery.deliveredAt !== null || delivery.failure !== undefined) return false;
+      if (!claim || claim.token !== token || claim.expiresAt <= now) return false;
+      claim.expiresAt = now + ttlMs;
+      return true;
+    },
+    async resolveClaim(id, token, resolution) {
+      const delivery = deliveries.get(id);
+      const claim = claims.get(id);
+      if (!delivery || !claim || claim.token !== token) return "stale";
+      if (delivery.deliveredAt !== null) return resolution.kind === "delivered" ? "duplicate" : "stale";
+      if (delivery.failure !== undefined) {
+        return resolution.kind === "failed" && delivery.failure.code === resolution.code ? "duplicate" : "stale";
+      }
+      if (claim.expiresAt <= Date.now()) return "stale";
+      if (resolution.kind === "delivered") {
+        delivery.deliveredAt = resolution.at;
+        delivery.deliverLatencyMs = Math.max(0, resolution.at - delivery.createdAt);
+      } else {
+        delivery.failure = { at: resolution.at, code: resolution.code };
+      }
+      return "resolved";
     },
     async listShadow(opts) {
       const limit = Math.max(1, opts?.limit ?? 100);
@@ -73,7 +110,7 @@ export function createDeliveryStore(): DeliveryStore {
     },
     async ack(id, at, slackApiMs) {
       const d = deliveries.get(id);
-      if (d && d.deliveredAt === null) {
+      if (d && d.deliveredAt === null && d.failure === undefined) {
         d.deliveredAt = at;
         d.deliverLatencyMs = Math.max(0, at - d.createdAt);
         if (slackApiMs !== undefined) d.slackApiMs = slackApiMs;
@@ -83,7 +120,7 @@ export function createDeliveryStore(): DeliveryStore {
       const existingId = byKey.get(idempotencyKey);
       if (existingId) {
         const d = deliveries.get(existingId);
-        if (d && d.deliveredAt === null) d.deliveredAt = at;
+        if (d && d.deliveredAt === null && d.failure === undefined) d.deliveredAt = at;
         return;
       }
       const tombstone: Delivery = {
@@ -107,7 +144,7 @@ export function createDeliveryStore(): DeliveryStore {
     },
     async recordRecipientThread(id, recipientThreadRef, at) {
       const d = deliveries.get(id);
-      if (!d || d.destination.type !== "principal") return;
+      if (!d || d.destination.type !== "principal" || d.failure !== undefined) return;
       d.recipientThreadRef = recipientThreadRef;
       if (d.deliveredAt === null) d.deliveredAt = at;
     },

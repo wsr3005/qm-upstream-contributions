@@ -37,6 +37,11 @@ async function fetchPending(base: string, query: string): Promise<{ id: string }
   return ((await res.json()) as { deliveries?: { id: string }[] }).deliveries ?? [];
 }
 
+async function signedPost(base: string, path: string, value: unknown): Promise<Response> {
+  const body = JSON.stringify(value);
+  return fetch(`${base}${path}`, { method: "POST", headers: sign("POST", path, body), body });
+}
+
 test("two overlapping drain pollers with claimMs can't both receive the same delivery", async () => {
   const srv = start();
   try {
@@ -86,6 +91,59 @@ test("an expired claim re-surfaces the row to a later poll (drainer died mid-pos
     );
     await new Promise((r) => setTimeout(r, 80));
     assert.equal((await fetchPending(srv.base, "type=group&claimMs=15000")).length, 1, "the abandoned row comes back");
+  } finally {
+    await srv.close();
+  }
+});
+
+test("a source can renew and terminally resolve only its current delivery claim", async () => {
+  const srv = start();
+  try {
+    await srv.app.enqueueDelivery({
+      destination: { type: "office", target: "member-a" },
+      text: "scheduled result",
+      idempotencyKey: "post:sess-4:one",
+    });
+    const first = (await fetchPending(srv.base, "type=office&claimMs=50"))[0] as {
+      id: string;
+      claim: { token: string };
+    };
+    assert.ok(first.claim.token);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const current = (await fetchPending(srv.base, "type=office&claimMs=15000"))[0] as {
+      id: string;
+      claim: { token: string };
+    };
+    assert.notEqual(current.claim.token, first.claim.token);
+
+    const stale = await signedPost(srv.base, `/v1/deliveries/${first.id}/claim/resolve?nonce=stale`, {
+      claimToken: first.claim.token,
+      outcome: "delivered",
+    });
+    assert.equal(stale.status, 409);
+
+    const renewed = await signedPost(srv.base, `/v1/deliveries/${current.id}/claim/renew?nonce=renew`, {
+      claimToken: current.claim.token,
+      claimMs: 15_000,
+    });
+    assert.equal(renewed.status, 200);
+
+    const resolved = await signedPost(srv.base, `/v1/deliveries/${current.id}/claim/resolve?nonce=resolve`, {
+      claimToken: current.claim.token,
+      outcome: "failed",
+      failureCode: "recipient_unauthorized",
+    });
+    assert.equal(resolved.status, 200);
+    assert.deepEqual(await resolved.json(), { outcome: "resolved" });
+
+    const duplicate = await signedPost(srv.base, `/v1/deliveries/${current.id}/claim/resolve?nonce=retry`, {
+      claimToken: current.claim.token,
+      outcome: "failed",
+      failureCode: "recipient_unauthorized",
+    });
+    assert.equal(duplicate.status, 200);
+    assert.deepEqual(await duplicate.json(), { outcome: "duplicate" });
+    assert.deepEqual(await fetchPending(srv.base, "type=office"), []);
   } finally {
     await srv.close();
   }

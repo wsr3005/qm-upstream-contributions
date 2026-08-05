@@ -39,6 +39,8 @@ export function createMessagingMethods(
   | "setCronDestination"
   | "setCronRecipientConsent"
   | "pendingDeliveries"
+  | "renewDeliveryClaim"
+  | "resolveDeliveryClaim"
   | "enqueueDelivery"
   | "ingestSurfaceEvents"
   | "searchSurface"
@@ -142,7 +144,7 @@ export function createMessagingMethods(
         });
       return { owned, visible };
     },
-    async updateCron(id, patch) {
+    async updateCron(id, patch, actorId) {
       const before = await deps.crons.get(id);
       if (!before) return null;
       if (patch.schedule) validateUserSchedule(patch.schedule);
@@ -155,46 +157,72 @@ export function createMessagingMethods(
       const updated = await deps.crons.update(id, patch);
       deps.auditLog.record({
         at: Date.now(),
-        principalId: before.owner,
+        principalId: actorId,
         action: "cron_update",
         resource: id,
         scopeLabel: before.ownerScopeId,
       });
       return updated;
     },
-    async deleteCron(id) {
+    async deleteCron(id, actorId) {
       const before = await deps.crons.get(id);
       await deps.crons.delete(id);
       if (before)
         deps.auditLog.record({
           at: Date.now(),
-          principalId: before.owner,
+          principalId: actorId,
           action: "cron_delete",
           resource: id,
           scopeLabel: before.ownerScopeId,
         });
     },
-    setCronEnabled(id, enabled) {
-      return deps.crons.setEnabled(id, enabled);
+    async setCronEnabled(id, enabled, actorId) {
+      const before = await deps.crons.get(id);
+      await deps.crons.setEnabled(id, enabled);
+      if (before) {
+        deps.auditLog.record({
+          at: Date.now(),
+          principalId: actorId,
+          action: enabled ? "cron_enable" : "cron_disable",
+          resource: id,
+          scopeLabel: before.ownerScopeId,
+        });
+      }
     },
-    async setCronDestination(id, destination) {
+    async setCronDestination(id, destination, actorId) {
       const before = await deps.crons.get(id);
       if (!before) return null;
       await deps.crons.setDestination(id, destination);
       deps.auditLog.record({
         at: Date.now(),
-        principalId: before.owner,
+        principalId: actorId,
         action: "cron_retarget",
         resource: id,
         scopeLabel: before.ownerScopeId,
       });
       return deps.crons.get(id);
     },
-    setCronRecipientConsent(id, recipientConsent) {
-      return deps.crons.setRecipientConsent(id, recipientConsent);
+    async setCronRecipientConsent(id, recipientConsent, actorId) {
+      const before = await deps.crons.get(id);
+      await deps.crons.setRecipientConsent(id, recipientConsent);
+      if (before) {
+        deps.auditLog.record({
+          at: Date.now(),
+          principalId: actorId,
+          action: `cron_recipient_consent_${recipientConsent.status}`,
+          resource: id,
+          scopeLabel: before.ownerScopeId,
+        });
+      }
     },
     pendingDeliveries(type, claimMs) {
       return claimMs && claimMs > 0 ? deps.deliveries.claimPending(type, claimMs) : deps.deliveries.pending(type);
+    },
+    renewDeliveryClaim(id, token, ttlMs) {
+      return deps.deliveries.renewClaim(id, token, ttlMs);
+    },
+    resolveDeliveryClaim(id, token, resolution) {
+      return deps.deliveries.resolveClaim(id, token, resolution);
     },
     async enqueueDelivery(input) {
       await deps.deliveries.enqueue(input);

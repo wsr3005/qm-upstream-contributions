@@ -485,7 +485,7 @@ export function createControlService(app: App, scheduler?: Scheduler): ControlSe
       const patch = await patchFromCronPatchRequest(app, before, req, capability);
       if ("ok" in patch) return patch;
       try {
-        const cron = await app.updateCron(id, patch);
+        const cron = await app.updateCron(id, patch, capability.actorId);
         if (!cron) return { ok: false, code: "not_found", message: `no cron ${id}` };
         const changeSummary: string[] = [];
         if (req.title !== undefined) changeSummary.push("title");
@@ -509,7 +509,7 @@ export function createControlService(app: App, scheduler?: Scheduler): ControlSe
       if (!cron) return { ok: false, code: "not_found", message: `no cron ${id}` };
       if (!(await canAdministerCron(app, cron, capability.actorId, capability.scopeId)))
         return { ok: false, code: "forbidden", message: "not your cron" };
-      await app.deleteCron(id);
+      await app.deleteCron(id, capability.actorId);
       await notifyEdit(cron, capability, ["deleted"], "deleted");
       return { ok: true };
     },
@@ -519,7 +519,7 @@ export function createControlService(app: App, scheduler?: Scheduler): ControlSe
       if (!cron) return { ok: false, code: "not_found", message: `no cron ${id}` };
       if (!(await canAdministerCron(app, cron, capability.actorId, capability.scopeId)))
         return { ok: false, code: "forbidden", message: "not your cron" };
-      await app.setCronEnabled(id, enabled);
+      await app.setCronEnabled(id, enabled, capability.actorId);
       await notifyEdit(cron, capability, [`enabled=${enabled}`], `enabled=${enabled}`);
       const after = await app.getCron(id);
       return { ok: true, cron: after ?? cron };
@@ -559,7 +559,7 @@ export function createControlService(app: App, scheduler?: Scheduler): ControlSe
           message: "destinationKey is not one of the destinations available for this conversation",
         };
       }
-      const updated = await app.setCronDestination(id, resolved.destination);
+      const updated = await app.setCronDestination(id, resolved.destination, capability.actorId);
       const destLabel = capability.destinations?.find((d) => d.key === destinationKey)?.label;
       await notifyEdit(
         cron,

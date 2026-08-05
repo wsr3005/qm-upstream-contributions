@@ -154,7 +154,7 @@ test("retained cron runs are private to people who can manage the cron", async (
   assert.equal(((await owner.json()) as { runs: Array<{ reply?: string }> }).runs[0]?.reply, "private result");
   assert.equal((await fetch(`${webBase}/api/crons/${cron.id}/runs`, asUser("other-user"))).status, 404);
 
-  await built.app.deleteCron(cron.id);
+  await built.app.deleteCron(cron.id, "run-owner");
 });
 
 test("list splits owned crons from ones visible through shared scopes, and visibility never grants administration", async () => {
@@ -217,7 +217,7 @@ test("list splits owned crons from ones visible through shared scopes, and visib
     assert.equal((await attempt).status, 404);
   }
 
-  for (const id of [publicCron.id, privateCron.id, dmCron.id, personalCron.id]) await built.app.deleteCron(id);
+  for (const cron of [publicCron, privateCron, dmCron, personalCron]) await built.app.deleteCron(cron.id, cron.owner);
 });
 
 test("a private-channel MEMBER may manage a shared cron via the web; a public-channel member and a non-member may not", async () => {
@@ -264,5 +264,5 @@ test("a private-channel MEMBER may manage a shared cron via the web; a public-ch
   const carolPriv = await fetch(`${webBase}/api/crons/${privCron.id}`, asUser("carol", { method: "DELETE" }));
   assert.equal(carolPriv.status, 404, "a non-member is denied");
 
-  for (const id of [privCron.id, pubCron.id]) await built.app.deleteCron(id);
+  for (const cron of [privCron, pubCron]) await built.app.deleteCron(cron.id, cron.owner);
 });
