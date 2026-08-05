@@ -296,7 +296,7 @@ export function createAmbientHelpers(deps: AppDeps, app: App) {
     return true;
   }
 
-  async function addressedWakeText(input: OrchestratorInput): Promise<string> {
+  async function addressedWakeText(input: OrchestratorInput, at = new Date()): Promise<string> {
     const container = input.conversation.channelRef ?? input.conversation.threadRef;
     const policy = deps.channelPolicy ? await deps.channelPolicy.get(container).catch(() => undefined) : undefined;
     const orders = policy?.orders;
@@ -306,7 +306,7 @@ export function createAmbientHelpers(deps: AppDeps, app: App) {
       reason: "addressed",
       surface,
       channel: container,
-      at: new Date(),
+      at,
       why: `${sender} addressed you directly; they expect a response.`,
       ...(orders ? { orders } : {}),
       recentMessages: [],

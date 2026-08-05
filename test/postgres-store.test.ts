@@ -894,6 +894,8 @@ test("pg run store: enqueue dedup, atomic one-per-session claim, fencing, ledger
     const b = await runs.enqueue({ sessionId: "s1", request: turn("again"), dedupKey: "k1" });
     assert.equal(b.deduped, true);
     assert.equal(b.run.id, a.run.id);
+    assert.equal((await runs.getByDedupKey("k1"))?.id, a.run.id);
+    assert.equal(await runs.getByDedupKey("missing-key"), null);
 
     const N = 8;
     const raced = await Promise.all(

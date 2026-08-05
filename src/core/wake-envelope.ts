@@ -70,3 +70,19 @@ export function buildWakeEnvelope(o: WakeEnvelopeOpts): string {
     `</wake>`,
   ].join("\n");
 }
+
+export function stableAmbientWakeEnvelope(text: string): string {
+  const match = text.match(
+    /^(<wake reason="ambient" surface="[^"\r\n]*" channel="[^"\r\n]*" at=")\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z(">\n[\s\S]*\n<\/wake>)$/,
+  );
+  return match ? `${match[1]}${match[2]}` : text;
+}
+
+export function addressedWakeEnvelopeAt(text: string): Date | undefined {
+  const match = text.match(
+    /^<wake reason="addressed" surface="[^"\r\n]*" channel="[^"\r\n]*" at="(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)">\n[\s\S]*\n<\/wake>$/,
+  );
+  if (!match) return undefined;
+  const at = new Date(match[1]!);
+  return Number.isNaN(at.valueOf()) ? undefined : at;
+}

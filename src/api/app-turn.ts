@@ -5,6 +5,7 @@ import { isHalt, routeWake, type Wake } from "../wake/wake.ts";
 import type { OrchestratorInput } from "../core/orchestrator.ts";
 import { resolveTurnOrigin } from "../core/turn-origin.ts";
 import { isTerminal, leaseLapsed } from "../runs/run-store.ts";
+import { deduplicatedRunMatches } from "../runs/run-dedup.ts";
 import { turnModelOptions, validateWebTurnModelOptions, webTurnRuntimeModelRefusal } from "../core/turn-options.ts";
 import { isProjectGroupRef, projectIdFromGroupRef } from "../projects/project-store.ts";
 import {
@@ -16,6 +17,7 @@ import {
 import { selectableCatalogForHarness, selectableModelCatalog } from "../model/model-catalog.ts";
 import { resolveRuntimeChoiceDurable } from "../harness/harness-router.ts";
 import { errMessage } from "../util/errors.ts";
+import { addressedWakeEnvelopeAt } from "../core/wake-envelope.ts";
 
 import type { App, AppDeps } from "./app-types.ts";
 import { STALE_LEASE_GRACE_MS } from "./app-types.ts";
@@ -252,6 +254,46 @@ export function createTurnMethods(
         ...(sessionParticipantIds ? { sessionParticipantIds } : {}),
         ...(projectVersion ? { scopeVersion: projectVersion } : {}),
       };
+      let dedupKey: string | undefined;
+      if (req.idempotencyKey) {
+        dedupKey =
+          projectVersion === undefined ? req.idempotencyKey : `${req.idempotencyKey}:project-${projectVersion}`;
+      }
+      const previousRun = dedupKey ? deps.runs.getByDedupKey(dedupKey) : Promise.resolve(null);
+      let routed: { request: OrchestratorInput; spineRouted: boolean } | undefined;
+      const routedRequest = async (): Promise<{ request: OrchestratorInput; spineRouted: boolean }> => {
+        if (routed) return routed;
+        let request = input as OrchestratorInput;
+        const spineRouted = !req.approval && shouldRouteToSpine(request);
+        if (spineRouted) {
+          request = { ...request, surfaceTools: true };
+          if (origin.kind !== "ambient") {
+            const priorAt = addressedWakeEnvelopeAt((await previousRun)?.request.text ?? "");
+            request = {
+              ...request,
+              text: await addressedWakeText(input as OrchestratorInput, priorAt),
+              displayText: input.text,
+              envelopeWrapped: true,
+            };
+          }
+        }
+        routed = { request, spineRouted };
+        return routed;
+      };
+
+      if (dedupKey) {
+        const canonical = await routedRequest();
+        const previous = await previousRun;
+        if (previous && !deduplicatedRunMatches(previous, conversation.threadRef, canonical.request)) {
+          return { status: "refused", reason: "that idempotency key belongs to a different request" };
+        }
+        if (previous) {
+          const run = previous;
+          if (run.result && isTerminal(run.status)) return withAdminLink(run.result);
+          if (req.async) return { status: "queued", runId: run.id };
+          return drive(run.id);
+        }
+      }
 
       if (projectGroup && req.approval) {
         const [approval, approvalSession] = await Promise.all([
@@ -269,17 +311,11 @@ export function createTurnMethods(
         }
       }
       const blocked = await pendingApprovalResultForThread(conversation.threadRef, projectGroup ? actor.id : undefined);
-      let request = input;
+      let request = input as OrchestratorInput;
       if (blocked) {
         const pendingList = blocked.pendingApprovals ?? [];
         const matches = (id?: string): boolean => !!id && pendingList.some((p) => p.requestId === id);
         if (!matches(req.approval?.requestId)) return blocked;
-      }
-
-      let dedupKey: string | undefined;
-      if (req.idempotencyKey) {
-        dedupKey =
-          projectVersion === undefined ? req.idempotencyKey : `${req.idempotencyKey}:project-${projectVersion}`;
       }
 
       if (origin.kind === "human" && !req.approval) deps.reaperPoke?.();
@@ -350,17 +386,9 @@ export function createTurnMethods(
         }
       }
 
-      const spineRouted = !req.approval && shouldRouteToSpine(request as OrchestratorInput);
-      if (spineRouted) {
-        request = { ...input, surfaceTools: true };
-        if (origin.kind !== "ambient")
-          request = {
-            ...request,
-            text: await addressedWakeText(input as OrchestratorInput),
-            displayText: input.text,
-            envelopeWrapped: true,
-          };
-      }
+      const canonical = await routedRequest();
+      request = canonical.request;
+      const { spineRouted } = canonical;
 
       if (spineRouted && origin.kind === "human" && !req.spawned && !req.idempotencyKey && origin.messageTs) {
         const container = conversation.channelRef ?? conversation.threadRef;
@@ -411,6 +439,15 @@ export function createTurnMethods(
       const enqueued = await withCurrentProjectRoster(enqueue);
       if (!enqueued) return { status: "refused", reason: "project membership changed; retry from the current project" };
       const { run, deduped } = enqueued;
+      if (deduped) {
+        if (spineRouted && origin.kind !== "ambient") {
+          const priorAt = addressedWakeEnvelopeAt(run.request.text);
+          if (priorAt) request = { ...request, text: await addressedWakeText(input as OrchestratorInput, priorAt) };
+        }
+        if (!deduplicatedRunMatches(run, conversation.threadRef, request as OrchestratorInput)) {
+          return { status: "refused", reason: "that idempotency key belongs to a different request" };
+        }
+      }
       if (!deduped) {
         deps.sessionStateBus?.emit({
           threadRef: conversation.threadRef,

@@ -30,6 +30,8 @@ for (const backend of backends) {
     assert.equal(a.deduped, false);
     assert.equal(b.deduped, true);
     assert.equal(b.run.id, a.run.id);
+    assert.equal((await runs.getByDedupKey("k1"))?.id, a.run.id);
+    assert.equal(await runs.getByDedupKey("missing"), null);
     const c = await runs.enqueue({ sessionId: "s1", request: turn("fresh"), dedupKey: "k2" });
     assert.notEqual(c.run.id, a.run.id);
   });

@@ -6,6 +6,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildApp } from "../src/wiring.ts";
+import { buildWakeEnvelope } from "../src/core/wake-envelope.ts";
 import { scopeId, type TurnRequest } from "../src/types.ts";
 import { testConfig } from "./support/test-config.ts";
 
@@ -132,14 +133,143 @@ test("spine ON: a re-delivered @mention (same idempotencyKey) spawns ONE sub-con
   const channel = "C3";
   const root = "300.3";
   const key = "evt-abc";
-  const first = await built.app.turn({ ...mention("!post once", channel, root), idempotencyKey: key });
-  const second = await built.app.turn({ ...mention("!post once", channel, root), idempotencyKey: key });
+  const [first, second] = await Promise.all([
+    built.app.turn({
+      ...mention("!post once", channel, root),
+      idempotencyKey: key,
+      clientSentAt: 1,
+      intakePreambleMs: 2,
+    }),
+    built.app.turn({
+      ...mention("!post once", channel, root),
+      idempotencyKey: key,
+      clientSentAt: 3,
+      intakePreambleMs: 4,
+    }),
+  ]);
   assert.equal(first.runId, second.runId, "the second delivery dedups to the same sub run");
+  assert.equal(
+    (await built.app.turn({ ...mention("!post different", channel, root), idempotencyKey: key })).status,
+    "refused",
+  );
+  assert.equal(
+    (await built.app.turn({ ...mention("!post once", channel, "300.4"), idempotencyKey: key })).status,
+    "refused",
+  );
+  assert.equal(
+    (
+      await built.app.turn({
+        ...mention("!post once", channel, root),
+        actor: { externalId: "U2" },
+        idempotencyKey: key,
+      })
+    ).status,
+    "refused",
+  );
   assert.equal(
     await built.sessions.getByThread(`slack/${channel}`),
     null,
     "no per-container ambient session is created",
   );
+});
+
+test("spine ON: a delayed re-delivery reuses the generated addressed wake time", async () => {
+  const built = freshApp();
+  const turn = { ...mention("!post once", "C3", "300.5"), idempotencyKey: "evt-delayed" };
+  const first = await built.app.turn(turn);
+  await sleep(5);
+  const second = await built.app.turn(turn);
+
+  assert.equal(second.runId, first.runId);
+});
+
+test("a caller-supplied addressed envelope remains identity-bearing", async () => {
+  const built = freshApp();
+  const addressed = (why: string) =>
+    buildWakeEnvelope({
+      reason: "addressed",
+      surface: "slack",
+      channel: "D1",
+      at: new Date(0),
+      why,
+      recentMessages: [{ ts: "1.0", authorId: "U2", text: "context" }],
+      addressedMessages: [{ ts: "2.0", authorId: "U1", text: "execute once" }],
+      instructions: "Act on the addressed message.",
+    });
+  const turn: TurnRequest = {
+    surface: "slack",
+    actor,
+    conversation: { kind: "dm", threadRef: "dm:U1:addressed", audience: [actor] },
+    text: addressed("The user addressed you."),
+    displayText: "execute once",
+    envelopeWrapped: true,
+    idempotencyKey: "caller-addressed",
+    async: true,
+  };
+  await built.app.turn(turn);
+
+  assert.equal((await built.app.turn({ ...turn, text: addressed("A different reason.") })).status, "refused");
+});
+
+test("spine ON: an ambient replay compares the same routed request identity", async () => {
+  const built = freshApp();
+  const ambient = {
+    ...mention("ambient update", "C8", "800.8"),
+    liveActor: false,
+    unprompted: true,
+    idempotencyKey: "ambient-retry",
+  };
+  const first = await built.app.turn(ambient);
+  const second = await built.app.turn(ambient);
+  assert.equal(first.runId, second.runId);
+});
+
+test("a delayed app-ambient wake retry ignores only envelope wall-clock time", async () => {
+  const built = freshApp();
+  const wakeText = ({
+    at,
+    why = "The recent messages may warrant a reply.",
+    message = "can you check this?",
+    instructions = "Reply if needed.",
+  }: {
+    at: Date;
+    why?: string;
+    message?: string;
+    instructions?: string;
+  }) =>
+    buildWakeEnvelope({
+      reason: "ambient",
+      surface: "slack",
+      channel: "C8",
+      at,
+      why,
+      recentMessages: [{ ts: "801.8", authorId: "U1", text: message }],
+      instructions,
+    });
+  const base = {
+    surface: "slack",
+    actor: { externalId: "system:ambient:qm" },
+    conversation: { kind: "channel" as const, threadRef: "ch:C8:ambient:801.8", channelRef: "C8", audience: [] },
+    deliveryTarget: "slack:C8:",
+    triggered: true,
+    async: true,
+    spawned: true,
+    idempotencyKey: "ambient:qm:slack:C8:801.8",
+  };
+  const first = await built.app.turn({ ...base, text: wakeText({ at: new Date() }) });
+  await sleep(5);
+  const second = await built.app.turn({ ...base, text: wakeText({ at: new Date() }) });
+  assert.equal(second.runId, first.runId);
+  for (const text of [
+    wakeText({ at: new Date(), why: "A different set of messages warrants a reply." }),
+    wakeText({ at: new Date(), message: "a different recent message" }),
+    wakeText({ at: new Date(), instructions: "Always reply." }),
+  ])
+    assert.equal((await built.app.turn({ ...base, text })).status, "refused");
+
+  const ordinary = { ...mention(wakeText({ at: new Date(0) }), "C8", "802.8"), idempotencyKey: "ordinary-wake-text" };
+  await built.app.turn(ordinary);
+  assert.equal((await built.app.turn({ ...ordinary, text: wakeText({ at: new Date(1) }) })).status, "refused");
 });
 
 test("a replayed/resumed request carries surfaceTools through app.turn (approval-continuation path)", async () => {
