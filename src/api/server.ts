@@ -73,6 +73,7 @@ function capabilityAdminDenied(method: string, pathname: string, url: URL, claim
 }
 
 function isAdminContentRead(pathname: string): boolean {
+  if (pathname === "/v1/admin/budget-usage") return true;
   if (pathname === "/v1/admin/memory") return true;
   if (pathname === "/v1/admin/keychain") return true;
   if (pathname === "/v1/admin/volumes") return true;

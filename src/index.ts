@@ -46,6 +46,7 @@ const server = createServer(built.app, {
   ...(config.publicWebUrl ? { portalUrl: config.publicWebUrl } : {}),
   admin: built.admin,
   rateLimiter: built.rateLimiter,
+  budget: built.budget,
   acl: built.acl,
   credentialUsage: built.credentialUsage,
   deviceFlowCutover: built.deviceFlowCutover,

@@ -51,7 +51,7 @@ import { createAuditLog, type AuditLog } from "./audit/audit-log.ts";
 import { createPostgresAuditLog } from "./admin/postgres-audit-log.ts";
 import { createRateLimiter, type RateLimiter } from "./ratelimit/rate-limiter.ts";
 import { createPostgresRateLimiter } from "./ratelimit/postgres-rate-limiter.ts";
-import { createBudgetTracker } from "./ratelimit/budget.ts";
+import { createBudgetTracker, type BudgetTracker } from "./ratelimit/budget.ts";
 import { createPostgresBudgetTracker } from "./ratelimit/postgres-budget.ts";
 import { createCronStore, type CronStore } from "./cron/cron-store.ts";
 import { createDeliveryStore, type DeliveryStore } from "./delivery/delivery-store.ts";
@@ -331,6 +331,7 @@ export interface BuiltApp {
   scheduler: Scheduler;
   admin: AdminService;
   rateLimiter: RateLimiter;
+  budget: BudgetTracker;
   errors: ErrorLog;
   metrics: MetricsSink;
   crons: CronStore;
@@ -530,10 +531,9 @@ export function buildApp(
     ...(config.orgBudgetUsdPerWindow !== undefined ? { orgLimitUsd: config.orgBudgetUsdPerWindow } : {}),
     windowMs: config.budgetWindowMs,
   };
-  const budget =
-    config.databaseUrl && (config.budgetUsdPerWindow !== undefined || config.orgBudgetUsdPerWindow !== undefined)
-      ? createPostgresBudgetTracker(config.databaseUrl, budgetOpts)
-      : createBudgetTracker(budgetOpts);
+  const budget = config.databaseUrl
+    ? createPostgresBudgetTracker(config.databaseUrl, budgetOpts)
+    : createBudgetTracker(budgetOpts);
   const resolution = createResolutionService(config.orgId, configStore, acl);
 
   const workspace = createLocalWorkspaceStore(config.dataDir);
@@ -1453,6 +1453,7 @@ export function buildApp(
     scheduler,
     admin,
     rateLimiter,
+    budget,
     errors,
     metrics,
     crons,

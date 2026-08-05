@@ -43,3 +43,57 @@ test("pg budget: caps are opt-in — unconfigured allows, configured refuses", {
   assert.equal(c.allowed, false);
   assert.equal(c.spentUsd, 9_999);
 });
+
+test("pg budget: usage reports both durable levels and excludes expired spend", { skip }, async () => {
+  const budget = createPostgresBudgetTracker(URL!, { limitUsd: 2, orgLimitUsd: 5, windowMs: 100 });
+  await budget.record("U1", 0.75, 950);
+  await budget.record("U2", 1.25, 975);
+  await budget.record("U1", 9, 899);
+
+  assert.deepEqual(await budget.usage("U1", 1_000), {
+    windowMs: 100,
+    member: { spentUsd: 0.75, limitUsd: 2 },
+    organization: { spentUsd: 2, limitUsd: 5 },
+  });
+});
+
+test(
+  "pg budget: member and organization namespaces cannot collide and unconfigured limits stay null",
+  { skip },
+  async () => {
+    const first = createPostgresBudgetTracker(URL!, { windowMs: 100 });
+    await first.record("@org", 0.75, 950);
+    await first.record("U2", 1.25, 975);
+    const restarted = createPostgresBudgetTracker(URL!, { windowMs: 100 });
+
+    assert.deepEqual(await restarted.usage("@org", 1_000), {
+      windowMs: 100,
+      member: { spentUsd: 0.75, limitUsd: null },
+      organization: { spentUsd: 2, limitUsd: null },
+    });
+  },
+);
+
+test("pg budget: rolling upgrade accepts and reads legacy writers after the new schema is live", { skip }, async () => {
+  const pg = (await import("pg")).default;
+  const admin = new pg.Pool({ connectionString: URL });
+  await admin.query(`CREATE TABLE budget_spend(
+    id BIGSERIAL PRIMARY KEY,
+    principal_id TEXT NOT NULL,
+    at BIGINT NOT NULL,
+    usd DOUBLE PRECISION NOT NULL
+  )`);
+  await admin.query("INSERT INTO budget_spend(principal_id, at, usd) VALUES ('U1', 950, 0.5), ('@org', 950, 0.5)");
+  const budget = createPostgresBudgetTracker(URL!, { windowMs: 100 });
+  assert.equal((await budget.usage("U1", 1_000)).member.spentUsd, 0.5);
+
+  await admin.query("INSERT INTO budget_spend(principal_id, at, usd) VALUES ('U1', 975, 0.25), ('@org', 975, 0.25)");
+  await budget.record("@org", 1, 990);
+  assert.deepEqual(await budget.usage("U1", 1_000), {
+    windowMs: 100,
+    member: { spentUsd: 0.75, limitUsd: null },
+    organization: { spentUsd: 1.75, limitUsd: null },
+  });
+  assert.equal((await budget.usage("@org", 1_000)).member.spentUsd, 1);
+  await admin.end();
+});

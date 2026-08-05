@@ -22,6 +22,31 @@ test("budget tracker accumulates per-principal and trips at the limit", async ()
   assert.equal((await b.check("U1", 1000 + 61_000)).allowed, true);
 });
 
+test("budget tracker reports member and organization spend for the active window", async () => {
+  const budget = createBudgetTracker({ limitUsd: 2, orgLimitUsd: 5, windowMs: 100 });
+  await budget.record("U1", 0.75, 950);
+  await budget.record("U2", 1.25, 975);
+  await budget.record("U1", 9, 899);
+
+  assert.deepEqual(await budget.usage("U1", 1_000), {
+    windowMs: 100,
+    member: { spentUsd: 0.75, limitUsd: 2 },
+    organization: { spentUsd: 2, limitUsd: 5 },
+  });
+});
+
+test("a member principal matching the legacy organization key is accounted independently", async () => {
+  const budget = createBudgetTracker({ limitUsd: 2, orgLimitUsd: 5, windowMs: 100 });
+  await budget.record("@org", 0.75, 950);
+  await budget.record("U2", 1.25, 975);
+
+  assert.deepEqual(await budget.usage("@org", 1_000), {
+    windowMs: 100,
+    member: { spentUsd: 0.75, limitUsd: 2 },
+    organization: { spentUsd: 2, limitUsd: 5 },
+  });
+});
+
 test("caps are opt-in: an unconfigured tracker never refuses, a configured one does", async () => {
   const unbounded = createBudgetTracker();
   await unbounded.record("U1", 1_000_000);

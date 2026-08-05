@@ -46,6 +46,7 @@ import type { AmbientJudgmentStore } from "../surface-cache/ambient-judgment-sto
 import type { AckEmojiPickStore } from "../surface-cache/ack-emoji-pick-store.ts";
 import type { ChannelPolicyStore } from "../surface-cache/channel-policy-store.ts";
 import type { RateLimiter } from "../ratelimit/rate-limiter.ts";
+import type { BudgetTracker } from "../ratelimit/budget.ts";
 import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
 import type { SlackInstallationStore, SlackSocketAppIdReader } from "../surfaces/slack-installation.ts";
 
@@ -88,6 +89,7 @@ export interface ServerDeps {
   harnessId?: string;
   admin?: AdminService;
   rateLimiter?: RateLimiter;
+  budget?: BudgetTracker;
   sessions?: SessionStore;
   auditLog?: AuditLog;
   errors?: ErrorLog;

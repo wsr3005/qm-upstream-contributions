@@ -34,6 +34,7 @@ import {
 import { deleteSlackInstallation, getSlackInstallation, putSlackInstallation } from "./admin/slack-installation.ts";
 import { deleteModelProvider, getModelProviders, putModelProvider } from "./admin/model-providers.ts";
 import { deleteCustomProvider, getCustomProviders, putCustomProvider } from "./admin/custom-providers.ts";
+import { getBudgetUsage } from "./admin/budget-usage.ts";
 
 const timed =
   (handle: (ctx: ApiCtx) => void | Promise<void>) =>
@@ -64,6 +65,7 @@ const routes: ReadonlyArray<Route<ApiCtx>> = [
   { method: "DELETE", path: "/v1/admin/custom-providers/:provider", auth: "either", handle: deleteCustomProvider },
   { method: "PUT", path: "/v1/admin/scopes/:scope/:resource", auth: "either", handle: putScopeConfig },
   { method: "GET", path: "/v1/admin/whoami", auth: "either", handle: whoami },
+  { method: "GET", path: "/v1/admin/budget-usage", auth: "either", handle: getBudgetUsage },
   { method: "GET", path: "/v1/admin/scopes", auth: "either", handle: listAdminScopes },
   { method: "GET", path: "/v1/admin/scopes/:scope", auth: "either", handle: getScopeConfig },
   { method: "GET", path: "/v1/admin/resources", auth: "either", handle: getAdminResources },
