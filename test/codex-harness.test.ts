@@ -635,11 +635,12 @@ const realCodexBinary = (() => {
 })();
 
 test(
-  "the installed Codex app-server accepts the exact thread/start this adapter sends",
+  "the installed Codex app-server accepts QM's endpoint and exact thread/start request",
   { skip: realCodexBinary && existsSync(realCodexBinary) ? false : "@openai/codex is not resolvable" },
   async (t) => {
     const jail = mkdtempSync(join(tmpdir(), "qm-codex-real-"));
-    prepareCodexHome({ CODEX_HOME: join(jail, "empty-source") }, jail);
+    const endpoint = "https://gateway.example.com/v1";
+    prepareCodexHome({ CODEX_HOME: join(jail, "empty-source"), OPENAI_BASE_URL: endpoint }, jail);
     const requests: string[] = [];
     const server = new CodexAppServer({
       binaryPath: realCodexBinary!,
@@ -657,6 +658,8 @@ test(
     });
 
     await server.initialize();
+    const resolved = await server.request<{ config: { openai_base_url: string | null } }>("config/read", {});
+    assert.equal(resolved.config.openai_base_url, endpoint);
     const started = await server.request<{ thread: { id: string } }>("thread/start", {
       model: DEFAULT_CODEX_MODEL_ID,
       cwd: jail,
