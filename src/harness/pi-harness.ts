@@ -6,6 +6,7 @@ import {
   DefaultResourceLoader,
   ModelRuntime,
   SessionManager,
+  SettingsManager,
   type AgentSession,
 } from "@earendil-works/pi-coding-agent";
 import { InMemoryCredentialStore, type Api, type Model } from "@earendil-works/pi-ai";
@@ -1047,7 +1048,7 @@ export async function oneShot(
   keys: ProviderKeys | string,
   systemPrompt: string,
   prompt: string,
-  opts?: { signal?: AbortSignal },
+  opts?: { signal?: AbortSignal; disableRetries?: boolean },
 ): Promise<string | undefined> {
   const modelRuntime = await buildModelRuntime(keys);
   const { resourceLoader, cwd, agentDir } = await createIsolatedResources(prefix, systemPrompt);
@@ -1059,6 +1060,13 @@ export async function oneShot(
       customTools: [],
       noTools: "builtin",
       sessionManager: SessionManager.inMemory(),
+      ...(opts?.disableRetries
+        ? {
+            settingsManager: SettingsManager.inMemory({
+              retry: { enabled: false, maxRetries: 0, provider: { maxRetries: 0 } },
+            }),
+          }
+        : {}),
       cwd,
       agentDir,
     });

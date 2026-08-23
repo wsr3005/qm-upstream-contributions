@@ -43,3 +43,11 @@ test("?view=onboarding resolves to the onboarding view", () => {
 test("unknown views still fall back to the default view", () => {
   assert.equal(resolveView("/admin/no-such-view", ""), "history");
 });
+
+test("custom provider setup exposes an explicit paid generation test", () => {
+  assert.match(html, /id="custom-provider-test-model"/);
+  assert.match(html, /id="custom-provider-test">Run paid generation test/);
+  assert.match(html, /sends one real generation request.*capped at 128 output tokens/);
+  assert.match(html, /id="st-custom-provider-test" role="status" aria-live="polite"/);
+  assert.match(html, /finally\s*{\s*\$\("custom-provider-test"\)\.disabled = false;/);
+});

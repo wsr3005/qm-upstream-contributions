@@ -66,6 +66,12 @@ export function validateCustomProviderSpec(spec: CustomProviderSpec): void {
     for (const [field, v] of [
       ["contextWindow", m.contextWindow],
       ["maxTokens", m.maxTokens],
+    ] as const) {
+      if (v !== undefined && (!Number.isInteger(v) || v <= 0)) {
+        throw new Error(`model "${m.id}": ${field} must be a positive integer`);
+      }
+    }
+    for (const [field, v] of [
       ["input", m.input],
       ["output", m.output],
     ] as const) {
@@ -110,6 +116,14 @@ function toRuntimeModel(provider: CustomProviderSpec, m: CustomModelSpec): Custo
     contextWindow: m.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
     maxTokens: m.maxTokens ?? DEFAULT_MAX_TOKENS,
   };
+}
+
+export function runtimeModelForCustomProvider(
+  provider: CustomProviderSpec,
+  modelId: string,
+): CustomRuntimeModel | undefined {
+  const model = provider.models.find((candidate) => candidate.id === modelId);
+  return model ? toRuntimeModel(provider, model) : undefined;
 }
 
 let registry = new Map<string, CustomRuntimeModel>();

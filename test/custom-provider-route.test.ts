@@ -84,6 +84,12 @@ test("custom provider lifecycle: register, list, resolve, delete — admin only,
     // Non-admin gets refused.
     const denied = await fetch(`${srv.base}/v1/admin/custom-providers`, { headers: USER });
     assert.notEqual(denied.status, 200);
+    const deniedTest = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/test`, {
+      method: "POST",
+      headers: USER,
+      body: JSON.stringify({ modelId: "acme-large" }),
+    });
+    assert.notEqual(deniedTest.status, 200);
 
     // Delete disables and clears the registry.
     const del = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway`, {
@@ -92,6 +98,27 @@ test("custom provider lifecycle: register, list, resolve, delete — admin only,
     });
     assert.equal(del.status, 200);
     assert.equal(resolveModel("acme-large"), undefined);
+  } finally {
+    await srv.close();
+  }
+});
+
+test("generation self-test requires an active stored key", async () => {
+  const srv = start();
+  try {
+    const put = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify({ ...BODY, apiKey: undefined, validate: false }),
+    });
+    assert.equal(put.status, 200);
+    const tested = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/test`, {
+      method: "POST",
+      headers: ADMIN,
+      body: JSON.stringify({ modelId: "acme-large" }),
+    });
+    assert.equal(tested.status, 400);
+    assert.equal(((await tested.json()) as { error: string }).error, "missing_api_key");
   } finally {
     await srv.close();
   }
@@ -126,6 +153,8 @@ test("bad specs are refused with a reason", async () => {
       [{ models: [] }, /at least one model/],
       [{ protocol: "grpc" }, /protocol/],
       [{ baseUrl: "https://x?y=1" }, /query/],
+      [{ models: [{ id: "acme-large", contextWindow: 0 }] }, /positive integer/],
+      [{ models: [{ id: "acme-large", maxTokens: 1.5 }] }, /positive integer/],
     ] as const) {
       const res = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway`, {
         method: "PUT",

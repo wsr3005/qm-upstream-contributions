@@ -87,6 +87,15 @@ test("spec validation rejects reserved ids, bad slugs, bad URLs, and empty model
   assert.throws(() => validateCustomProviderSpec({ ...GATEWAY, baseUrl: "https://x?y=1" }), /query/);
   assert.throws(() => validateCustomProviderSpec({ ...GATEWAY, models: [] }), /at least one model/);
   assert.throws(() => validateCustomProviderSpec({ ...GATEWAY, models: [{ id: "a" }, { id: "a" }] }), /duplicate/);
+  assert.throws(
+    () => validateCustomProviderSpec({ ...GATEWAY, models: [{ id: "a", contextWindow: 0 }] }),
+    /positive integer/,
+  );
+  assert.throws(
+    () => validateCustomProviderSpec({ ...GATEWAY, models: [{ id: "a", maxTokens: 1.5 }] }),
+    /positive integer/,
+  );
+  assert.doesNotThrow(() => validateCustomProviderSpec({ ...GATEWAY, models: [{ id: "a", input: 0, output: 0.5 }] }));
 });
 
 test("store round-trip: upsert encrypts the key, statuses never leak it, delete disables", async () => {
@@ -123,6 +132,32 @@ test("store validates specs on upsert", async () => {
     keyMaterial: "k",
   });
   await assert.rejects(store.upsert({ ...GATEWAY, id: "anthropic" }, "k", "a@b.c"), /reserved/);
+});
+
+test("active provider resolution keeps the endpoint and key from one durable snapshot", async () => {
+  const inner = createMemoryMap<StoredCustomProvider>();
+  const seed = createCustomProviderStore({ backing: inner, keyMaterial: "snapshot-key-material" });
+  await seed.upsert(GATEWAY, "sk-old", "admin@example.com");
+  const oldRecord = await inner.get(GATEWAY.id);
+  await seed.upsert({ ...GATEWAY, baseUrl: "https://new.example.com/v1" }, "sk-new", "admin@example.com");
+  const newRecord = await inner.get(GATEWAY.id);
+  assert.ok(oldRecord && newRecord);
+  await inner.put(GATEWAY.id, oldRecord);
+  let reads = 0;
+  const backing = {
+    ...inner,
+    async get(id: string) {
+      reads += 1;
+      const value = await inner.get(id);
+      await inner.put(id, newRecord);
+      return value;
+    },
+  };
+  const store = createCustomProviderStore({ backing, keyMaterial: "snapshot-key-material" });
+  const active = await store.resolveActive(GATEWAY.id);
+  assert.equal(reads, 1);
+  assert.equal(active?.provider.baseUrl, GATEWAY.baseUrl);
+  assert.equal(active?.apiKey, "sk-old");
 });
 
 test("registered models surface in the catalog and vanish on unregister", () => {

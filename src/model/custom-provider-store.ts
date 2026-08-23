@@ -32,6 +32,7 @@ export interface CustomProviderStore {
   statuses(): Promise<CustomProviderStatus[]>;
   /** Plaintext key for one provider, or null when absent/disabled. */
   resolveKey(id: string): Promise<string | null>;
+  resolveActive(id: string): Promise<{ provider: CustomProviderSpec; apiKey: string | null } | null>;
   upsert(spec: CustomProviderSpec, apiKey: string | undefined, updatedBy: string): Promise<void>;
   delete(id: string, updatedBy: string): Promise<boolean>;
 }
@@ -75,6 +76,15 @@ export function createCustomProviderStore(input: {
       const saved = await input.backing.get(id);
       if (!saved || saved.disabled || !saved.apiKeyEnc) return null;
       return decryptSecret(saved.apiKeyEnc, key);
+    },
+
+    async resolveActive(id) {
+      const saved = await input.backing.get(id);
+      if (!saved || saved.disabled) return null;
+      return {
+        provider: strip(saved),
+        apiKey: saved.apiKeyEnc ? decryptSecret(saved.apiKeyEnc, key) : null,
+      };
     },
 
     async upsert(spec, apiKey, updatedBy) {

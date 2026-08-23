@@ -3995,6 +3995,20 @@
                 <button class="primary" id="custom-provider-save">Save provider</button
                 ><span class="status" id="st-custom-provider"></span>
               </div>
+              <div class="body setup-form">
+                <label
+                  >Test a saved model
+                  <select id="custom-provider-test-model"></select
+                ></label>
+                <p class="muted">
+                  This sends one real generation request to the saved endpoint, capped at 128 output tokens, and may
+                  incur charges.
+                </p>
+              </div>
+              <div class="foot">
+                <button id="custom-provider-test">Run paid generation test</button
+                ><span class="status" id="st-custom-provider-test" role="status" aria-live="polite"></span>
+              </div>
             </section>
           </div>
 
@@ -7339,6 +7353,7 @@
         setStatus("st-onboarding-model", "Provider disabled.", "ok");
       };
       let customProvidersLoaded = [];
+      let customProviderTestTargets = [];
       function parseCustomModels(text) {
         return text
           .split("\n")
@@ -7357,6 +7372,18 @@
         const res = await api("GET", "/api/custom-providers");
         if (!res.ok) return;
         customProvidersLoaded = (res.data?.providers || []).filter((provider) => !provider.disabled);
+        customProviderTestTargets = customProvidersLoaded.flatMap((provider) =>
+          provider.models.map((model) => ({ providerId: provider.id, providerName: provider.name, modelId: model.id })),
+        );
+        const testSelect = $("custom-provider-test-model");
+        testSelect.textContent = "";
+        customProviderTestTargets.forEach((target, index) => {
+          const option = document.createElement("option");
+          option.value = String(index);
+          option.textContent = target.providerName + " · " + target.modelId;
+          testSelect.appendChild(option);
+        });
+        $("custom-provider-test").disabled = customProviderTestTargets.length === 0;
         const rows = $("custom-provider-rows");
         rows.textContent = "";
         $("custom-provider-empty").hidden = customProvidersLoaded.length > 0;
@@ -7437,6 +7464,36 @@
         $("custom-provider-key").value = "";
         await loadCustomProviders();
         setStatus("st-custom-provider", "Provider saved. Its models are now in the picker.", "ok");
+      };
+      $("custom-provider-test").onclick = async () => {
+        const target = customProviderTestTargets[Number($("custom-provider-test-model").value)];
+        if (!target) {
+          setStatus("st-custom-provider-test", "Save a provider and model first.", "err");
+          return;
+        }
+        $("custom-provider-test").disabled = true;
+        setStatus("st-custom-provider-test", "Sending a real paid generation request…", "saving", true);
+        let tested;
+        try {
+          tested = await api("POST", "/api/custom-providers/" + encodeURIComponent(target.providerId) + "/test", {
+            modelId: target.modelId,
+          });
+        } catch {
+          setStatus("st-custom-provider-test", "The generation test could not reach QM.", "err", true);
+          return;
+        } finally {
+          $("custom-provider-test").disabled = false;
+        }
+        if (!tested.ok) {
+          setStatus("st-custom-provider-test", tested.data?.message || "The generation test failed.", "err", true);
+          return;
+        }
+        const reply = String(tested.data?.reply || "").trim();
+        setStatus(
+          "st-custom-provider-test",
+          target.modelId + " replied in " + tested.data.latencyMs + " ms: " + reply.slice(0, 300),
+          "ok",
+        );
       };
       function openOnboardingTarget(target) {
         setView("connectors");

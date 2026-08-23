@@ -13,18 +13,17 @@ import { test } from "node:test";
 import { createInsecureTestServer } from "../src/api/server.ts";
 import { buildApp } from "../src/wiring.ts";
 import { testConfig } from "./support/test-config.ts";
-import { oneShot } from "../src/harness/pi-harness.ts";
 import { resolveModel, modelSupportedByHarness, modelServiceable } from "../src/model/pi-models.ts";
 import { setCustomProviders } from "../src/model/custom-providers.ts";
 import { createCustomProviderStore } from "../src/model/custom-provider-store.ts";
 import { createMemoryMap } from "../src/persistence/durable-map.ts";
-import type { Api, Model } from "@earendil-works/pi-ai";
 
 const ADMIN = { "content-type": "application/json", "x-admin-actor": "admin-alice@default-org" };
 
 test("QA: full custom-provider lifecycle against a live fake upstream", async () => {
   // --- fake OpenAI-compatible upstream ---
-  const seen: Array<{ path: string; auth: string | undefined; model?: string }> = [];
+  const seen: Array<{ path: string; auth: string | undefined; model?: string; maxTokens?: number }> = [];
+  let failCompletions = false;
   const upstream = createServer((req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
@@ -40,8 +39,14 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
         return res.end(JSON.stringify({ data: [{ id: "qa-chat" }] }));
       }
       if (req.url?.endsWith("/chat/completions")) {
-        record.model = (JSON.parse(body) as { model?: string }).model;
+        const payload = JSON.parse(body) as { model?: string; max_tokens?: number; max_completion_tokens?: number };
+        record.model = payload.model;
+        record.maxTokens = payload.max_completion_tokens ?? payload.max_tokens;
         seen.push(record);
+        if (failCompletions) {
+          res.writeHead(500, { "content-type": "application/json" });
+          return res.end(JSON.stringify({ error: { message: "retryable failure" } }));
+        }
         res.writeHead(200, { "content-type": "text/event-stream" });
         const chunk = (delta: object, finish: string | null) =>
           `data: ${JSON.stringify({ id: "cmpl-qa", object: "chat.completion.chunk", model: "qa-chat", choices: [{ index: 0, delta, finish_reason: finish }], usage: finish ? { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 } : undefined })}\n\n`;
@@ -57,6 +62,14 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
   });
   await new Promise<void>((r) => upstream.listen(0, "127.0.0.1", r));
   const upstreamUrl = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}/v1`;
+  const staleSeen: string[] = [];
+  const staleUpstream = createServer((req, res) => {
+    staleSeen.push(req.url ?? "");
+    res.writeHead(500, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { message: "stale endpoint must not be called" } }));
+  });
+  await new Promise<void>((r) => staleUpstream.listen(0, "127.0.0.1", r));
+  const staleUpstreamUrl = `http://127.0.0.1:${(staleUpstream.address() as AddressInfo).port}/v1`;
 
   const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "qa-custom-")) }));
   const server = createInsecureTestServer(built.app, {
@@ -153,18 +166,116 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
     assert.equal(modelServiceable("qa-chat", { anthropic: false, openai: false, openrouter: false }), true);
 
     // 6. REAL model call through QM's pi path → fake upstream answers
-    const reply = await oneShot(
-      "qa",
-      model as unknown as Model<Api>,
-      { qa: "sk-qa-good" },
-      "you are terse",
-      "say anything",
-    );
-    assert.equal(reply, "QA UPSTREAM REPLY");
+    setCustomProviders([
+      {
+        id: "qa",
+        name: "Stale QA Provider",
+        protocol: "openai",
+        baseUrl: staleUpstreamUrl,
+        models: [{ id: "qa-chat" }],
+      },
+    ]);
+    r = await api("/v1/admin/custom-providers/qa/test", {
+      method: "POST",
+      body: JSON.stringify({ modelId: "not-registered" }),
+    });
+    assert.equal(r.status, 400);
+    r = await api("/v1/admin/custom-providers/qa/test", {
+      method: "POST",
+      body: JSON.stringify({ modelId: "qa-chat" }),
+    });
+    assert.equal(r.status, 409);
+    assert.deepEqual(staleSeen, []);
+    assert.equal(seen.filter((s) => s.path.endsWith("/chat/completions")).length, 0);
+    await built.refreshCustomProviders();
+    r = await api("/v1/admin/custom-providers/qa/test", {
+      method: "POST",
+      body: JSON.stringify({ modelId: "qa-chat" }),
+    });
+    assert.equal(r.status, 200);
+    const testResult = (await r.json()) as {
+      ok: boolean;
+      providerId: string;
+      modelId: string;
+      reply: string;
+      latencyMs: number;
+      maxOutputTokens: number;
+    };
+    assert.equal(testResult.ok, true);
+    assert.equal(testResult.providerId, "qa");
+    assert.equal(testResult.modelId, "qa-chat");
+    assert.equal(testResult.reply, "QA UPSTREAM REPLY");
+    assert.ok(testResult.latencyMs >= 0);
+    assert.equal(testResult.maxOutputTokens, 128);
+    assert.ok(!JSON.stringify(testResult).includes("sk-qa-good"));
     const call = seen.find((s) => s.path.endsWith("/chat/completions"));
     assert.ok(call, "completion request reached the upstream");
     assert.equal(call!.model, "qa-chat");
     assert.equal(call!.auth, "Bearer sk-qa-good", "stored key was sent to the custom endpoint");
+    assert.equal(call!.maxTokens, 128, "the outbound generation request is capped at 128 output tokens");
+
+    const callsBeforeFailure = seen.filter((s) => s.path.endsWith("/chat/completions")).length;
+    failCompletions = true;
+    r = await api("/v1/admin/custom-providers/qa/test", {
+      method: "POST",
+      body: JSON.stringify({ modelId: "qa-chat" }),
+    });
+    assert.equal(r.status, 502);
+    assert.equal(seen.filter((s) => s.path.endsWith("/chat/completions")).length, callsBeforeFailure + 1);
+    const testAudits = (await built.auditLog.events()).filter((event) => event.action === "custom-providers.test");
+    assert.deepEqual(
+      testAudits.map((event) => event.status),
+      ["attempted", "succeeded", "attempted", "failed"],
+    );
+    assert.ok(testAudits.every((event) => !JSON.stringify(event).includes("sk-qa-good")));
+    assert.ok(
+      testAudits
+        .filter((event) => event.status !== "attempted")
+        .every((event) => /^latencyMs=\d+$/.test(event.detail ?? "")),
+    );
+    failCompletions = false;
+
+    r = await api("/v1/admin/custom-providers/collision", {
+      method: "PUT",
+      body: JSON.stringify({
+        name: "Built-in Collision",
+        protocol: "openai",
+        baseUrl: upstreamUrl,
+        apiKey: "sk-qa-good",
+        models: [{ id: "gpt-5.6-luna" }],
+        validate: false,
+      }),
+    });
+    assert.equal(r.status, 200);
+    const callsBeforeBuiltInCollision = seen.filter((s) => s.path.endsWith("/chat/completions")).length;
+    r = await api("/v1/admin/custom-providers/collision/test", {
+      method: "POST",
+      body: JSON.stringify({ modelId: "gpt-5.6-luna" }),
+    });
+    assert.equal(r.status, 409);
+    assert.equal(seen.filter((s) => s.path.endsWith("/chat/completions")).length, callsBeforeBuiltInCollision);
+    assert.equal((await api("/v1/admin/custom-providers/collision", { method: "DELETE" })).status, 200);
+
+    r = await api("/v1/admin/custom-providers/z-shadow", {
+      method: "PUT",
+      body: JSON.stringify({
+        name: "Custom Collision",
+        protocol: "openai",
+        baseUrl: upstreamUrl,
+        apiKey: "sk-qa-good",
+        models: [{ id: "qa-chat" }],
+        validate: false,
+      }),
+    });
+    assert.equal(r.status, 200);
+    const callsBeforeCustomCollision = seen.filter((s) => s.path.endsWith("/chat/completions")).length;
+    r = await api("/v1/admin/custom-providers/qa/test", {
+      method: "POST",
+      body: JSON.stringify({ modelId: "qa-chat" }),
+    });
+    assert.equal(r.status, 409);
+    assert.equal(seen.filter((s) => s.path.endsWith("/chat/completions")).length, callsBeforeCustomCollision);
+    assert.equal((await api("/v1/admin/custom-providers/z-shadow", { method: "DELETE" })).status, 200);
 
     // 7. edit WITHOUT key keeps the stored key
     r = await api("/v1/admin/custom-providers/qa", {
@@ -193,11 +304,12 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
   } finally {
     server.close();
     upstream.close();
+    staleUpstream.close();
   }
 });
 
 test("QA: anthropic-protocol custom provider serves a real turn (correct wire shape + headers)", async () => {
-  const seen: Array<{ path: string; apiKeyHeader?: string; version?: string; model?: string }> = [];
+  const seen: Array<{ path: string; apiKeyHeader?: string; version?: string; model?: string; maxTokens?: number }> = [];
   const upstream = createServer((req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
@@ -213,7 +325,9 @@ test("QA: anthropic-protocol custom provider serves a real turn (correct wire sh
         return res.end(JSON.stringify({ data: [] }));
       }
       if (req.url?.endsWith("/v1/messages")) {
-        record.model = (JSON.parse(body) as { model?: string }).model;
+        const payload = JSON.parse(body) as { model?: string; max_tokens?: number };
+        record.model = payload.model;
+        record.maxTokens = payload.max_tokens;
         seen.push(record);
         res.writeHead(200, { "content-type": "text/event-stream" });
         res.write(
@@ -253,7 +367,7 @@ test("QA: anthropic-protocol custom provider serves a real turn (correct wire sh
   server.listen(0);
   const base = `http://localhost:${(server.address() as AddressInfo).port}`;
   try {
-    const r = await fetch(`${base}/v1/admin/custom-providers/antcompat`, {
+    let r = await fetch(`${base}/v1/admin/custom-providers/antcompat`, {
       method: "PUT",
       headers: ADMIN,
       body: JSON.stringify({
@@ -268,12 +382,18 @@ test("QA: anthropic-protocol custom provider serves a real turn (correct wire sh
     const model = resolveModel("claude-compat");
     assert.ok(model);
     assert.equal((model as { api?: string }).api, "anthropic-messages");
-    const reply = await oneShot("qa-ant", model as unknown as Model<Api>, { antcompat: "sk-ant-qa" }, "terse", "go");
-    assert.equal(reply, "ANTHROPIC QA REPLY");
+    r = await fetch(`${base}/v1/admin/custom-providers/antcompat/test`, {
+      method: "POST",
+      headers: ADMIN,
+      body: JSON.stringify({ modelId: "claude-compat" }),
+    });
+    assert.equal(r.status, 200);
+    assert.equal(((await r.json()) as { reply: string }).reply, "ANTHROPIC QA REPLY");
     const call = seen.find((s) => s.path.endsWith("/v1/messages"));
     assert.ok(call, "messages request reached the anthropic-compatible upstream");
     assert.equal(call!.model, "claude-compat");
     assert.equal(call!.apiKeyHeader, "sk-ant-qa", "anthropic wire auth uses x-api-key");
+    assert.equal(call!.maxTokens, 128);
   } finally {
     server.close();
     upstream.close();
