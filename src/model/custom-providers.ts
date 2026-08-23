@@ -1,21 +1,6 @@
-/**
- * Custom model providers.
- *
- * An org admin can register additional model providers that speak one of
- * the two wire protocols we already run — OpenAI-compatible or
- * Anthropic-compatible — by giving a base URL, an API key, and the model
- * ids to expose. Registered models resolve like built-ins (the pi
- * harness reaches them through the same request path), surface in the
- * catalog, and are gated to harnesses that route through pi-ai.
- *
- * Secrets never live here: this module holds the runtime registry
- * (everything except the key). Keys stay in the encrypted store and are
- * resolved per-call by wiring alongside the built-in provider keys.
- */
-
 import { parseProviderBaseUrl, PROVIDER_IDS } from "./provider-endpoints.ts";
 
-export const CUSTOM_PROVIDER_PROTOCOLS = ["openai", "anthropic"] as const;
+export const CUSTOM_PROVIDER_PROTOCOLS = ["openai", "openai-responses", "anthropic"] as const;
 export type CustomProviderProtocol = (typeof CUSTOM_PROVIDER_PROTOCOLS)[number];
 
 interface CustomModelSpec {
@@ -91,7 +76,7 @@ export interface CustomRuntimeModel {
   id: string;
   name: string;
   provider: string;
-  api: "openai-completions" | "anthropic-messages";
+  api: "openai-completions" | "openai-responses" | "anthropic-messages";
   baseUrl: string;
   reasoning: boolean;
   input: ("text" | "image")[];
@@ -103,12 +88,18 @@ export interface CustomRuntimeModel {
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 const DEFAULT_MAX_TOKENS = 8_192;
 
+function runtimeApi(protocol: CustomProviderProtocol): CustomRuntimeModel["api"] {
+  if (protocol === "anthropic") return "anthropic-messages";
+  if (protocol === "openai-responses") return "openai-responses";
+  return "openai-completions";
+}
+
 function toRuntimeModel(provider: CustomProviderSpec, m: CustomModelSpec): CustomRuntimeModel {
   return {
     id: m.id,
     name: m.name?.trim() || m.id,
     provider: provider.id,
-    api: provider.protocol === "anthropic" ? "anthropic-messages" : "openai-completions",
+    api: runtimeApi(provider.protocol),
     baseUrl: provider.baseUrl,
     reasoning: false,
     input: ["text"],
@@ -137,14 +128,17 @@ let version = 0;
  * built-in.
  */
 export function setCustomProviders(specs: CustomProviderSpec[]): void {
+  const snapshot = specs.map((spec) => ({ ...spec, models: [...spec.models] }));
+  if (JSON.stringify(snapshot) === JSON.stringify(providers)) return;
   const next = new Map<string, CustomRuntimeModel>();
-  for (const spec of specs) {
+  for (const spec of snapshot) {
     for (const m of spec.models) {
+      if (next.has(m.id)) throw new Error(`custom model id "${m.id}" is registered by more than one provider`);
       next.set(m.id, toRuntimeModel(spec, m));
     }
   }
   registry = next;
-  providers = specs.map((s) => ({ ...s, models: [...s.models] }));
+  providers = snapshot;
   version += 1;
 }
 
@@ -172,16 +166,18 @@ export function customModelCatalog(): Array<{ id: string; name: string; provider
  * a runtime API key alone is not enough (availability checks only cover
  * providers the ModelsStore knows).
  */
-export function customModelsJson(): { providers: Record<string, unknown> } | undefined {
-  if (providers.length === 0) return undefined;
+export function customModelsJsonForProviders(
+  specs: CustomProviderSpec[],
+): { providers: Record<string, unknown> } | undefined {
+  if (specs.length === 0) return undefined;
   return {
     providers: Object.fromEntries(
-      providers.map((spec) => [
+      specs.map((spec) => [
         spec.id,
         {
           name: spec.name,
           baseUrl: spec.baseUrl,
-          api: spec.protocol === "anthropic" ? "anthropic-messages" : "openai-completions",
+          api: runtimeApi(spec.protocol),
           models: spec.models.map((m) => ({
             id: m.id,
             name: m.name ?? m.id,
@@ -193,4 +189,8 @@ export function customModelsJson(): { providers: Record<string, unknown> } | und
       ]),
     ),
   };
+}
+
+export function customModelsJson(): { providers: Record<string, unknown> } | undefined {
+  return customModelsJsonForProviders(providers);
 }

@@ -162,7 +162,7 @@ export function registerOpenRouterCatalogModel(definition: OpenRouterCatalogMode
   return model;
 }
 
-export function resolveModel(id: string): PiModel | undefined {
+export function resolveStaticModel(id: string): PiModel | undefined {
   const entry = REGISTRY_BY_ID.get(id);
   if (entry?.clone) {
     const template = builtinModel(entry.clone.template);
@@ -179,9 +179,11 @@ export function resolveModel(id: string): PiModel | undefined {
         })
       : undefined;
   }
-  return (
-    builtinModel(id) ?? (resolveCustomModel(id) as unknown as PiModel | undefined) ?? OPENROUTER_CATALOG_MODELS.get(id)
-  );
+  return builtinModel(id) ?? OPENROUTER_CATALOG_MODELS.get(id);
+}
+
+export function resolveModel(id: string): PiModel | undefined {
+  return resolveStaticModel(id) ?? (resolveCustomModel(id) as unknown as PiModel | undefined);
 }
 
 export function auxiliaryModelForProvider(provider: string): string | undefined {
@@ -207,8 +209,10 @@ export function contextTokenBudgetForModel(id: string): number | undefined {
 
 export function modelSupportedByHarness(id: string | undefined, harness: string): boolean {
   if (!id) return false;
-  if (isCustomModelId(id) && !REGISTRY_BY_ID.has(id))
+  if (isCustomModelId(id) && !REGISTRY_BY_ID.has(id)) {
+    if (harness === "codex") return resolveCustomModel(id)?.api === "openai-responses";
     return harness === "pi" || harness === "opencode" || harness === "mock";
+  }
   if (harness === "pi" || harness === "opencode" || harness === "mock") return Boolean(resolveModel(id));
   const provider = resolveModel(id)?.provider;
   if (harness === "claude") return provider === "anthropic" || /^claude-/i.test(id);

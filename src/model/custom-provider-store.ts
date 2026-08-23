@@ -9,11 +9,14 @@
 
 import { decryptSecret, deriveConnectorKey, encryptSecret } from "../connectors/connector-client-store.ts";
 import type { DurableMap } from "../persistence/durable-map.ts";
+import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
+import { errMessage } from "../util/errors.ts";
 import { validateCustomProviderSpec, type CustomProviderSpec } from "./custom-providers.ts";
 
 export interface StoredCustomProvider extends CustomProviderSpec {
   apiKeyEnc?: string;
   disabled?: boolean;
+  modelHistory?: string[];
   updatedAt: number;
   updatedBy: string;
 }
@@ -33,6 +36,8 @@ export interface CustomProviderStore {
   /** Plaintext key for one provider, or null when absent/disabled. */
   resolveKey(id: string): Promise<string | null>;
   resolveActive(id: string): Promise<{ provider: CustomProviderSpec; apiKey: string | null } | null>;
+  active(): Promise<Array<{ provider: CustomProviderSpec; apiKey: string | null }>>;
+  knowsModel(id: string): Promise<boolean>;
   upsert(spec: CustomProviderSpec, apiKey: string | undefined, updatedBy: string): Promise<void>;
   delete(id: string, updatedBy: string): Promise<boolean>;
 }
@@ -50,8 +55,11 @@ function strip(saved: StoredCustomProvider): CustomProviderSpec {
 export function createCustomProviderStore(input: {
   backing: DurableMap<StoredCustomProvider>;
   keyMaterial: string | Buffer;
+  advisoryLock?: AdvisoryLock;
 }): CustomProviderStore {
   const key = deriveConnectorKey(input.keyMaterial, "custom-model-providers");
+  const withRegistryLock = <T>(operation: () => Promise<T>): Promise<T> =>
+    input.advisoryLock ? input.advisoryLock.withLock("custom-model-providers", operation) : operation();
 
   return {
     async enabled() {
@@ -87,32 +95,74 @@ export function createCustomProviderStore(input: {
       };
     },
 
+    async active() {
+      const all = await input.backing.all();
+      return all
+        .filter((saved) => !saved.disabled)
+        .map((saved) => ({
+          provider: strip(saved),
+          apiKey: (() => {
+            if (!saved.apiKeyEnc) return null;
+            try {
+              return decryptSecret(saved.apiKeyEnc, key);
+            } catch (error) {
+              console.error(`[model] custom provider ${saved.id}: key unreadable: ${errMessage(error)}`);
+              return null;
+            }
+          })(),
+        }));
+    },
+
+    async knowsModel(id) {
+      const all = await input.backing.all();
+      return all.some((saved) => saved.models.some((model) => model.id === id) || saved.modelHistory?.includes(id));
+    },
+
     async upsert(spec, apiKey, updatedBy) {
-      validateCustomProviderSpec(spec);
-      const actor = updatedBy.trim();
-      if (!actor) throw new Error("updatedBy is required");
-      const existing = await input.backing.get(spec.id);
-      const trimmedKey = apiKey?.trim();
-      const apiKeyEnc = trimmedKey ? encryptSecret(trimmedKey, key) : existing?.apiKeyEnc;
-      await input.backing.put(spec.id, {
-        ...spec,
-        ...(apiKeyEnc ? { apiKeyEnc } : {}),
-        disabled: false,
-        updatedAt: Date.now(),
-        updatedBy: actor,
+      await withRegistryLock(async () => {
+        validateCustomProviderSpec(spec);
+        const conflict = (await input.backing.all()).find(
+          (saved) =>
+            !saved.disabled &&
+            saved.id !== spec.id &&
+            saved.models.some((model) => spec.models.some((candidate) => candidate.id === model.id)),
+        );
+        if (conflict) throw new Error(`custom model id is already registered by provider "${conflict.id}"`);
+        const actor = updatedBy.trim();
+        if (!actor) throw new Error("updatedBy is required");
+        const existing = await input.backing.get(spec.id);
+        const trimmedKey = apiKey?.trim();
+        const apiKeyEnc = trimmedKey ? encryptSecret(trimmedKey, key) : existing?.apiKeyEnc;
+        const modelHistory = [
+          ...new Set([
+            ...(existing?.modelHistory ?? []),
+            ...(existing?.models ?? []).map((model) => model.id),
+            ...spec.models.map((model) => model.id),
+          ]),
+        ];
+        await input.backing.put(spec.id, {
+          ...spec,
+          ...(apiKeyEnc ? { apiKeyEnc } : {}),
+          modelHistory,
+          disabled: false,
+          updatedAt: Date.now(),
+          updatedBy: actor,
+        });
       });
     },
 
     async delete(id, updatedBy) {
-      const existing = await input.backing.get(id);
-      if (!existing || existing.disabled) return false;
-      await input.backing.put(id, {
-        ...existing,
-        disabled: true,
-        updatedAt: Date.now(),
-        updatedBy,
+      return withRegistryLock(async () => {
+        const existing = await input.backing.get(id);
+        if (!existing || existing.disabled) return false;
+        await input.backing.put(id, {
+          ...existing,
+          disabled: true,
+          updatedAt: Date.now(),
+          updatedBy,
+        });
+        return true;
       });
-      return true;
     },
   };
 }

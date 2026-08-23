@@ -5,6 +5,7 @@ import {
   resolveCustomModel,
   isCustomModelId,
   customModelCatalog,
+  customProvidersVersion,
   validateCustomProviderSpec,
 } from "../src/model/custom-providers.ts";
 import { builtInModelCatalog } from "../src/model/model-catalog.ts";
@@ -12,6 +13,7 @@ import { createCustomProviderStore } from "../src/model/custom-provider-store.ts
 import { modelSupportedByHarness, modelServiceable, resolveModel } from "../src/model/pi-models.ts";
 import { createMemoryMap } from "../src/persistence/durable-map.ts";
 import type { StoredCustomProvider } from "../src/model/custom-provider-store.ts";
+import { createMemoryAdvisoryLock } from "../src/persistence/advisory-lock.ts";
 
 afterEach(() => setCustomProviders([]));
 
@@ -49,6 +51,20 @@ test("anthropic-protocol providers produce anthropic-messages models with defaul
   assert.equal(model.api, "anthropic-messages");
   assert.equal(model.contextWindow, 128_000);
   assert.equal(model.cost.input, 0);
+});
+
+test("OpenAI Responses providers are available to all three enterprise harnesses", () => {
+  setCustomProviders([
+    {
+      ...GATEWAY,
+      protocol: "openai-responses",
+      models: [{ id: "responses-model" }],
+    },
+  ]);
+  assert.equal(resolveCustomModel("responses-model")?.api, "openai-responses");
+  assert.equal(modelSupportedByHarness("responses-model", "pi"), true);
+  assert.equal(modelSupportedByHarness("responses-model", "opencode"), true);
+  assert.equal(modelSupportedByHarness("responses-model", "codex"), true);
 });
 
 test("resolveModel falls back to custom models; built-ins shadow custom ids", () => {
@@ -132,6 +148,40 @@ test("store validates specs on upsert", async () => {
     keyMaterial: "k",
   });
   await assert.rejects(store.upsert({ ...GATEWAY, id: "anthropic" }, "k", "a@b.c"), /reserved/);
+});
+
+test("concurrent provider writes cannot claim the same model id", async () => {
+  const backing = createMemoryMap<StoredCustomProvider>();
+  const advisoryLock = createMemoryAdvisoryLock();
+  const first = createCustomProviderStore({ backing, keyMaterial: "k", advisoryLock });
+  const second = createCustomProviderStore({ backing, keyMaterial: "k", advisoryLock });
+  const results = await Promise.allSettled([
+    first.upsert({ ...GATEWAY, id: "first-gateway" }, "sk-first", "admin@example.com"),
+    second.upsert({ ...GATEWAY, id: "second-gateway" }, "sk-second", "admin@example.com"),
+  ]);
+  assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+  assert.equal(results.filter((result) => result.status === "rejected").length, 1);
+  assert.equal((await first.enabled()).length, 1);
+});
+
+test("an unchanged custom provider snapshot does not invalidate runtime caches", () => {
+  setCustomProviders([GATEWAY]);
+  const version = customProvidersVersion();
+  setCustomProviders([{ ...GATEWAY, models: [...GATEWAY.models] }]);
+  assert.equal(customProvidersVersion(), version);
+});
+
+test("provider model history preserves removed custom identities", async () => {
+  const store = createCustomProviderStore({
+    backing: createMemoryMap<StoredCustomProvider>(),
+    keyMaterial: "history-key-material",
+    advisoryLock: createMemoryAdvisoryLock(),
+  });
+  await store.upsert({ ...GATEWAY, models: [{ id: "gpt-private" }] }, "sk-private", "admin@example.com");
+  await store.upsert({ ...GATEWAY, models: [{ id: "replacement-model" }] }, undefined, "admin@example.com");
+  assert.equal(await store.knowsModel("gpt-private"), true);
+  assert.equal(await store.knowsModel("replacement-model"), true);
+  assert.equal(await store.knowsModel("gpt-future-native"), false);
 });
 
 test("active provider resolution keeps the endpoint and key from one durable snapshot", async () => {

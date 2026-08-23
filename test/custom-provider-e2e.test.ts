@@ -256,6 +256,7 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
     assert.equal(seen.filter((s) => s.path.endsWith("/chat/completions")).length, callsBeforeBuiltInCollision);
     assert.equal((await api("/v1/admin/custom-providers/collision", { method: "DELETE" })).status, 200);
 
+    const callsBeforeCustomCollision = seen.filter((s) => s.path.endsWith("/chat/completions")).length;
     r = await api("/v1/admin/custom-providers/z-shadow", {
       method: "PUT",
       body: JSON.stringify({
@@ -267,15 +268,9 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
         validate: false,
       }),
     });
-    assert.equal(r.status, 200);
-    const callsBeforeCustomCollision = seen.filter((s) => s.path.endsWith("/chat/completions")).length;
-    r = await api("/v1/admin/custom-providers/qa/test", {
-      method: "POST",
-      body: JSON.stringify({ modelId: "qa-chat" }),
-    });
-    assert.equal(r.status, 409);
+    assert.equal(r.status, 400);
     assert.equal(seen.filter((s) => s.path.endsWith("/chat/completions")).length, callsBeforeCustomCollision);
-    assert.equal((await api("/v1/admin/custom-providers/z-shadow", { method: "DELETE" })).status, 200);
+    assert.equal((await api("/v1/admin/custom-providers/z-shadow", { method: "DELETE" })).status, 404);
 
     // 7. edit WITHOUT key keeps the stored key
     r = await api("/v1/admin/custom-providers/qa", {
@@ -305,6 +300,104 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
     server.close();
     upstream.close();
     staleUpstream.close();
+  }
+});
+
+test("QA: OpenAI Responses custom provider serves the Admin self-test path", async () => {
+  const seen: Array<{ path: string; auth?: string; model?: string; maxTokens?: number }> = [];
+  const upstream = createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      const record = { path: req.url ?? "", auth: req.headers.authorization };
+      if (req.url?.endsWith("/models")) {
+        seen.push(record);
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ data: [{ id: "responses-chat" }] }));
+      }
+      if (req.url?.endsWith("/responses")) {
+        const payload = JSON.parse(body) as { model?: string; max_output_tokens?: number };
+        seen.push({ ...record, model: payload.model, maxTokens: payload.max_output_tokens });
+        const item = {
+          id: "msg_responses_qa",
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [{ type: "output_text", text: "RESPONSES QA REPLY", annotations: [] }],
+        };
+        const response = {
+          id: "resp_qa",
+          object: "response",
+          created_at: Math.floor(Date.now() / 1000),
+          status: "completed",
+          model: "responses-chat",
+          output: [item],
+          usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8 },
+        };
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        for (const event of [
+          { type: "response.created", response: { ...response, status: "in_progress", output: [] } },
+          {
+            type: "response.output_item.added",
+            output_index: 0,
+            item: { ...item, status: "in_progress", content: [] },
+          },
+          { type: "response.output_text.delta", output_index: 0, content_index: 0, delta: "RESPONSES QA REPLY" },
+          { type: "response.output_item.done", output_index: 0, item },
+          { type: "response.completed", response },
+        ]) {
+          res.write(`data: ${JSON.stringify(event)}\n\n`);
+        }
+        res.write("data: [DONE]\n\n");
+        return res.end();
+      }
+      seen.push(record);
+      res.writeHead(404);
+      res.end();
+    });
+  });
+  await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  const upstreamUrl = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}/v1`;
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "qa-responses-")) }));
+  const server = createInsecureTestServer(built.app, {
+    config: built.config,
+    modelCredentials: built.modelCredentials,
+    customProviders: built.customProviders,
+    refreshCustomProviders: built.refreshCustomProviders,
+    admin: built.admin,
+    auditLog: built.auditLog,
+    harnessId: "pi",
+  });
+  server.listen(0);
+  const base = `http://localhost:${(server.address() as AddressInfo).port}`;
+  try {
+    let result = await fetch(`${base}/v1/admin/custom-providers/responses`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify({
+        name: "Responses",
+        protocol: "openai-responses",
+        baseUrl: upstreamUrl,
+        apiKey: "sk-responses",
+        models: [{ id: "responses-chat" }],
+      }),
+    });
+    assert.equal(result.status, 200);
+    result = await fetch(`${base}/v1/admin/custom-providers/responses/test`, {
+      method: "POST",
+      headers: ADMIN,
+      body: JSON.stringify({ modelId: "responses-chat" }),
+    });
+    assert.equal(result.status, 200);
+    assert.equal(((await result.json()) as { reply: string }).reply, "RESPONSES QA REPLY");
+    const call = seen.find((request) => request.path.endsWith("/responses"));
+    assert.ok(call);
+    assert.equal(call.auth, "Bearer sk-responses");
+    assert.equal(call.model, "responses-chat");
+    assert.equal(call.maxTokens, 128);
+  } finally {
+    server.close();
+    upstream.close();
   }
 });
 

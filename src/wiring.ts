@@ -171,7 +171,7 @@ import { createConsentLinkStore, type ConsentLinkStore, type ConsentLinkRecord }
 import { createModelGateway, type ModelGateway } from "./model/model-gateway.ts";
 import { createModelCredentialStore, type ModelCredentialStore } from "./model/model-credential-store.ts";
 import { setProviderBaseUrls } from "./model/provider-endpoints.ts";
-import { setCustomProviders } from "./model/custom-providers.ts";
+import { resolveCustomModel, setCustomProviders } from "./model/custom-providers.ts";
 import { createCustomProviderStore, type CustomProviderStore } from "./model/custom-provider-store.ts";
 import { createMemorySessionStore } from "./sessions/memory-session-store.ts";
 import { createPostgresSessionStore } from "./sessions/postgres-session-store.ts";
@@ -252,8 +252,11 @@ import {
   auxiliaryModelForProvider,
   defaultModelForHarness,
   modelProviderAvailabilityFor,
+  resolveModel,
+  resolveStaticModel,
   type HarnessId,
 } from "./model/pi-models.ts";
+import { NonRetryableTurnError } from "./core/turn-error.ts";
 import { createAdminService, bootAdminGrantSeed, type AdminService } from "./admin/admin-service.ts";
 import { createAdminGrantStore, createMapAdminGrantPersistence, type AdminGrant } from "./admin/admin-grant-store.ts";
 import { createPostgresAdminGrantStore } from "./admin/postgres-admin-grant-store.ts";
@@ -727,6 +730,7 @@ export function buildApp(
   const customProviders = createCustomProviderStore({
     backing: artifactMap("custom_model_providers"),
     keyMaterial: config.connectorSecretKey ?? randomBytes(32),
+    advisoryLock,
   });
   const refreshCustomProviders = async () => {
     setCustomProviders(await customProviders.enabled());
@@ -734,34 +738,61 @@ export function buildApp(
   void refreshCustomProviders().catch((e) =>
     console.error("[wiring] custom provider hydration failed:", errMessage(e)),
   );
-  const resolveModelProviderKeys = async () => {
-    const [anthropic, openai, openrouter, enabledCustom] = await Promise.all([
+  const resolveModelProviderRuntime = async () => {
+    const [anthropic, openai, openrouter, activeCustom] = await Promise.all([
       modelCredentials.resolve("anthropic"),
       modelCredentials.resolve("openai"),
       modelCredentials.resolve("openrouter"),
-      customProviders.enabled(),
+      customProviders.active(),
     ]);
+    const customProvidersSnapshot = activeCustom.map(({ provider }) => provider);
     const customKeys = Object.fromEntries(
-      (
-        await Promise.all(
-          enabledCustom.map(async (p) => {
-            try {
-              return [p.id, await customProviders.resolveKey(p.id)] as const;
-            } catch (e) {
-              // A corrupt/undecryptable custom key must degrade that one
-              // provider, never the whole turn (built-ins included).
-              console.error(`[model] custom provider ${p.id}: key unreadable: ${errMessage(e)}`);
-              return [p.id, null] as const;
-            }
-          }),
-        )
-      ).filter(([, key]) => key),
+      activeCustom.filter(({ apiKey }) => apiKey).map(({ provider, apiKey }) => [provider.id, apiKey]),
     );
     return {
-      ...(anthropic ? { anthropic } : {}),
-      ...(openai ? { openai } : {}),
-      ...(openrouter ? { openrouter } : {}),
-      ...customKeys,
+      keys: {
+        ...(anthropic ? { anthropic } : {}),
+        ...(openai ? { openai } : {}),
+        ...(openrouter ? { openrouter } : {}),
+        ...customKeys,
+      },
+      customProviders: customProvidersSnapshot,
+    };
+  };
+  const resolveCodexCustomProvider = async (modelId: string) => {
+    if (resolveStaticModel(modelId)) return null;
+    const knownCustom = await customProviders.knowsModel(modelId);
+    const custom = resolveCustomModel(modelId);
+    const model = resolveModel(modelId);
+    if (
+      !custom ||
+      !model ||
+      model.provider !== custom.provider ||
+      model.api !== custom.api ||
+      model.baseUrl !== custom.baseUrl
+    ) {
+      if (knownCustom) throw new NonRetryableTurnError(`custom model ${modelId} is not active`);
+      return null;
+    }
+    if (model.api !== "openai-responses") {
+      throw new NonRetryableTurnError(`custom model ${modelId} does not support the Codex Responses transport`);
+    }
+    const providerId = String(model.provider);
+    const active = await customProviders.resolveActive(providerId);
+    if (
+      !active ||
+      !active.apiKey ||
+      active.provider.protocol !== "openai-responses" ||
+      active.provider.baseUrl !== model.baseUrl ||
+      !active.provider.models.some((candidate) => candidate.id === modelId)
+    ) {
+      throw new NonRetryableTurnError(`custom model ${modelId} is not active with a usable Codex credential`);
+    }
+    return {
+      id: active.provider.id,
+      name: active.provider.name,
+      baseUrl: active.provider.baseUrl,
+      apiKey: active.apiKey,
     };
   };
   const runtimeOrgScope = scopeId("org", config.orgId);
@@ -773,7 +804,7 @@ export function buildApp(
       createPiHarness({
         ...piHarnessConfigOptions(config),
         resolveBaseModelId: orgBaseModelId,
-        resolveProviderKeys: resolveModelProviderKeys,
+        resolveProviderRuntime: resolveModelProviderRuntime,
         signals: runSignals,
         mcpTools,
       }),
@@ -786,25 +817,21 @@ export function buildApp(
         tasks,
         mcpTools,
         resolveCustomProviders: async () => {
-          const enabled = await customProviders.enabled();
-          return Promise.all(
-            enabled.map(async (spec) => {
-              try {
-                const apiKey = await customProviders.resolveKey(spec.id);
-                return { spec, ...(apiKey ? { apiKey } : {}) };
-              } catch (e) {
-                // An unreadable key must not prevent the opencode server from
-                // starting; the provider is configured keyless and its models
-                // fail individually instead.
-                console.error(`[model] custom provider ${spec.id}: key unreadable: ${errMessage(e)}`);
-                return { spec };
-              }
-            }),
-          );
+          const active = await customProviders.active();
+          return active.map(({ provider: spec, apiKey }) => ({ spec, ...(apiKey ? { apiKey } : {}) }));
         },
       }),
     ],
-    ["codex", createCodexHarness({ ...codexHarnessConfigOptions(config), signals: runSignals, tasks, mcpTools })],
+    [
+      "codex",
+      createCodexHarness({
+        ...codexHarnessConfigOptions(config),
+        signals: runSignals,
+        tasks,
+        mcpTools,
+        resolveCustomProvider: resolveCodexCustomProvider,
+      }),
+    ],
     ["claude", createClaudeHarness({ ...claudeHarnessConfigOptions(config), signals: runSignals, tasks, mcpTools })],
     ["mock", createMockHarness()],
   ]);
@@ -820,12 +847,13 @@ export function buildApp(
     },
   };
   const judgeModelId = (): string => config.judgeModelId ?? auxiliaryModelFor(orgBaseModelId() ?? fallback.modelId);
-  const harness = createHarnessRouter(adapters, adapters.get(fallbackHarness)!, (input) =>
-    resolveRuntimeChoiceDurable(configStore, runtimeOrgScope, input.scopeLabel, fallback, {
+  const harness = createHarnessRouter(adapters, adapters.get(fallbackHarness)!, async (input) => {
+    await refreshCustomProviders();
+    return resolveRuntimeChoiceDurable(configStore, runtimeOrgScope, input.scopeLabel, fallback, {
       ...(input.harness ? { harnessId: input.harness as HarnessId } : {}),
       ...(input.model ? { modelId: input.model } : {}),
-    }),
-  );
+    });
+  });
 
   const leaseTtlMs = config.leaseTtlMs;
   const maxAttempts = config.maxAttempts;

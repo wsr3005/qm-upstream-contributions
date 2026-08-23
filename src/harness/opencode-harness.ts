@@ -1,4 +1,4 @@
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { sanitizeTitle, TITLE_GENERATION_PROMPT, titleUserPrompt } from "./pi-harness.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -10,7 +10,7 @@ import { createOpencodeClient, type OpencodeClient } from "@opencode-ai/sdk";
 import { CONFIG_DEFAULTS, type Config } from "../config.ts";
 import { isCustomModelId } from "../model/custom-providers.ts";
 import type { CustomProviderSpec } from "../model/custom-providers.ts";
-import { DEFAULT_AGENT_MODEL_ID, resolveModel } from "../model/pi-models.ts";
+import { DEFAULT_AGENT_MODEL_ID, modelSupportedByHarness, resolveModel } from "../model/pi-models.ts";
 import { startSignalPoll, type RunSignalStore } from "../runs/run-signal-store.ts";
 import type { LlmCallUsage } from "../sessions/session-store.ts";
 import type { ScopeId, SessionEntry } from "../types.ts";
@@ -54,11 +54,6 @@ export interface OpenCodeHarnessOptions {
   binaryPath?: string;
   startupTimeoutMs?: number;
   tasks?: TaskStore;
-  /**
-   * Admin-registered custom providers, resolved (with keys) when the
-   * opencode server starts. Registrations made while a server is already
-   * running apply to the next server start.
-   */
   resolveCustomProviders?: () => Promise<Array<{ spec: CustomProviderSpec; apiKey?: string }>>;
 }
 
@@ -95,9 +90,13 @@ type ActiveTurn = {
   eventTail: Promise<void>;
   stopped: boolean;
   child: boolean;
+  runtime: Runtime;
 };
 
 type Runtime = {
+  key: string;
+  retired: boolean;
+  closing: boolean;
   client: OpencodeClient;
   process: ChildProcess;
   bridge: ReturnType<typeof createServer>;
@@ -475,8 +474,35 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
     opts.defaultModelId ??
     DEFAULT_AGENT_MODEL_ID;
   const defaultTurnWallClockMs = opts.turnWallClockMs ?? CONFIG_DEFAULTS.turnWallClockSec * 1000;
-  let runtime: Runtime | null = null;
-  let starting: Promise<Runtime> | null = null;
+  const runtimes = new Map<string, Runtime>();
+  const starting = new Map<string, Promise<Runtime>>();
+  const reservations = new Map<string, number>();
+  let desiredRuntimeKey = "";
+
+  const closeRuntime = async (runtime: Runtime): Promise<void> => {
+    if (runtime.closing) return;
+    runtime.closing = true;
+    if (runtimes.get(runtime.key) === runtime) runtimes.delete(runtime.key);
+    await runtime.close();
+  };
+
+  const runtimeInUse = (candidate: Runtime): boolean =>
+    (reservations.get(candidate.key) ?? 0) > 0 || [...active.values()].some((state) => state.runtime === candidate);
+
+  const releaseReservation = async (key: string): Promise<void> => {
+    const remaining = (reservations.get(key) ?? 1) - 1;
+    if (remaining > 0) reservations.set(key, remaining);
+    else reservations.delete(key);
+    const candidate = runtimes.get(key);
+    if (candidate?.retired && !runtimeInUse(candidate)) await closeRuntime(candidate).catch(() => undefined);
+  };
+
+  const resolveRuntimeSpec = async () => {
+    const custom = (await opts.resolveCustomProviders?.()) ?? [];
+    custom.sort((left, right) => left.spec.id.localeCompare(right.spec.id));
+    const key = createHash("sha256").update(JSON.stringify(custom)).digest("hex");
+    return { key, custom };
+  };
 
   const childState = (parent: ActiveTurn): ActiveTurn => ({
     ...parent,
@@ -568,11 +594,20 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
     await operation;
   };
 
-  const ensureRuntime = async (): Promise<Runtime> => {
-    if (runtime && runtime.process.exitCode === null) return runtime;
-    if (starting) return await starting;
-    starting = (async () => {
+  const ensureRuntime = async (spec: Awaited<ReturnType<typeof resolveRuntimeSpec>>): Promise<Runtime> => {
+    desiredRuntimeKey = spec.key;
+    const existing = runtimes.get(spec.key);
+    if (existing && !existing.closing && existing.process.exitCode === null) return existing;
+    const pending = starting.get(spec.key);
+    if (pending) {
+      const joined = await pending;
+      if (!joined.closing && joined.process.exitCode === null) return joined;
+      if (starting.get(spec.key) === pending) starting.delete(spec.key);
+      return ensureRuntime(spec);
+    }
+    const operation = (async () => {
       const jail = mkdtempSync(join(tmpdir(), "qm-opencode-"));
+      let createdRuntime: Runtime | null = null;
       const bridge = createServer(async (req, res) => {
         try {
           const url = new URL(req.url ?? "/", "http://127.0.0.1");
@@ -585,8 +620,10 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
             if (!equalSecret(bearer(req), bridgeSecret)) return json(res, 401, { error: "unauthorized" });
             const requestedSessionId = decodeURIComponent(sessionMatch[1]!);
             let state = active.get(requestedSessionId);
-            if (!state && runtime) {
-              const session = await runtime.client.session.get({ path: { id: requestedSessionId } }).catch(() => null);
+            if (!state && createdRuntime) {
+              const session = await createdRuntime.client.session
+                .get({ path: { id: requestedSessionId } })
+                .catch(() => null);
               const parentId = session?.data?.parentID;
               const parent = parentId ? active.get(parentId) : undefined;
               if (parent) {
@@ -657,32 +694,33 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
         const bridgeUrl = `http://127.0.0.1:${address.port}`;
         const pluginUrl = pathToFileURL(join(import.meta.dirname, "opencode-plugin.ts")).href;
         const enabledTools = Object.fromEntries(definitions.map((item) => [item.name, true]));
-        const custom = (await opts.resolveCustomProviders?.()) ?? [];
+        const custom = spec.custom;
         const customProviderConfig = Object.fromEntries(
-          custom.map(({ spec, apiKey }) => [
-            spec.id,
-            {
-              npm: spec.protocol === "anthropic" ? "@ai-sdk/anthropic" : "@ai-sdk/openai-compatible",
-              name: spec.name,
-              options: { baseURL: spec.baseUrl, ...(apiKey ? { apiKey } : {}) },
-              models: Object.fromEntries(
-                spec.models.map((m) => [
-                  m.id,
-                  {
-                    name: m.name ?? m.id,
-                    ...(m.contextWindow || m.maxTokens
-                      ? {
-                          limit: {
-                            context: m.contextWindow ?? 128_000,
-                            output: m.maxTokens ?? 8_192,
-                          },
-                        }
-                      : {}),
-                  },
-                ]),
-              ),
-            },
-          ]),
+          custom.map(({ spec, apiKey }) => {
+            let npm = "@ai-sdk/openai-compatible";
+            if (spec.protocol === "anthropic") npm = "@ai-sdk/anthropic";
+            if (spec.protocol === "openai-responses") npm = "@ai-sdk/openai";
+            return [
+              spec.id,
+              {
+                npm,
+                name: spec.name,
+                options: { baseURL: spec.baseUrl, ...(apiKey ? { apiKey } : {}) },
+                models: Object.fromEntries(
+                  spec.models.map((m) => [
+                    m.id,
+                    {
+                      name: m.name ?? m.id,
+                      limit: {
+                        context: m.contextWindow ?? 128_000,
+                        output: m.maxTokens ?? 8_192,
+                      },
+                    },
+                  ]),
+                ),
+              },
+            ];
+          }),
         );
         const config = {
           plugin: [pluginUrl],
@@ -796,6 +834,9 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
           }
         })();
         const created: Runtime = {
+          key: spec.key,
+          retired: spec.custom.length > 0 || desiredRuntimeKey !== spec.key,
+          closing: false,
           client,
           process: proc,
           bridge,
@@ -806,16 +847,29 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
             await terminateProcess(proc!);
             await closeServer(bridge);
             rmSync(jail, { recursive: true, force: true });
+            if (runtimes.get(spec.key) === created) runtimes.delete(spec.key);
           },
         };
+        createdRuntime = created;
         proc.once("exit", () => {
           abortEvents.abort();
-          if (runtime !== created) return;
-          runtime = null;
+          if (runtimes.get(spec.key) === created) runtimes.delete(spec.key);
           bridge.close();
           rmSync(jail, { recursive: true, force: true });
         });
-        runtime = created;
+        runtimes.set(spec.key, created);
+        const priorVersions = created.retired
+          ? [created]
+          : [...runtimes.values()].filter((candidate) => candidate !== created);
+        if (!created.retired)
+          priorVersions.forEach((candidate) => {
+            candidate.retired = true;
+          });
+        await Promise.all(
+          priorVersions
+            .filter((candidate) => !runtimeInUse(candidate))
+            .map((candidate) => closeRuntime(candidate).catch(() => undefined)),
+        );
         return created;
       } catch (error) {
         if (proc) await terminateProcess(proc);
@@ -824,68 +878,116 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
         throw error;
       }
     })();
+    starting.set(spec.key, operation);
     try {
-      return await starting;
+      return await operation;
     } finally {
-      starting = null;
+      if (starting.get(spec.key) === operation) starting.delete(spec.key);
     }
   };
 
   const runPrompt = async (turn: HarnessTurnInput): Promise<HarnessTurnResult> => {
     if (turn.cancel?.aborted) return { reply: "", stopped: true };
-    const rt = await ensureRuntime();
-    if (turn.cancel?.aborted) return { reply: "", stopped: true };
+    if (turn.model && !modelSupportedByHarness(turn.model, "opencode")) {
+      throw new NonRetryableTurnError(`OpenCode does not support requested model ${turn.model}`);
+    }
     const selectedModel = turn.model ?? resolveModelId(turn.scopeLabel);
+    const runtimeSpec = await resolveRuntimeSpec();
+    reservations.set(runtimeSpec.key, (reservations.get(runtimeSpec.key) ?? 0) + 1);
+    let rt: Runtime;
+    try {
+      rt = await ensureRuntime(runtimeSpec);
+    } catch (error) {
+      await releaseReservation(runtimeSpec.key);
+      throw error;
+    }
+    if (turn.cancel?.aborted) {
+      await releaseReservation(runtimeSpec.key);
+      return { reply: "", stopped: true };
+    }
     const model = modelRef(selectedModel);
-    const created = await rt.client.session.create({ body: { title: `qm:${turn.session.id}` } });
+    let created;
+    try {
+      created = await rt.client.session.create({ body: { title: `qm:${turn.session.id}` } });
+    } catch (error) {
+      await releaseReservation(runtimeSpec.key);
+      throw error;
+    }
     const session = created.data;
-    if (!session) throw new Error(`OpenCode session creation failed: ${JSON.stringify(created.error)}`);
+    if (!session) {
+      await releaseReservation(runtimeSpec.key);
+      throw new Error(`OpenCode session creation failed: ${JSON.stringify(created.error)}`);
+    }
     const sessionId = session.id;
     if (turn.cancel?.aborted) {
       await rt.client.session.abort({ path: { id: sessionId } }).catch(() => undefined);
       await rt.client.session.delete({ path: { id: sessionId } }).catch(() => undefined);
+      await releaseReservation(runtimeSpec.key);
       return { reply: "", stopped: true };
     }
-    const ref: ToolContextRef = {
-      current: turn.tools,
-      pendingApprovals: [],
-      pausedOnApproval: false,
-      silentRequested: false,
-      pollFire: Boolean(turn.pollFire),
-      emit: turn.emit,
-      scopeLabel: turn.scopeLabel,
-      orgScopeId: turn.orgScopeId,
-      screenExternalContent: turn.screenExternalContent,
-      toolApprovalGate: turn.toolApprovalGate,
-    };
-    const controller = new AbortController();
-    ref.abortSignal = controller.signal;
-    const tools = asTools(ref, toolOptions(opts, turn));
-    const userEntry = await turn.emit({
-      type: "user",
-      payload: {
-        text: turn.input,
-        ...((turn.triggerTs ?? turn.entryTs) ? { ts: turn.triggerTs ?? turn.entryTs } : {}),
-        ...(turn.attachments?.length ? { attachments: turn.attachments } : {}),
-      },
-      scopeLabel: turn.scopeLabel,
-    });
-    const state: ActiveTurn = {
-      turn,
-      ref,
-      tools: new Map(tools.map((tool) => [bridgeToolName(tool.name), tool])),
-      system: `${turn.systemPrompt}\n\nOpenCode tool aliases: workspace_execute is foreground \`execute\`; workspace_read reads workspace files; workspace_write writes workspace files.`,
-      history: replayMessages(reconstructMessagesFromHistory(turn.history), sessionId, model),
-      userSeq: userEntry.seq,
-      captures: [],
-      model: selectedModel,
-      seenText: new Map(),
-      seenTasks: new Map(),
-      eventTail: Promise.resolve(),
-      stopped: false,
-      child: false,
-    };
+    let prepared: { ref: ToolContextRef; controller: AbortController; state: ActiveTurn };
+    try {
+      const ref: ToolContextRef = {
+        current: turn.tools,
+        pendingApprovals: [],
+        pausedOnApproval: false,
+        silentRequested: false,
+        pollFire: Boolean(turn.pollFire),
+        emit: turn.emit,
+        scopeLabel: turn.scopeLabel,
+        orgScopeId: turn.orgScopeId,
+        screenExternalContent: turn.screenExternalContent,
+        toolApprovalGate: turn.toolApprovalGate,
+      };
+      const controller = new AbortController();
+      ref.abortSignal = controller.signal;
+      const tools = asTools(ref, toolOptions(opts, turn));
+      prepared = {
+        ref,
+        controller,
+        state: {
+          turn,
+          ref,
+          tools: new Map(tools.map((tool) => [bridgeToolName(tool.name), tool])),
+          system: `${turn.systemPrompt}\n\nOpenCode tool aliases: workspace_execute is foreground \`execute\`; workspace_read reads workspace files; workspace_write writes workspace files.`,
+          history: replayMessages(reconstructMessagesFromHistory(turn.history), sessionId, model),
+          userSeq: null,
+          captures: [],
+          model: selectedModel,
+          seenText: new Map(),
+          seenTasks: new Map(),
+          eventTail: Promise.resolve(),
+          stopped: false,
+          child: false,
+          runtime: rt,
+        },
+      };
+    } catch (error) {
+      await releaseReservation(runtimeSpec.key);
+      await rt.client.session.delete({ path: { id: sessionId } }).catch(() => undefined);
+      throw error;
+    }
+    const { ref, controller, state } = prepared;
     active.set(sessionId, state);
+    await releaseReservation(runtimeSpec.key);
+    let userEntry: SessionEntry;
+    try {
+      userEntry = await turn.emit({
+        type: "user",
+        payload: {
+          text: turn.input,
+          ...((turn.triggerTs ?? turn.entryTs) ? { ts: turn.triggerTs ?? turn.entryTs } : {}),
+          ...(turn.attachments?.length ? { attachments: turn.attachments } : {}),
+        },
+        scopeLabel: turn.scopeLabel,
+      });
+    } catch (error) {
+      active.delete(sessionId);
+      await rt.client.session.delete({ path: { id: sessionId } }).catch(() => undefined);
+      if (rt.retired && !runtimeInUse(rt)) await closeRuntime(rt).catch(() => undefined);
+      throw error;
+    }
+    state.userSeq = userEntry.seq;
     const abort = async (stopped: boolean) => {
       state.stopped ||= stopped;
       controller.abort();
@@ -903,6 +1005,7 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
       active.delete(sessionId);
       turn.cancel.removeEventListener("abort", onCancel);
       await rt.client.session.delete({ path: { id: sessionId } }).catch(() => undefined);
+      if (rt.retired && !runtimeInUse(rt)) await closeRuntime(rt).catch(() => undefined);
       return { reply: "", stopped: true };
     }
     const wallMs = turn.turnWallClockMs ?? defaultTurnWallClockMs;
@@ -997,7 +1100,7 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
       })),
     ];
     const enabled = Object.fromEntries(definitions.map((tool) => [tool.name, false]));
-    for (const tool of tools) enabled[bridgeToolName(tool.name)] = true;
+    for (const name of state.tools.keys()) enabled[name] = true;
     enabled.task = !turn.readOnly;
     let timer: NodeJS.Timeout | undefined;
     let signalsStopped = false;
@@ -1100,6 +1203,7 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
       await flushLlmRequests();
       for (const [id, candidate] of active) if (candidate.turn === turn) active.delete(id);
       await rt.client.session.delete({ path: { id: sessionId } }).catch(() => undefined);
+      if (rt.retired && !runtimeInUse(rt)) await closeRuntime(rt).catch(() => undefined);
     }
   };
 
@@ -1149,9 +1253,8 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
     {
       runTurn: runPrompt,
       close: async () => {
-        await starting?.catch(() => undefined);
-        await runtime?.close();
-        runtime = null;
+        await Promise.allSettled([...starting.values()]);
+        await Promise.all([...runtimes.values()].map((runtime) => closeRuntime(runtime).catch(() => undefined)));
       },
       resetSession: () => {},
       oneShot: single,

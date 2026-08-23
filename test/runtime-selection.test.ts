@@ -60,6 +60,16 @@ test("runtime resolution falls back to the first approved harness when deploymen
   });
 });
 
+test("runtime resolution fails closed when a stored runtime is unavailable", () => {
+  const config = createMemoryConfigStore("default-org");
+  config.setApprovedHarnesses(["pi", "codex"]);
+  config.setRuntimeSelection(ORG, { harnessId: "codex", modelId: "removed-custom-model" });
+  assert.throws(
+    () => resolveRuntimeChoice(config, ORG, PERSONAL, { harnessId: "pi", modelId: "claude-opus-4-8" }),
+    /configured runtime codex\/removed-custom-model is unavailable/,
+  );
+});
+
 test("runtime resolution reads approvals and selections from shared durable state on every turn", async () => {
   const baseModels = createMemoryMap<PersistedBaseModel>();
   const approvedHarnesses = createMemoryMap<PersistedApprovedHarnesses>();

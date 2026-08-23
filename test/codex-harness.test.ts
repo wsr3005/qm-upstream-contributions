@@ -4,8 +4,11 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import {
   codexChildEnv,
+  codexCustomRuntimeSpec,
   codexNonRetryable,
   codexProviderFailure,
   codexUsageTotals,
@@ -25,6 +28,7 @@ import type { ScopeId, Session, SessionEntry } from "../src/types.ts";
 import { createMemoryTaskStore } from "../src/tasks/memory-task-store.ts";
 import { CodexAppServer } from "../src/harness/codex-app-server.ts";
 import { DEFAULT_CODEX_MODEL_ID } from "../src/model/pi-models.ts";
+import { setCustomProviders } from "../src/model/custom-providers.ts";
 
 const replaySmokeItems = [
   { type: "message", role: "user", content: [{ type: "input_text", text: "earlier question" }] },
@@ -39,6 +43,40 @@ test("Codex replay keeps paired tool ids within the provider's 64-character limi
   assert.equal(normalized.length, 64);
   assert.equal(codexReplayCallId(longId), normalized);
   assert.equal(codexReplayCallId("short-id"), "short-id");
+});
+
+test("Codex fails closed when an explicitly requested model is unavailable", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-codex-unavailable-"));
+  let resolutions = 0;
+  const harness = createCodexHarness({
+    binaryPath: fakeCodexBinary(dir),
+    resolveCustomProvider: async () => {
+      resolutions += 1;
+      return null;
+    },
+  });
+  t.after(async () => {
+    await harness.turns.close?.();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const scope = { kind: "org", id: "test" } as unknown as ScopeId;
+  await assert.rejects(
+    harness.turns.runTurn({
+      session: { id: "unavailable" } as Session,
+      input: "hi",
+      model: "removed-custom-model",
+      systemPrompt: "be concise",
+      history: [],
+      tools: {} as HarnessTurnInput["tools"],
+      scopeLabel: scope,
+      orgScopeId: scope,
+      emit: async (entry) => ({ ...entry, sessionId: "unavailable", seq: 1, createdAt: Date.now() }) as SessionEntry,
+      recordModelCall: () => {},
+    }),
+    /does not support requested model/,
+  );
+  assert.equal(resolutions, 0);
+  assert.equal(existsSync(join(dir, "starts")), false);
 });
 
 function fakeCodexBinary(dir: string): string {
@@ -77,6 +115,72 @@ rl.on("line", (line) => {
     return send({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed", items: [], itemsView: "notLoaded" } } });
   }
   if (msg.method === "turn/interrupt" || msg.method === "turn/steer") return send({ id: msg.id, result: {} });
+});
+`,
+  );
+  chmodSync(path, 0o755);
+  return path;
+}
+
+function customProviderCodexBinary(dir: string): string {
+  const path = join(dir, "custom-provider-codex");
+  writeFileSync(
+    path,
+    `#!/usr/bin/env node
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin });
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") return send({ id: msg.id, result: {} });
+  if (msg.method === "initialized") return;
+  if (msg.method === "thread/start") {
+    const provider = msg.params.config?.model_providers?.gateway;
+    if (msg.params.model !== "responses-model" || msg.params.config?.model_provider !== "gateway" ||
+        provider?.base_url !== "https://gateway.example.com/v1" || provider?.wire_api !== "responses" ||
+        provider?.env_key !== "QM_CODEX_PROVIDER_KEY" || process.env.QM_CODEX_PROVIDER_KEY !== "sk-custom" ||
+        process.env.OPENAI_API_KEY || process.env.OPENAI_BASE_URL || process.env.CODEX_ACCESS_TOKEN ||
+        line.includes("sk-custom")) {
+      return send({ id: msg.id, error: { code: -1, message: "bad custom provider binding" } });
+    }
+    return send({ id: msg.id, result: { thread: { id: "thread-custom" }, model: "responses-model" } });
+  }
+  if (msg.method === "turn/start") {
+    send({ id: msg.id, result: { turn: { id: "turn-custom", status: "inProgress", items: [] } } });
+    return send({ method: "turn/completed", params: { threadId: "thread-custom", turn: { id: "turn-custom", status: "completed", items: [{ type: "agentMessage", text: "CUSTOM-OK", phase: "final_answer" }] } } });
+  }
+});
+`,
+  );
+  chmodSync(path, 0o755);
+  return path;
+}
+
+function rotatingProviderCodexBinary(dir: string): string {
+  const path = join(dir, "rotating-provider-codex");
+  const log = join(dir, "runtime-log");
+  writeFileSync(
+    path,
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const readline = require("node:readline");
+const key = process.env.QM_CODEX_PROVIDER_KEY;
+fs.appendFileSync(${JSON.stringify(log)}, "start:" + key + "\\n");
+process.on("SIGTERM", () => {
+  fs.appendFileSync(${JSON.stringify(log)}, "close:" + key + "\\n");
+  process.exit(0);
+});
+const rl = readline.createInterface({ input: process.stdin });
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") return send({ id: msg.id, result: {} });
+  if (msg.method === "initialized") return;
+  if (msg.method === "thread/start") return send({ id: msg.id, result: { thread: { id: "thread-" + key } } });
+  if (msg.method === "turn/start") {
+    send({ id: msg.id, result: { turn: { id: "turn-" + key, status: "inProgress", items: [] } } });
+    return send({ method: "turn/completed", params: { threadId: "thread-" + key, turn: { id: "turn-" + key, status: "completed", items: [{ type: "agentMessage", text: key, phase: "final_answer" }] } } });
+  }
 });
 `,
   );
@@ -164,6 +268,28 @@ process.stdin.resume();
   return path;
 }
 
+function delayedCustomCodexBinary(dir: string): string {
+  const path = join(dir, "delayed-custom-codex");
+  writeFileSync(
+    path,
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const readline = require("node:readline");
+const log = ${JSON.stringify(join(dir, "delayed-log"))};
+fs.appendFileSync(log, "start\\n");
+fs.writeFileSync(${JSON.stringify(join(dir, "delayed-jail"))}, process.env.HOME);
+process.on("SIGTERM", () => { fs.appendFileSync(log, "close\\n"); process.exit(0); });
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") setTimeout(() => process.stdout.write(JSON.stringify({ id: msg.id, result: {} }) + "\\n"), 300);
+});
+`,
+  );
+  chmodSync(path, 0o755);
+  return path;
+}
+
 test("Codex forwards external-content screening into its native tool bridge", () => {
   const screenExternalContent: NonNullable<HarnessTurnInput["screenExternalContent"]> = async () => ({
     decision: "auto",
@@ -212,6 +338,136 @@ test("Codex harness drives app-server JSON-RPC with a read-only jail", async (t)
   assert.deepEqual(
     (await tasks.list()).map(({ title, status }) => ({ title, status })),
     [{ title: "return ALPHA", status: "completed" }],
+  );
+});
+
+test("Codex binds a Responses custom provider without exposing its key in RPC", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-codex-custom-"));
+  setCustomProviders([
+    {
+      id: "gateway",
+      name: "Gateway",
+      protocol: "openai-responses",
+      baseUrl: "https://gateway.example.com/v1",
+      models: [{ id: "responses-model" }],
+    },
+  ]);
+  const harness = createCodexHarness({
+    binaryPath: customProviderCodexBinary(dir),
+    env: {
+      ...process.env,
+      OPENAI_API_KEY: "sk-official",
+      OPENAI_BASE_URL: "https://official.example.com/v1",
+      CODEX_ACCESS_TOKEN: "official-token",
+    },
+    resolveCustomProvider: async (modelId) => {
+      assert.equal(modelId, "responses-model");
+      return {
+        id: "gateway",
+        name: "Gateway",
+        baseUrl: "https://gateway.example.com/v1",
+        apiKey: "sk-custom",
+      };
+    },
+  });
+  t.after(async () => {
+    await harness.turns.close?.();
+    setCustomProviders([]);
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const scope = { kind: "org", id: "test" } as unknown as ScopeId;
+  const session = { id: "session-custom" } as Session;
+  const result = await harness.turns.runTurn({
+    session,
+    input: "hi",
+    model: "responses-model",
+    systemPrompt: "be concise",
+    history: [],
+    tools: {} as HarnessTurnInput["tools"],
+    scopeLabel: scope,
+    orgScopeId: scope,
+    emit: async (entry) => ({ ...entry, sessionId: session.id, seq: 1, createdAt: Date.now() }) as SessionEntry,
+    recordModelCall: () => {},
+  });
+  assert.equal(result.reply, "CUSTOM-OK");
+});
+
+test("custom Codex runtime identity rotates with endpoint or key and strips built-in credentials", () => {
+  const source = {
+    OPENAI_API_KEY: "official-key",
+    OPENAI_BASE_URL: "https://official.example.com/v1",
+    CODEX_ACCESS_TOKEN: "official-token",
+    PATH: "/bin",
+  };
+  const first = codexCustomRuntimeSpec(source, {
+    id: "gateway",
+    name: "Gateway",
+    baseUrl: "https://gateway.example.com/v1",
+    apiKey: "sk-one",
+  });
+  const second = codexCustomRuntimeSpec(source, {
+    id: "gateway",
+    name: "Gateway",
+    baseUrl: "https://gateway.example.com/v2",
+    apiKey: "sk-two",
+  });
+  assert.notEqual(first.key, second.key);
+  assert.equal(first.env.QM_CODEX_PROVIDER_KEY, "sk-one");
+  assert.equal(first.env.OPENAI_API_KEY, undefined);
+  assert.equal(first.env.OPENAI_BASE_URL, undefined);
+  assert.equal(first.env.CODEX_ACCESS_TOKEN, undefined);
+  assert.equal(first.env.PATH, "/bin");
+  assert.equal(JSON.stringify(first.config).includes("sk-one"), false);
+  assert.equal(first.key.includes("sk-one"), false);
+});
+
+test("Codex retires an idle provider process when its saved key rotates", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-codex-rotate-"));
+  let key = "sk-one";
+  setCustomProviders([
+    {
+      id: "gateway",
+      name: "Gateway",
+      protocol: "openai-responses",
+      baseUrl: "https://gateway.example.com/v1",
+      models: [{ id: "responses-model" }],
+    },
+  ]);
+  const harness = createCodexHarness({
+    binaryPath: rotatingProviderCodexBinary(dir),
+    env: { PATH: process.env.PATH },
+    resolveCustomProvider: async () => ({
+      id: "gateway",
+      name: "Gateway",
+      baseUrl: "https://gateway.example.com/v1",
+      apiKey: key,
+    }),
+  });
+  t.after(async () => {
+    await harness.turns.close?.();
+    setCustomProviders([]);
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const scope = { kind: "org", id: "test" } as unknown as ScopeId;
+  const run = (id: string) =>
+    harness.turns.runTurn({
+      session: { id } as Session,
+      input: "hi",
+      model: "responses-model",
+      systemPrompt: "be concise",
+      history: [],
+      tools: {} as HarnessTurnInput["tools"],
+      scopeLabel: scope,
+      orgScopeId: scope,
+      emit: async (entry) => ({ ...entry, sessionId: id, seq: 1, createdAt: Date.now() }) as SessionEntry,
+      recordModelCall: () => {},
+    });
+  assert.equal((await run("rotation-one")).reply, "sk-one");
+  key = "sk-two";
+  assert.equal((await run("rotation-two")).reply, "sk-two");
+  assert.equal(
+    readFileSync(join(dir, "runtime-log"), "utf8"),
+    "start:sk-one\nclose:sk-one\nstart:sk-two\nclose:sk-two\n",
   );
 });
 
@@ -407,6 +663,56 @@ test("Codex discards a nonresponsive startup so a later turn can retry", async (
   await assert.rejects(turn("first"), /initialization timed out/);
   await assert.rejects(turn("second"), /initialization timed out/);
   assert.equal(readFileSync(join(dir, "starts"), "utf8"), "start\nstart\n");
+});
+
+test("a timed-out custom Codex startup closes after its background initialization finishes", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-codex-abandoned-custom-"));
+  setCustomProviders([
+    {
+      id: "gateway",
+      name: "Gateway",
+      protocol: "openai-responses",
+      baseUrl: "https://gateway.example.com/v1",
+      models: [{ id: "responses-model" }],
+    },
+  ]);
+  const harness = createCodexHarness({
+    binaryPath: delayedCustomCodexBinary(dir),
+    env: { PATH: process.env.PATH },
+    turnWallClockMs: 50,
+    appServerStartTimeoutMs: 2_000,
+    resolveCustomProvider: async () => ({
+      id: "gateway",
+      name: "Gateway",
+      baseUrl: "https://gateway.example.com/v1",
+      apiKey: "sk-abandoned",
+    }),
+  });
+  t.after(async () => {
+    await harness.turns.close?.();
+    setCustomProviders([]);
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const scope = { kind: "org", id: "test" } as unknown as ScopeId;
+  await assert.rejects(
+    harness.turns.runTurn({
+      session: { id: "abandoned-custom" } as Session,
+      input: "hi",
+      model: "responses-model",
+      systemPrompt: "be concise",
+      history: [],
+      tools: {} as HarnessTurnInput["tools"],
+      scopeLabel: scope,
+      orgScopeId: scope,
+      emit: async (entry) =>
+        ({ ...entry, sessionId: "abandoned-custom", seq: 1, createdAt: Date.now() }) as SessionEntry,
+      recordModelCall: () => {},
+    }),
+    /exceeded/,
+  );
+  await new Promise((resolveWait) => setTimeout(resolveWait, 2_500));
+  assert.equal(readFileSync(join(dir, "delayed-log"), "utf8"), "start\nclose\n");
+  assert.equal(existsSync(readFileSync(join(dir, "delayed-jail"), "utf8")), false);
 });
 
 test("cancelling one Codex setup does not kill another active turn", async (t) => {
@@ -623,7 +929,7 @@ test(
     const server = new CodexAppServer({
       binaryPath: realCodexBinary!,
       cwd: jail,
-      env: codexChildEnv({ PATH: process.env.PATH }, jail),
+      env: codexChildEnv({ PATH: process.env.PATH, QM_CODEX_PROVIDER_KEY: "sk-fake" }, jail),
       onNotification: () => {},
       onRequest: async (method) => {
         requests.push(method);
@@ -678,6 +984,160 @@ test(
       threadId: started.thread.id,
       items: replaySmokeItems,
     });
+    const custom = await server.request<{ thread: { id: string } }>("thread/start", {
+      model: "responses-model",
+      cwd: jail,
+      approvalPolicy: "never",
+      sandbox: "read-only",
+      ephemeral: true,
+      dynamicTools: [],
+      environments: [],
+      config: {
+        model_provider: "gateway",
+        model_providers: {
+          gateway: {
+            name: "Gateway",
+            base_url: "https://gateway.example.com/v1",
+            env_key: "QM_CODEX_PROVIDER_KEY",
+            wire_api: "responses",
+          },
+        },
+        web_search: "disabled",
+      },
+    });
+    assert.ok(custom.thread.id);
     assert.deepEqual(requests, []);
+  },
+);
+
+test(
+  "the installed Codex app-server completes a turn through a saved Responses provider binding",
+  { skip: realCodexBinary && existsSync(realCodexBinary) ? false : "@openai/codex is not resolvable" },
+  async (t) => {
+    const requests: Array<{ path: string; auth?: string; model?: string }> = [];
+    const upstream = createServer((req, res) => {
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", () => {
+        const payload = body ? (JSON.parse(body) as { model?: string }) : {};
+        requests.push({ path: req.url ?? "", auth: req.headers.authorization, model: payload.model });
+        if (!req.url?.endsWith("/responses")) {
+          res.writeHead(404);
+          return res.end();
+        }
+        const item = {
+          id: "msg_codex_qa",
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [{ type: "output_text", text: "CODEX RESPONSES OK", annotations: [] }],
+        };
+        const response = {
+          id: "resp_codex_qa",
+          object: "response",
+          created_at: Math.floor(Date.now() / 1000),
+          status: "completed",
+          model: "responses-model",
+          output: [item],
+          usage: {
+            input_tokens: 5,
+            input_tokens_details: { cached_tokens: 0 },
+            output_tokens: 4,
+            output_tokens_details: { reasoning_tokens: 0 },
+            total_tokens: 9,
+          },
+        };
+        const events = [
+          { type: "response.created", response: { ...response, status: "in_progress", output: [] } },
+          {
+            type: "response.output_item.added",
+            output_index: 0,
+            item: { ...item, status: "in_progress", content: [] },
+          },
+          {
+            type: "response.content_part.added",
+            output_index: 0,
+            item_id: item.id,
+            content_index: 0,
+            part: { type: "output_text", text: "", annotations: [] },
+          },
+          {
+            type: "response.output_text.delta",
+            output_index: 0,
+            item_id: item.id,
+            content_index: 0,
+            delta: "CODEX RESPONSES OK",
+          },
+          {
+            type: "response.output_text.done",
+            output_index: 0,
+            item_id: item.id,
+            content_index: 0,
+            text: "CODEX RESPONSES OK",
+          },
+          {
+            type: "response.content_part.done",
+            output_index: 0,
+            item_id: item.id,
+            content_index: 0,
+            part: item.content[0],
+          },
+          { type: "response.output_item.done", output_index: 0, item },
+          { type: "response.completed", response },
+        ];
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        events.forEach((event, sequence_number) =>
+          res.write(`event: ${event.type}\ndata: ${JSON.stringify({ ...event, sequence_number })}\n\n`),
+        );
+        res.end();
+      });
+    });
+    await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+    const baseUrl = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}/v1`;
+    setCustomProviders([
+      {
+        id: "gateway",
+        name: "Gateway",
+        protocol: "openai-responses",
+        baseUrl,
+        models: [{ id: "responses-model" }],
+      },
+    ]);
+    const harness = createCodexHarness({
+      binaryPath: realCodexBinary!,
+      env: { PATH: process.env.PATH },
+      turnWallClockMs: 10_000,
+      resolveCustomProvider: async () => ({
+        id: "gateway",
+        name: "Gateway",
+        baseUrl,
+        apiKey: "sk-codex-qa",
+      }),
+    });
+    t.after(async () => {
+      await harness.turns.close?.();
+      upstream.close();
+      setCustomProviders([]);
+    });
+    const scope = { kind: "org", id: "test" } as unknown as ScopeId;
+    const result = await harness.turns.runTurn({
+      session: { id: "real-custom-provider" } as Session,
+      input: "reply briefly",
+      model: "responses-model",
+      systemPrompt: "be concise",
+      history: [],
+      tools: {} as HarnessTurnInput["tools"],
+      scopeLabel: scope,
+      orgScopeId: scope,
+      readOnly: true,
+      emit: async (entry) =>
+        ({ ...entry, sessionId: "real-custom-provider", seq: 1, createdAt: Date.now() }) as SessionEntry,
+      recordModelCall: () => {},
+    });
+    assert.equal(result.reply, "CODEX RESPONSES OK");
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0]?.path, "/v1/responses");
+    assert.equal(requests[0]?.auth, "Bearer sk-codex-qa");
+    assert.equal(requests[0]?.model, "responses-model");
   },
 );
