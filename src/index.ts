@@ -4,6 +4,7 @@ import { createServer } from "./api/server.ts";
 import { errMessage } from "./util/errors.ts";
 import { slackPluginConfigFromEnv, startSlackPlugin } from "./slack/index.ts";
 import { createSlackRuntimeReconciler } from "./surfaces/slack-runtime.ts";
+import { startRuntime } from "./runtime-start.ts";
 
 const config = loadConfig();
 
@@ -21,14 +22,14 @@ await built.refreshCustomProviders();
 await built.identity.hydrate();
 await built.deploymentLayerReady;
 built.deploymentLayerRefresh.start();
-built.runtime.start();
-
-server.listen(config.port, () => {
-  console.log(
-    `[qm] listening on :${config.port} (org=${config.orgId}, store=${config.sessionStore}, ` +
-      `runStore=${config.runStore}, workers=${config.workers}, backgroundWork=${config.backgroundWorkEnabled})`,
-  );
-});
+await startRuntime(built.runtime, () =>
+  server.listen(config.port, () => {
+    console.log(
+      `[qm] listening on :${config.port} (org=${config.orgId}, store=${config.sessionStore}, ` +
+        `runStore=${config.runStore}, workers=${config.workers}, backgroundWork=${config.backgroundWorkEnabled})`,
+    );
+  }),
+);
 
 if (config.backgroundWorkEnabled) {
   built.scheduler.start(1000);

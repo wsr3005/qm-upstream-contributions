@@ -14,6 +14,7 @@ import {
   resolveBuildRepoRoot,
   runInherit,
   sleep,
+  sourceBuildArgs,
   streamLabeled,
   tailString,
   which,
@@ -144,7 +145,7 @@ function resolveImage(ctx: DockerCtx, service: ServiceName): string {
     const dockerfile = join(root, "deploy", service, "Dockerfile");
     if (!existsSync(dockerfile)) throw new CliError(`no Dockerfile at ${dockerfile}`);
     const tag = `qm-${service}:local`;
-    const buildArgs: string[] = [];
+    const buildArgs = sourceBuildArgs(root, service);
     step(`building ${service} from ${dockerfile}`);
     dockerInherit(["build", "-f", dockerfile, "-t", tag, ...buildArgs, root]);
     return tag;

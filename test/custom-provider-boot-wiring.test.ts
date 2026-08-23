@@ -16,6 +16,21 @@ const ADMIN = { "content-type": "application/json", "x-admin-actor": "admin-alic
 
 afterEach(() => setCustomProviders([], []));
 
+test("durable production instances require a build id for capability registration", () => {
+  assert.throws(
+    () =>
+      buildApp(
+        testConfig({
+          dataDir: mkdtempSync(join(tmpdir(), "custom-provider-build-id-")),
+          production: true,
+          databaseUrl: "postgres://unused.invalid/qm",
+          buildSha: undefined,
+        }),
+      ),
+    /GIT_SHA is required/,
+  );
+});
+
 test("serverDeps wires the custom-provider store and resolves a custom boot default lazily", async () => {
   const config = testConfig({
     dataDir: mkdtempSync(join(tmpdir(), "custom-provider-boot-")),

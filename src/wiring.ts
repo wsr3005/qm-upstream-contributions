@@ -290,6 +290,8 @@ import { sleep } from "./util/async.ts";
 import { createSlackInstallationStore, type SlackInstallationStore } from "./surfaces/slack-installation.ts";
 
 export interface Runtime {
+  ready(): Promise<void>;
+  readyForTraffic(): boolean;
   start(): void;
   stop(): Promise<void>;
   releaseInFlightRuns(): Promise<void>;
@@ -399,6 +401,9 @@ export function buildApp(
     instanceRegistry?: InstanceRegistry;
   } = {},
 ): BuiltApp {
+  if (config.production && config.databaseUrl && !overrides.instanceRegistry && !config.buildSha) {
+    throw new Error("GIT_SHA is required for production instances with durable storage");
+  }
   if (config.databaseUrl && !config.connectorSecretKey) {
     throw new Error("CONNECTOR_SECRET_KEY is required with durable storage");
   }
@@ -1490,6 +1495,8 @@ export function buildApp(
       )
     : null;
   const runtime: Runtime = {
+    ready: () => drain.ready(),
+    readyForTraffic: () => drain.readyForTraffic(),
     start() {
       drain.start();
       if (!config.backgroundWorkEnabled) return;
@@ -1613,6 +1620,7 @@ export function serverDeps(
   const configuredModel = configuredModelForHarness(config, config.harness);
   return {
     production: config.production,
+    ...(config.production ? { readyForTraffic: built.runtime.readyForTraffic } : {}),
     allowUnauthenticatedCore: config.allowUnauthenticatedCore,
     ...(config.signingSecret ? { signingSecret: config.signingSecret } : {}),
     ...(config.capabilitySecret ? { capabilitySecret: config.capabilitySecret } : {}),

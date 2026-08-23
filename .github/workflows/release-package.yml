@@ -19,6 +19,7 @@ jobs:
         include:
           - name: core
             dockerfile: deploy/core/Dockerfile
+            build-args: GIT_SHA=${{ github.sha }}
           - name: web-ui
             dockerfile: deploy/web-ui/Dockerfile
           - name: admin

@@ -144,6 +144,12 @@ export async function putCustomProvider(ctx: ApiCtx): Promise<void> {
 export async function testCustomProvider(ctx: ApiCtx): Promise<void> {
   const authorized = await actor(ctx);
   if (!authorized) return;
+  if (ctx.deps.production) {
+    return sendJson(ctx.res, 409, {
+      error: "harness_test_rollout_incomplete",
+      message: "model testing is unavailable until the compatibility rollout is complete",
+    });
+  }
   if (!ctx.deps.customProviders) return sendJson(ctx.res, 404, { error: "not_found" });
   const id = ctx.params.provider;
   if (!id) return sendJson(ctx.res, 404, { error: "not_found" });

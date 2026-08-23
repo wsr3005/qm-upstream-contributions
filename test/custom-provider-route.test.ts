@@ -1,6 +1,7 @@
 import "./support/auto-fake-sprites.ts";
 
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -11,15 +12,18 @@ import { buildApp, type BuiltApp } from "../src/wiring.ts";
 import { testConfig } from "./support/test-config.ts";
 import { resolveModel } from "../src/model/pi-models.ts";
 import { setCustomProviders } from "../src/model/custom-providers.ts";
+import { mintPortalIdentity } from "../plugins/chassis/src/portal-identity.ts";
 
 const ADMIN = { "content-type": "application/json", "x-admin-actor": "admin-alice@default-org" };
 const USER = { "content-type": "application/json", "x-admin-actor": "bob@default-org" };
+const PROD_PORTAL_IDENTITY_SECRET = "custom-provider-production-portal-identity-secret";
 
 afterEach(() => setCustomProviders([], []));
 
 function start(
   modelCredentialFetch: typeof fetch = async () => new Response(null, { status: 200 }),
   runtimeSchemaReady?: boolean,
+  production = false,
 ): {
   base: string;
   built: BuiltApp;
@@ -38,6 +42,8 @@ function start(
     customProviders: built.customProviders,
     refreshCustomProviders: built.refreshCustomProviders,
     modelCredentialFetch,
+    production,
+    ...(production ? { portalIdentitySecret: PROD_PORTAL_IDENTITY_SECRET } : {}),
     harnessId: "pi",
     providerKeys: { anthropic: true, openai: false, openrouter: false },
     admin: built.admin,
@@ -50,6 +56,67 @@ function start(
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   };
 }
+
+test("production closes the legacy paid test endpoint before a mixed-version rollout", async () => {
+  let upstreamRequests = 0;
+  const upstream = createServer((_req, res) => {
+    upstreamRequests += 1;
+    res.writeHead(500, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { message: "must not be called" } }));
+  });
+  await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  const upstreamUrl = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}/v1`;
+  const srv = start(undefined, undefined, true);
+  try {
+    await srv.built.customProviders.upsert(
+      {
+        id: "acme-gateway",
+        name: "Acme Gateway",
+        protocol: "openai",
+        baseUrl: upstreamUrl,
+        models: [{ id: "acme-large" }],
+      },
+      "sk-production-guard",
+      "admin-alice",
+    );
+    await srv.built.refreshCustomProviders();
+    let providerReads = 0;
+    const resolveActive = srv.built.customProviders.resolveActive.bind(srv.built.customProviders);
+    srv.built.customProviders.resolveActive = async (id) => {
+      providerReads += 1;
+      return resolveActive(id);
+    };
+    const request = (identity?: string) =>
+      fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/test`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(identity ? { "x-portal-identity": identity } : {}),
+        },
+        body: JSON.stringify({ modelId: "acme-large" }),
+      });
+    const unauthenticated = await request();
+    assert.equal(unauthenticated.status, 401);
+    const nonAdmin = await request(
+      mintPortalIdentity({ p: "bob", exp: Date.now() + 60_000 }, PROD_PORTAL_IDENTITY_SECRET),
+    );
+    assert.equal(nonAdmin.status, 403);
+    const tested = await request(
+      mintPortalIdentity({ p: "admin-alice", exp: Date.now() + 60_000 }, PROD_PORTAL_IDENTITY_SECRET),
+    );
+    assert.equal(tested.status, 409);
+    assert.equal(((await tested.json()) as { error: string }).error, "harness_test_rollout_incomplete");
+    assert.equal(providerReads, 0);
+    assert.equal(upstreamRequests, 0);
+    assert.equal(
+      (await srv.built.auditLog.events()).some((event) => event.action === "custom-providers.test"),
+      false,
+    );
+  } finally {
+    await srv.close();
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
+  }
+});
 
 const BODY = {
   name: "Acme Gateway",

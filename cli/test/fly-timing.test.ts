@@ -375,16 +375,17 @@ test("fly up build-only pushes a tagged image without checking runtime deploy se
     true,
     "new apps receive only the ownership marker",
   );
-  assert.equal(
-    commands.some(
-      (args) =>
-        args[0] === "deploy" &&
-        args.includes("--build-only") &&
-        args.includes("--push") &&
-        args.includes("--image-label"),
-    ),
-    true,
+  const build = commands.find(
+    (args) =>
+      args[0] === "deploy" &&
+      args.includes("--build-only") &&
+      args.includes("--push") &&
+      args.includes("--image-label"),
   );
+  assert.ok(build);
+  const stamps = build.filter((value) => value.startsWith("GIT_SHA="));
+  assert.equal(stamps.length, 1);
+  assert.match(stamps[0]!, /^GIT_SHA=[0-9a-f]{40}(?:-dirty)?$/);
 });
 
 test("fly up build-only dry-run plans without pushing an image", () => {

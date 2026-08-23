@@ -24,14 +24,22 @@ test(
       buildSha: "sha-capable",
       startedAt: 500,
       livenessMs: 200,
+      incompatibleGraceMs: 400,
       capabilities: ["wire-id-v1"],
     });
     assert.equal(await capable.allLiveSupport!("wire-id-v1"), false, "zero rows never prove rollout readiness");
     await capable.beat();
+    const firstCapable = await capable.capabilitySnapshot!("wire-id-v1");
     assert.equal(
       await capable.allLiveSupport!("wire-id-v1"),
       true,
       "the current capable instance must heartbeat first",
+    );
+    await capable.beat();
+    assert.equal(
+      (await capable.capabilitySnapshot!("wire-id-v1")).epoch,
+      firstCapable.epoch,
+      "routine heartbeats do not move the rollout fence",
     );
 
     const old = createPostgresInstanceRegistry(pool, {
@@ -39,6 +47,7 @@ test(
       buildSha: "sha-a",
       startedAt: 1000,
       livenessMs: 200,
+      incompatibleGraceMs: 400,
     });
     assert.equal(await old.beat(), false, "alone: not superseded");
 
@@ -47,6 +56,7 @@ test(
       buildSha: "sha-a",
       startedAt: 2000,
       livenessMs: 200,
+      incompatibleGraceMs: 400,
     });
     await peer.beat();
     assert.equal(await old.beat(), false, "same-sha peer (scale-out) never drains");
@@ -56,18 +66,34 @@ test(
       buildSha: "sha-b",
       startedAt: 3000,
       livenessMs: 200,
+      incompatibleGraceMs: 400,
       capabilities: ["wire-id-v1"],
     });
     await next.beat();
+    const mixed = await next.capabilitySnapshot!("wire-id-v1");
     assert.equal(await old.beat(), true, "newer build live: superseded");
     assert.equal(await next.beat(), false, "the newest build itself is not superseded");
     assert.equal(await next.allLiveSupport!("wire-id-v1"), false, "a live old runtime blocks the capability");
+    assert.notEqual(mixed.epoch, firstCapable.epoch, "a new instance moves the rollout fence");
 
     await new Promise((r) => setTimeout(r, 250));
     assert.equal(await old.beat(), false, "the newer build's beats went stale (failed deploy): claiming resumes");
     assert.equal(await next.allLiveSupport!("wire-id-v1"), false, "the refreshed old runtime still blocks activation");
     await new Promise((r) => setTimeout(r, 250));
     await next.beat();
+    assert.equal(
+      await next.allLiveSupport!("wire-id-v1"),
+      false,
+      "an incompatible runtime keeps blocking after normal liveness while traffic drains",
+    );
+    await new Promise((r) => setTimeout(r, 200));
+    await next.beat();
     assert.equal(await next.allLiveSupport!("wire-id-v1"), true, "only capable live runtimes allow activation");
+    const readyAgain = await next.capabilitySnapshot!("wire-id-v1");
+    await new Promise((r) => setTimeout(r, 250));
+    await old.beat();
+    const resumedOld = await next.capabilitySnapshot!("wire-id-v1");
+    assert.equal(resumedOld.ready, false, "a resumed incompatible instance closes activation again");
+    assert.notEqual(resumedOld.epoch, readyAgain.epoch, "a stale-to-live transition moves the rollout fence");
   },
 );

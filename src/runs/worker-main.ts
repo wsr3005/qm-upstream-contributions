@@ -1,12 +1,13 @@
 import { loadConfig } from "../config.ts";
 import { buildApp, stopWithBackstop } from "../wiring.ts";
+import { startRuntime } from "../runtime-start.ts";
 
 const config = loadConfig();
 const built = buildApp(config);
 await built.config.hydrate?.();
 await built.identity.hydrate();
 const { runtime } = built;
-runtime.start();
+await startRuntime(runtime);
 console.log(`[qm:worker] draining runs (org=${config.orgId}, runStore=${config.runStore}, workers=${config.workers})`);
 
 let shuttingDown = false;
