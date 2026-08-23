@@ -10,12 +10,18 @@ import {
 } from "../src/model/custom-providers.ts";
 import { builtInModelCatalog } from "../src/model/model-catalog.ts";
 import { createCustomProviderStore } from "../src/model/custom-provider-store.ts";
-import { modelSupportedByHarness, modelServiceable, resolveModel } from "../src/model/pi-models.ts";
+import {
+  modelSupportedByHarness,
+  modelServiceable,
+  registerOpenRouterCatalogModel,
+  resolveModel,
+  resolveStaticModel,
+} from "../src/model/pi-models.ts";
 import { createMemoryMap } from "../src/persistence/durable-map.ts";
 import type { StoredCustomProvider } from "../src/model/custom-provider-store.ts";
 import { createMemoryAdvisoryLock } from "../src/persistence/advisory-lock.ts";
 
-afterEach(() => setCustomProviders([]));
+afterEach(() => setCustomProviders([], []));
 
 const GATEWAY = {
   id: "acme-gateway",
@@ -67,11 +73,60 @@ test("OpenAI Responses providers are available to all three enterprise harnesses
   assert.equal(modelSupportedByHarness("responses-model", "codex"), true);
 });
 
+test("a custom selection alias resolves to its upstream wire model id", () => {
+  setCustomProviders([
+    {
+      ...GATEWAY,
+      protocol: "openai-responses",
+      models: [{ id: "gateway/gpt-5.6-luna", upstreamId: "gpt-5.6-luna", name: "GPT 5.6 Luna" }],
+    },
+  ]);
+  const selected = resolveCustomModel("gateway/gpt-5.6-luna");
+  assert.equal(selected?.id, "gateway/gpt-5.6-luna");
+  assert.equal(selected?.wireId, "gpt-5.6-luna");
+  assert.equal(resolveModel("gateway/gpt-5.6-luna")?.provider, "acme-gateway");
+});
+
 test("resolveModel falls back to custom models; built-ins shadow custom ids", () => {
   setCustomProviders([{ ...GATEWAY, models: [{ id: "acme-large" }, { id: "claude-opus-5", name: "impostor" }] }]);
   assert.equal(resolveModel("acme-large")?.provider, "acme-gateway");
   // The built-in claude-opus-5 must win over a custom model claiming its id.
   assert.equal(String(resolveModel("claude-opus-5")?.provider), "anthropic");
+});
+
+test("custom model source binding survives dynamic arrival order and removal", () => {
+  const lateId = "vendor/future-model-late";
+  setCustomProviders([{ ...GATEWAY, models: [{ id: lateId, name: "Private Late" }] }]);
+  assert.equal(resolveModel(lateId)?.provider, GATEWAY.id);
+  registerOpenRouterCatalogModel({
+    id: lateId,
+    name: "Public Late",
+    contextWindow: 128_000,
+    maxTokens: 8_192,
+    input: ["text"],
+    reasoning: false,
+    cost: { input: 0, output: 0 },
+  });
+  assert.equal(resolveStaticModel(lateId), undefined);
+  assert.equal(resolveModel(lateId)?.provider, GATEWAY.id);
+
+  const earlyId = "vendor/future-model-early";
+  registerOpenRouterCatalogModel({
+    id: earlyId,
+    name: "Public Early",
+    contextWindow: 128_000,
+    maxTokens: 8_192,
+    input: ["text"],
+    reasoning: false,
+    cost: { input: 0, output: 0 },
+  });
+  assert.equal(resolveModel(earlyId)?.provider, "openrouter");
+  setCustomProviders([{ ...GATEWAY, models: [{ id: earlyId, name: "Private Early" }] }]);
+  assert.equal(resolveModel(earlyId)?.provider, GATEWAY.id);
+  setCustomProviders([]);
+  assert.equal(resolveModel(earlyId), undefined);
+  setCustomProviders([], [earlyId]);
+  assert.equal(resolveModel(earlyId), undefined);
 });
 
 test("custom models are gated to pi and mock harnesses", () => {
@@ -114,6 +169,29 @@ test("spec validation rejects reserved ids, bad slugs, bad URLs, and empty model
   assert.doesNotThrow(() => validateCustomProviderSpec({ ...GATEWAY, models: [{ id: "a", input: 0, output: 0.5 }] }));
 });
 
+test("spec validation rejects malformed model entries and upstream ids", () => {
+  assert.throws(
+    () => validateCustomProviderSpec({ ...GATEWAY, models: [null as unknown as { id: string }] }),
+    /every model needs an id/,
+  );
+  assert.throws(
+    () =>
+      validateCustomProviderSpec({
+        ...GATEWAY,
+        models: [{ id: "gateway-model", upstreamId: 42 as unknown as string }],
+      }),
+    /upstreamId must be a non-empty string/,
+  );
+  assert.throws(
+    () =>
+      validateCustomProviderSpec({
+        ...GATEWAY,
+        models: [{ id: "gateway-model", upstreamId: " gpt-5.6-luna " }],
+      }),
+    /upstreamId must be a non-empty string/,
+  );
+});
+
 test("store round-trip: upsert encrypts the key, statuses never leak it, delete disables", async () => {
   const backing = createMemoryMap<StoredCustomProvider>();
   const store = createCustomProviderStore({ backing, keyMaterial: "test-key-material" });
@@ -150,6 +228,80 @@ test("store validates specs on upsert", async () => {
   await assert.rejects(store.upsert({ ...GATEWAY, id: "anthropic" }, "k", "a@b.c"), /reserved/);
 });
 
+test("wire-id providers stay legacy-disabled and activate only when every live runtime is compatible", async () => {
+  let ready = false;
+  const backing = createMemoryMap<StoredCustomProvider>();
+  const store = createCustomProviderStore({
+    backing,
+    keyMaterial: "wire-id-key-material",
+    runtimeSchemaReady: async () => ready,
+  });
+  const aliased = {
+    ...GATEWAY,
+    protocol: "openai-responses" as const,
+    models: [{ id: "acme/gpt-luna", upstreamId: "gpt-5.6-luna" }],
+  };
+
+  await assert.rejects(store.upsert(aliased, "sk-alias", "admin@example.com"), /compatibility rollout/);
+  ready = true;
+  await store.upsert(aliased, "sk-alias", "admin@example.com");
+  const raw = await backing.get(GATEWAY.id);
+  assert.equal(raw?.disabled, true);
+  assert.equal(raw?.compatibilityDisabled, true);
+  assert.equal(raw?.runtimeSchema, 1);
+  assert.deepEqual(await store.enabled(), [aliased]);
+  assert.equal((await store.statuses())[0]?.disabled, false);
+
+  ready = false;
+  assert.deepEqual(await store.enabled(), []);
+  assert.equal(await store.resolveActive(GATEWAY.id), null);
+  assert.equal((await store.statuses())[0]?.disabled, true);
+
+  ready = true;
+  assert.equal(await store.delete(GATEWAY.id, "admin@example.com"), true);
+  assert.deepEqual(await store.enabled(), []);
+  const deleted = await backing.get(GATEWAY.id);
+  assert.equal(deleted?.disabled, true);
+  assert.equal(deleted?.compatibilityDisabled, false);
+});
+
+test("compatibility runtime reads wire-id records while production writes stay closed", async () => {
+  const backing = createMemoryMap<StoredCustomProvider>();
+  const store = createCustomProviderStore({
+    backing,
+    keyMaterial: "compatibility-release-key",
+    runtimeSchemaReady: async () => true,
+    runtimeSchemaWritable: async () => false,
+  });
+  const aliased = {
+    ...GATEWAY,
+    protocol: "openai-responses" as const,
+    models: [{ id: "acme/gpt-luna", upstreamId: "gpt-5.6-luna" }],
+  };
+
+  await backing.put(GATEWAY.id, {
+    ...aliased,
+    disabled: true,
+    compatibilityDisabled: true,
+    runtimeSchema: 1,
+    updatedAt: Date.now(),
+    updatedBy: "newer-release",
+  });
+
+  assert.deepEqual(await store.enabled(), [aliased]);
+  const before = await backing.get(GATEWAY.id);
+  await assert.rejects(store.upsert(aliased, "sk-alias", "admin@example.com"), /compatibility rollout/);
+  await assert.rejects(
+    store.upsert(
+      { ...GATEWAY, protocol: "openai-responses", models: [{ id: "acme/gpt-luna" }] },
+      "sk-legacy-edit",
+      "admin@example.com",
+    ),
+    /compatibility rollout/,
+  );
+  assert.deepEqual(await backing.get(GATEWAY.id), before);
+});
+
 test("concurrent provider writes cannot claim the same model id", async () => {
   const backing = createMemoryMap<StoredCustomProvider>();
   const advisoryLock = createMemoryAdvisoryLock();
@@ -172,8 +324,9 @@ test("an unchanged custom provider snapshot does not invalidate runtime caches",
 });
 
 test("provider model history preserves removed custom identities", async () => {
+  const backing = createMemoryMap<StoredCustomProvider>();
   const store = createCustomProviderStore({
-    backing: createMemoryMap<StoredCustomProvider>(),
+    backing,
     keyMaterial: "history-key-material",
     advisoryLock: createMemoryAdvisoryLock(),
   });
@@ -182,6 +335,20 @@ test("provider model history preserves removed custom identities", async () => {
   assert.equal(await store.knowsModel("gpt-private"), true);
   assert.equal(await store.knowsModel("replacement-model"), true);
   assert.equal(await store.knowsModel("gpt-future-native"), false);
+  await store.delete(GATEWAY.id, "admin@example.com");
+  const restarted = createCustomProviderStore({ backing, keyMaterial: "history-key-material" });
+  assert.deepEqual((await restarted.knownModelIds()).sort(), ["gpt-private", "replacement-model"]);
+  registerOpenRouterCatalogModel({
+    id: "gpt-private",
+    name: "Public Impostor",
+    contextWindow: 128_000,
+    maxTokens: 8_192,
+    input: ["text"],
+    reasoning: false,
+    cost: { input: 0, output: 0 },
+  });
+  setCustomProviders(await restarted.enabled(), await restarted.knownModelIds());
+  assert.equal(resolveModel("gpt-private"), undefined);
 });
 
 test("active provider resolution keeps the endpoint and key from one durable snapshot", async () => {
@@ -236,11 +403,12 @@ test("opencode modelRef routes slashed custom model ids to the registered provid
       name: "LiteLLM",
       protocol: "openai",
       baseUrl: "https://litellm.example.com/v1",
-      models: [{ id: "bedrock/claude-opus-5" }],
+      models: [{ id: "bedrock/claude-opus-5" }, { id: "litellm/gpt-luna", upstreamId: "gpt-5.6-luna" }],
     },
   ]);
   try {
     assert.deepEqual(modelRef("bedrock/claude-opus-5"), { providerID: "litellm", modelID: "bedrock/claude-opus-5" });
+    assert.deepEqual(modelRef("litellm/gpt-luna"), { providerID: "litellm", modelID: "gpt-5.6-luna" });
     // built-in slash convention untouched
     assert.deepEqual(modelRef("openrouter/auto"), { providerID: "openrouter", modelID: "auto" });
   } finally {

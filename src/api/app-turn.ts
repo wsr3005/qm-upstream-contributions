@@ -61,6 +61,7 @@ export function createTurnMethods(
       if (!deps.identity.isInternal(actor)) {
         return { status: "refused", reason: "internal-only: non-internal principals cannot interact" };
       }
+      await deps.refreshCustomProviders?.();
       let projectAudience: Principal[] | undefined;
       let projectName: string | undefined;
       let projectVersion: string | undefined;

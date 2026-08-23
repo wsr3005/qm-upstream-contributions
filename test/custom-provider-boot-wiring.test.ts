@@ -14,7 +14,7 @@ import { setCustomProviders } from "../src/model/custom-providers.ts";
 
 const ADMIN = { "content-type": "application/json", "x-admin-actor": "admin-alice@default-org" };
 
-afterEach(() => setCustomProviders([]));
+afterEach(() => setCustomProviders([], []));
 
 test("serverDeps wires the custom-provider store and resolves a custom boot default lazily", async () => {
   const config = testConfig({
@@ -53,6 +53,25 @@ test("serverDeps wires the custom-provider store and resolves a custom boot defa
 
     assert.equal(defaultModelForHarness("pi", deps.baseModelDefault), "acme-large");
 
+    setCustomProviders([], []);
+    const surface = await fetch(`${base}/v1/surface-config`, { headers: ADMIN });
+    assert.equal(surface.status, 200);
+    assert.ok(((await surface.json()) as { webuiModels: string[] }).webuiModels.includes("acme-large"));
+
+    setCustomProviders([], []);
+    const selected = await fetch(`${base}/v1/runtime-config`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify({
+        principalId: "admin-alice@default-org",
+        scopeId: "personal:admin-alice@default-org",
+        harnessId: "pi",
+        modelId: "acme-large",
+      }),
+    });
+    assert.equal(selected.status, 200);
+
+    setCustomProviders([], []);
     const runtime = await fetch(
       `${base}/v1/runtime-config?principalId=admin-alice@default-org&scopeId=personal:admin-alice@default-org`,
       { headers: ADMIN },
@@ -69,4 +88,31 @@ test("serverDeps wires the custom-provider store and resolves a custom boot defa
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
+});
+
+test("web turns refresh durable custom providers before runtime validation", async () => {
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "custom-provider-turn-refresh-")) }));
+  await built.customProviders.upsert(
+    {
+      id: "fresh-gateway",
+      name: "Fresh Gateway",
+      protocol: "openai",
+      baseUrl: "https://llm.example.com/v1",
+      models: [{ id: "fresh-model" }],
+    },
+    "sk-fresh",
+    "admin-alice@default-org",
+  );
+  setCustomProviders([], []);
+
+  const turn = await built.app.turn({
+    surface: "web",
+    actor: { externalId: "alice" },
+    conversation: { kind: "dm", threadRef: "web:alice:custom-provider-refresh" },
+    text: "hello",
+    model: "fresh-model",
+    async: true,
+  });
+
+  assert.equal(turn.status, "queued");
 });

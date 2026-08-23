@@ -15,9 +15,12 @@ import { setCustomProviders } from "../src/model/custom-providers.ts";
 const ADMIN = { "content-type": "application/json", "x-admin-actor": "admin-alice@default-org" };
 const USER = { "content-type": "application/json", "x-admin-actor": "bob@default-org" };
 
-afterEach(() => setCustomProviders([]));
+afterEach(() => setCustomProviders([], []));
 
-function start(modelCredentialFetch: typeof fetch = async () => new Response(null, { status: 200 })): {
+function start(
+  modelCredentialFetch: typeof fetch = async () => new Response(null, { status: 200 }),
+  runtimeSchemaReady?: boolean,
+): {
   base: string;
   built: BuiltApp;
   close: () => Promise<void>;
@@ -25,6 +28,10 @@ function start(modelCredentialFetch: typeof fetch = async () => new Response(nul
   const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "custom-provider-route-")) }), {
     modelCredentialFetch,
   });
+  if (runtimeSchemaReady !== undefined) {
+    built.customProviders.runtimeSchemaReady = async () => runtimeSchemaReady;
+    built.customProviders.runtimeSchemaWritable = async () => runtimeSchemaReady;
+  }
   const server = createInsecureTestServer(built.app, {
     config: built.config,
     modelCredentials: built.modelCredentials,
@@ -172,6 +179,49 @@ test("bad specs are refused with a reason", async () => {
     });
     assert.equal(reserved.status, 400);
     assert.match(((await reserved.json()) as { message: string }).message, /reserved/);
+  } finally {
+    await srv.close();
+  }
+});
+
+test("null JSON bodies return a client error", async () => {
+  const srv = start();
+  try {
+    const put = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: "null",
+    });
+    assert.equal(put.status, 400);
+    assert.equal(((await put.json()) as { error: string }).error, "bad_request");
+
+    const tested = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/test`, {
+      method: "POST",
+      headers: ADMIN,
+      body: "null",
+    });
+    assert.equal(tested.status, 400);
+    assert.equal(((await tested.json()) as { error: string }).error, "bad_request");
+  } finally {
+    await srv.close();
+  }
+});
+
+test("model aliases remain inactive until every runtime supports wire ids", async () => {
+  const srv = start(undefined, false);
+  try {
+    const put = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify({
+        ...BODY,
+        models: [{ id: "acme-luna", upstreamId: "gpt-5.6-luna" }],
+        validate: false,
+      }),
+    });
+    assert.equal(put.status, 409);
+    assert.equal(((await put.json()) as { error: string }).error, "runtime_rollout_incomplete");
+    assert.equal(resolveModel("acme-luna"), undefined);
   } finally {
     await srv.close();
   }

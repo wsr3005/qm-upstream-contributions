@@ -1,7 +1,7 @@
 import { getBuiltinModel } from "@earendil-works/pi-ai/providers/all";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { providerBaseUrl } from "./provider-endpoints.ts";
-import { isCustomModelId, resolveCustomModel } from "./custom-providers.ts";
+import { isCustomModelId, isKnownCustomModelId, resolveCustomModel } from "./custom-providers.ts";
 
 const getModel = getBuiltinModel as unknown as (provider: string, id: string) => Model<Api> | undefined;
 
@@ -97,7 +97,12 @@ const REGISTRY_BY_ID = new Map(MODEL_REGISTRY.map((m) => [m.id, m]));
 const OPENROUTER_CATALOG_MODELS = new Map<string, PiModel>();
 
 export function modelDisplayName(id: string): string {
-  return REGISTRY_BY_ID.get(id)?.name ?? OPENROUTER_CATALOG_MODELS.get(id)?.name ?? id;
+  return (
+    REGISTRY_BY_ID.get(id)?.name ??
+    resolveCustomModel(id)?.name ??
+    (isKnownCustomModelId(id) ? id : OPENROUTER_CATALOG_MODELS.get(id)?.name) ??
+    id
+  );
 }
 
 export const DEFAULT_WEBUI_MODEL_IDS: readonly string[] = MODEL_REGISTRY.filter((m) => m.webui).map((m) => m.id);
@@ -179,11 +184,15 @@ export function resolveStaticModel(id: string): PiModel | undefined {
         })
       : undefined;
   }
-  return builtinModel(id) ?? OPENROUTER_CATALOG_MODELS.get(id);
+  return builtinModel(id);
 }
 
 export function resolveModel(id: string): PiModel | undefined {
-  return resolveStaticModel(id) ?? (resolveCustomModel(id) as unknown as PiModel | undefined);
+  const stable = resolveStaticModel(id);
+  if (stable) return stable;
+  const custom = resolveCustomModel(id) as unknown as PiModel | undefined;
+  if (custom) return custom;
+  return isKnownCustomModelId(id) ? undefined : OPENROUTER_CATALOG_MODELS.get(id);
 }
 
 export function auxiliaryModelForProvider(provider: string): string | undefined {

@@ -1062,13 +1062,13 @@ async function buildModelRuntime(
       credentials: new InMemoryCredentialStore(),
       modelsPath,
     });
+    for (const [provider, apiKey] of Object.entries(k)) {
+      if (apiKey) await runtime.setRuntimeApiKey(provider, apiKey, { allowNetwork: false });
+    }
+    return runtime;
   } finally {
     if (customProviders && modelsPath) rmSync(dirname(modelsPath), { recursive: true, force: true });
   }
-  for (const [provider, apiKey] of Object.entries(k)) {
-    if (apiKey) await runtime.setRuntimeApiKey(provider, apiKey, { allowNetwork: false });
-  }
-  return runtime;
 }
 
 export async function oneShot(
@@ -1589,7 +1589,6 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
           }
           const activeModel = entry.agentSession.model as { id?: string; headers?: Record<string, string> } | undefined;
           entry.ref.fast = Boolean(activeModel?.headers?.["anthropic-beta"]?.includes(FAST_MODE_BETA));
-          const effectiveModel = activeModel?.id ?? desiredModelId;
           const defaultThinkingLevel = entry.agentSession.model
             ? defaultInteractiveThinkingLevel(entry.agentSession.model)
             : "auto";
@@ -1644,7 +1643,7 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
           entry.ref.pendingPrepareNextTurn = undefined;
           entry.ref.pendingTransformContext = undefined;
           turn.recordModelCall({
-            model: effectiveModel,
+            model: desiredModelId,
             inputTokens: entry.composedPromptTokens + estimateHistoryTokens(turn.history) + countTokens(modelPrompt),
             entryCount: turn.history.length,
           });
@@ -1710,11 +1709,7 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
             } else if (event.type === "message_end" && (event.message as { role?: string }).role === "assistant") {
               const end = Date.now();
               const u = (event.message as { usage?: PiUsageShape }).usage;
-              meterGrindCall(
-                grindMeter,
-                piUsageToCallUsage(u),
-                (entry.agentSession.model as { id?: string } | undefined)?.id ?? effectiveModel,
-              );
+              meterGrindCall(grindMeter, piUsageToCallUsage(u), desiredModelId);
               if (entry.ref.goal?.status === "active") meterGoalCall(entry.ref.goal, piUsageToCallUsage(u));
               callStats.push({
                 ttftMs: curStart !== undefined && curFirst !== undefined ? curFirst - curStart : null,
@@ -1776,7 +1771,7 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
                 await turn.recordLlmRequest({
                   turnSeq: userEntry.seq,
                   step,
-                  model: captured[step]!.transport?.modelId ?? effectiveModel,
+                  model: desiredModelId,
                   promptEnvelope: captured[step]!.envelope,
                   truncated: captured[step]!.truncated,
                   transport: captured[step]!.transport ?? null,

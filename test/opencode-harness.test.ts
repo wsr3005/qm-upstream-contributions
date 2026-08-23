@@ -350,7 +350,7 @@ test("custom providers materialize into the opencode config (enabled + provider 
           name: "Responses Gateway",
           protocol: "openai-responses" as const,
           baseUrl: "http://responses.internal/v1",
-          models: [{ id: "gpt-responses" }],
+          models: [{ id: "responses-gateway/gpt-luna", upstreamId: "gpt-5.6-luna" }],
         },
         apiKey: "sk-responses",
       },
@@ -369,7 +369,7 @@ test("custom providers materialize into the opencode config (enabled + provider 
     assert.deepEqual(litellm.models["deepseek-chat"], { name: "DeepSeek", limit: { context: 128000, output: 8192 } });
     assert.equal(config.provider["responses-gateway"].npm, "@ai-sdk/openai");
     assert.equal(config.provider["responses-gateway"].options.baseURL, "http://responses.internal/v1");
-    assert.deepEqual(config.provider["responses-gateway"].models["gpt-responses"].limit, {
+    assert.deepEqual(config.provider["responses-gateway"].models["gpt-5.6-luna"].limit, {
       context: 128000,
       output: 8192,
     });
@@ -411,7 +411,7 @@ test(
           object: "response",
           created_at: Math.floor(Date.now() / 1000),
           status: "completed",
-          model: "responses-model",
+          model: "gpt-5.6-luna",
           output: [item],
           usage: {
             input_tokens: 5,
@@ -474,7 +474,7 @@ test(
         name: "Responses Gateway",
         protocol: "openai-responses",
         baseUrl,
-        models: [{ id: "responses-model" }],
+        models: [{ id: "responses-gateway/gpt-luna", upstreamId: "gpt-5.6-luna" }],
       },
     ]);
     const harness = createOpenCodeHarness({
@@ -487,7 +487,7 @@ test(
             name: "Responses Gateway",
             protocol: "openai-responses",
             baseUrl,
-            models: [{ id: "responses-model" }],
+            models: [{ id: "responses-gateway/gpt-luna", upstreamId: "gpt-5.6-luna" }],
           },
           apiKey: "sk-opencode-qa",
         },
@@ -496,21 +496,27 @@ test(
     t.after(async () => {
       await harness.turns.close?.();
       upstream.close();
-      setCustomProviders([]);
+      setCustomProviders([], []);
     });
-    const input = turnInput([], []);
+    const llmRows: HarnessLlmRequestRecord[] = [];
+    const modelCalls: Array<{ model: string }> = [];
+    const input = turnInput([], llmRows);
     input.session = { id: "real-opencode-responses" } as Session;
-    input.model = "responses-model";
+    input.model = "responses-gateway/gpt-luna";
     input.readOnly = true;
+    input.recordModelCall = (record) => modelCalls.push(record);
     const result = await harness.turns.runTurn(input);
     assert.equal(result.reply, "OPENCODE RESPONSES OK");
     assert.deepEqual(requests, [
       {
         path: "/v1/responses",
         auth: "Bearer sk-opencode-qa",
-        model: "responses-model",
+        model: "gpt-5.6-luna",
         maxOutputTokens: 8192,
       },
     ]);
+    assert.equal(modelCalls[0]?.model, "responses-gateway/gpt-luna");
+    assert.equal(llmRows[0]?.model, "responses-gateway/gpt-luna");
+    assert.equal(llmRows[0]?.transport?.modelId, "responses-gateway/gpt-5.6-luna");
   },
 );

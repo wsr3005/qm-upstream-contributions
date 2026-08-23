@@ -13,9 +13,16 @@ import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
 import { errMessage } from "../util/errors.ts";
 import { validateCustomProviderSpec, type CustomProviderSpec } from "./custom-providers.ts";
 
+export const CUSTOM_PROVIDER_WIRE_ID_SCHEMA = 1;
+export const CUSTOM_PROVIDER_WIRE_ID_CAPABILITY = "custom-provider-wire-id-v1";
+
+export class CustomProviderRuntimeNotReadyError extends Error {}
+
 export interface StoredCustomProvider extends CustomProviderSpec {
   apiKeyEnc?: string;
   disabled?: boolean;
+  compatibilityDisabled?: boolean;
+  runtimeSchema?: number;
   modelHistory?: string[];
   updatedAt: number;
   updatedBy: string;
@@ -38,6 +45,9 @@ export interface CustomProviderStore {
   resolveActive(id: string): Promise<{ provider: CustomProviderSpec; apiKey: string | null } | null>;
   active(): Promise<Array<{ provider: CustomProviderSpec; apiKey: string | null }>>;
   knowsModel(id: string): Promise<boolean>;
+  knownModelIds(): Promise<string[]>;
+  runtimeSchemaReady(schema: number): Promise<boolean>;
+  runtimeSchemaWritable(schema: number): Promise<boolean>;
   upsert(spec: CustomProviderSpec, apiKey: string | undefined, updatedBy: string): Promise<void>;
   delete(id: string, updatedBy: string): Promise<boolean>;
 }
@@ -56,23 +66,47 @@ export function createCustomProviderStore(input: {
   backing: DurableMap<StoredCustomProvider>;
   keyMaterial: string | Buffer;
   advisoryLock?: AdvisoryLock;
+  runtimeSchemaReady?: (schema: number) => Promise<boolean>;
+  runtimeSchemaWritable?: (schema: number) => Promise<boolean>;
 }): CustomProviderStore {
   const key = deriveConnectorKey(input.keyMaterial, "custom-model-providers");
   const withRegistryLock = <T>(operation: () => Promise<T>): Promise<T> =>
     input.advisoryLock ? input.advisoryLock.withLock("custom-model-providers", operation) : operation();
+  const runtimeSchemaReady = (schema: number): Promise<boolean> =>
+    schema === CUSTOM_PROVIDER_WIRE_ID_SCHEMA
+      ? (input.runtimeSchemaReady?.(schema) ?? Promise.resolve(true))
+      : Promise.resolve(false);
+  const runtimeSchemaWritable = (schema: number): Promise<boolean> =>
+    schema === CUSTOM_PROVIDER_WIRE_ID_SCHEMA
+      ? (input.runtimeSchemaWritable?.(schema) ?? runtimeSchemaReady(schema))
+      : Promise.resolve(false);
+  const compatibilityEncoded = (saved: StoredCustomProvider): boolean =>
+    saved.runtimeSchema === CUSTOM_PROVIDER_WIRE_ID_SCHEMA &&
+    saved.compatibilityDisabled === true &&
+    saved.disabled === true;
+  const explicitlyDisabled = (saved: StoredCustomProvider): boolean =>
+    saved.disabled === true && !compatibilityEncoded(saved);
+  const runtimeEnabled = (saved: StoredCustomProvider, wireIdReady: boolean): boolean => {
+    if (explicitlyDisabled(saved)) return false;
+    if (saved.runtimeSchema === undefined) return true;
+    return compatibilityEncoded(saved) && wireIdReady;
+  };
+  const wireIdReady = (): Promise<boolean> => runtimeSchemaReady(CUSTOM_PROVIDER_WIRE_ID_SCHEMA);
 
   return {
     async enabled() {
       const all = await input.backing.all();
-      return all.filter((p) => !p.disabled).map(strip);
+      const ready = await wireIdReady();
+      return all.filter((saved) => runtimeEnabled(saved, ready)).map(strip);
     },
 
     async statuses() {
       const all = await input.backing.all();
+      const ready = await wireIdReady();
       return all
         .map((p) => ({
           ...strip(p),
-          disabled: p.disabled ?? false,
+          disabled: !runtimeEnabled(p, ready),
           hasKey: Boolean(p.apiKeyEnc),
           updatedAt: p.updatedAt,
           updatedBy: p.updatedBy,
@@ -82,13 +116,13 @@ export function createCustomProviderStore(input: {
 
     async resolveKey(id) {
       const saved = await input.backing.get(id);
-      if (!saved || saved.disabled || !saved.apiKeyEnc) return null;
+      if (!saved || !runtimeEnabled(saved, await wireIdReady()) || !saved.apiKeyEnc) return null;
       return decryptSecret(saved.apiKeyEnc, key);
     },
 
     async resolveActive(id) {
       const saved = await input.backing.get(id);
-      if (!saved || saved.disabled) return null;
+      if (!saved || !runtimeEnabled(saved, await wireIdReady())) return null;
       return {
         provider: strip(saved),
         apiKey: saved.apiKeyEnc ? decryptSecret(saved.apiKeyEnc, key) : null,
@@ -97,8 +131,9 @@ export function createCustomProviderStore(input: {
 
     async active() {
       const all = await input.backing.all();
+      const ready = await wireIdReady();
       return all
-        .filter((saved) => !saved.disabled)
+        .filter((saved) => runtimeEnabled(saved, ready))
         .map((saved) => ({
           provider: strip(saved),
           apiKey: (() => {
@@ -118,19 +153,42 @@ export function createCustomProviderStore(input: {
       return all.some((saved) => saved.models.some((model) => model.id === id) || saved.modelHistory?.includes(id));
     },
 
+    async knownModelIds() {
+      const all = await input.backing.all();
+      return [
+        ...new Set(all.flatMap((saved) => [...saved.models.map((model) => model.id), ...(saved.modelHistory ?? [])])),
+      ];
+    },
+
+    runtimeSchemaReady,
+
+    runtimeSchemaWritable,
+
     async upsert(spec, apiKey, updatedBy) {
       await withRegistryLock(async () => {
         validateCustomProviderSpec(spec);
+        const existing = await input.backing.get(spec.id);
+        const runtimeSchema = spec.models.some((model) => model.upstreamId !== undefined)
+          ? CUSTOM_PROVIDER_WIRE_ID_SCHEMA
+          : undefined;
+        const protectedSchema =
+          existing?.runtimeSchema ??
+          (existing?.compatibilityDisabled === true ? CUSTOM_PROVIDER_WIRE_ID_SCHEMA : undefined);
+        const requiredSchemas = [...new Set([protectedSchema, runtimeSchema].filter((schema) => schema !== undefined))];
+        if ((await Promise.all(requiredSchemas.map(runtimeSchemaWritable))).some((writable) => !writable)) {
+          throw new CustomProviderRuntimeNotReadyError(
+            "custom model aliases are unavailable until the compatibility rollout is complete",
+          );
+        }
         const conflict = (await input.backing.all()).find(
           (saved) =>
-            !saved.disabled &&
+            !explicitlyDisabled(saved) &&
             saved.id !== spec.id &&
             saved.models.some((model) => spec.models.some((candidate) => candidate.id === model.id)),
         );
         if (conflict) throw new Error(`custom model id is already registered by provider "${conflict.id}"`);
         const actor = updatedBy.trim();
         if (!actor) throw new Error("updatedBy is required");
-        const existing = await input.backing.get(spec.id);
         const trimmedKey = apiKey?.trim();
         const apiKeyEnc = trimmedKey ? encryptSecret(trimmedKey, key) : existing?.apiKeyEnc;
         const modelHistory = [
@@ -144,7 +202,9 @@ export function createCustomProviderStore(input: {
           ...spec,
           ...(apiKeyEnc ? { apiKeyEnc } : {}),
           modelHistory,
-          disabled: false,
+          ...(runtimeSchema !== undefined
+            ? { runtimeSchema, compatibilityDisabled: true, disabled: true }
+            : { compatibilityDisabled: false, disabled: false }),
           updatedAt: Date.now(),
           updatedBy: actor,
         });
@@ -154,10 +214,11 @@ export function createCustomProviderStore(input: {
     async delete(id, updatedBy) {
       return withRegistryLock(async () => {
         const existing = await input.backing.get(id);
-        if (!existing || existing.disabled) return false;
+        if (!existing || explicitlyDisabled(existing)) return false;
         await input.backing.put(id, {
           ...existing,
           disabled: true,
+          compatibilityDisabled: false,
           updatedAt: Date.now(),
           updatedBy,
         });

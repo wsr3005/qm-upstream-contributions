@@ -19,6 +19,21 @@ test(
   { skip },
   async () => {
     const pool = createPostgresMapFactory(URL!).pool;
+    const capable = createPostgresInstanceRegistry(pool, {
+      instanceId: "i-capable",
+      buildSha: "sha-capable",
+      startedAt: 500,
+      livenessMs: 200,
+      capabilities: ["wire-id-v1"],
+    });
+    assert.equal(await capable.allLiveSupport!("wire-id-v1"), false, "zero rows never prove rollout readiness");
+    await capable.beat();
+    assert.equal(
+      await capable.allLiveSupport!("wire-id-v1"),
+      true,
+      "the current capable instance must heartbeat first",
+    );
+
     const old = createPostgresInstanceRegistry(pool, {
       instanceId: "i-old",
       buildSha: "sha-a",
@@ -41,12 +56,18 @@ test(
       buildSha: "sha-b",
       startedAt: 3000,
       livenessMs: 200,
+      capabilities: ["wire-id-v1"],
     });
     await next.beat();
     assert.equal(await old.beat(), true, "newer build live: superseded");
     assert.equal(await next.beat(), false, "the newest build itself is not superseded");
+    assert.equal(await next.allLiveSupport!("wire-id-v1"), false, "a live old runtime blocks the capability");
 
     await new Promise((r) => setTimeout(r, 250));
     assert.equal(await old.beat(), false, "the newer build's beats went stale (failed deploy): claiming resumes");
+    assert.equal(await next.allLiveSupport!("wire-id-v1"), false, "the refreshed old runtime still blocks activation");
+    await new Promise((r) => setTimeout(r, 250));
+    await next.beat();
+    assert.equal(await next.allLiveSupport!("wire-id-v1"), true, "only capable live runtimes allow activation");
   },
 );

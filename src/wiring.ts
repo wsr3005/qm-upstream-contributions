@@ -172,7 +172,12 @@ import { createModelGateway, type ModelGateway } from "./model/model-gateway.ts"
 import { createModelCredentialStore, type ModelCredentialStore } from "./model/model-credential-store.ts";
 import { setProviderBaseUrls } from "./model/provider-endpoints.ts";
 import { resolveCustomModel, setCustomProviders } from "./model/custom-providers.ts";
-import { createCustomProviderStore, type CustomProviderStore } from "./model/custom-provider-store.ts";
+import {
+  createCustomProviderStore,
+  CUSTOM_PROVIDER_WIRE_ID_CAPABILITY,
+  CUSTOM_PROVIDER_WIRE_ID_SCHEMA,
+  type CustomProviderStore,
+} from "./model/custom-provider-store.ts";
 import { createMemorySessionStore } from "./sessions/memory-session-store.ts";
 import { createPostgresSessionStore } from "./sessions/postgres-session-store.ts";
 import type { SessionStore } from "./sessions/session-store.ts";
@@ -391,6 +396,7 @@ export function buildApp(
     securityScreener?: SecurityScreener;
     credentialBrokers?: Record<string, AwsRoleBroker>;
     modelCredentialFetch?: typeof fetch;
+    instanceRegistry?: InstanceRegistry;
   } = {},
 ): BuiltApp {
   if (config.databaseUrl && !config.connectorSecretKey) {
@@ -727,13 +733,30 @@ export function buildApp(
       ? createPostgresRunSignalStore(requireDbUrl("RUN_STORE"))
       : createMemoryRunSignalStore();
   const tasks = config.databaseUrl ? createPostgresTaskStore(config.databaseUrl) : createMemoryTaskStore();
+  const instanceRegistry: InstanceRegistry =
+    overrides.instanceRegistry ??
+    (config.buildSha && pgArtifactMap
+      ? createPostgresInstanceRegistry(pgArtifactMap.pool, {
+          instanceId: randomUUID(),
+          buildSha: config.buildSha,
+          startedAt: Date.now(),
+          capabilities: [CUSTOM_PROVIDER_WIRE_ID_CAPABILITY],
+        })
+      : createNoopInstanceRegistry());
   const customProviders = createCustomProviderStore({
     backing: artifactMap("custom_model_providers"),
     keyMaterial: config.connectorSecretKey ?? randomBytes(32),
     advisoryLock,
+    runtimeSchemaReady: async (schema) => {
+      if (schema !== CUSTOM_PROVIDER_WIRE_ID_SCHEMA) return false;
+      if (!config.production) return true;
+      return (await instanceRegistry.allLiveSupport?.(CUSTOM_PROVIDER_WIRE_ID_CAPABILITY)) ?? false;
+    },
+    runtimeSchemaWritable: async (schema) => schema === CUSTOM_PROVIDER_WIRE_ID_SCHEMA && !config.production,
   });
   const refreshCustomProviders = async () => {
-    setCustomProviders(await customProviders.enabled());
+    const [enabled, knownIds] = await Promise.all([customProviders.enabled(), customProviders.knownModelIds()]);
+    setCustomProviders(enabled, knownIds);
   };
   void refreshCustomProviders().catch((e) =>
     console.error("[wiring] custom provider hydration failed:", errMessage(e)),
@@ -793,6 +816,7 @@ export function buildApp(
       name: active.provider.name,
       baseUrl: active.provider.baseUrl,
       apiKey: active.apiKey,
+      modelId: active.provider.models.find((candidate) => candidate.id === modelId)?.upstreamId?.trim() || modelId,
     };
   };
   const runtimeOrgScope = scopeId("org", config.orgId);
@@ -1410,14 +1434,6 @@ export function buildApp(
         },
       })
     : undefined;
-  const instanceRegistry: InstanceRegistry =
-    config.buildSha && pgArtifactMap
-      ? createPostgresInstanceRegistry(pgArtifactMap.pool, {
-          instanceId: randomUUID(),
-          buildSha: config.buildSha,
-          startedAt: Date.now(),
-        })
-      : createNoopInstanceRegistry();
   const taskProtection: TaskProtection | null =
     config.ecsTaskProtection && config.ecsAgentUri ? createEcsTaskProtection(config.ecsAgentUri) : null;
   const drain: DrainController = createDrainController({
@@ -1475,6 +1491,7 @@ export function buildApp(
     : null;
   const runtime: Runtime = {
     start() {
+      drain.start();
       if (!config.backgroundWorkEnabled) return;
       for (const w of workers) w.start();
       reaper.start();
@@ -1487,7 +1504,6 @@ export function buildApp(
       reachDeniedNotifier?.start(config.insightsIntervalMs);
       wakeSweep.start();
       orphanedSignalSweeper.start();
-      drain.start();
     },
     async releaseInFlightRuns() {
       await Promise.all(workers.map((w) => w.releaseInFlight()));

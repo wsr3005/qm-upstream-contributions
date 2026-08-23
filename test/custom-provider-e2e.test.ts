@@ -242,18 +242,24 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
         protocol: "openai",
         baseUrl: upstreamUrl,
         apiKey: "sk-qa-good",
-        models: [{ id: "gpt-5.6-luna" }],
+        models: [{ id: "gpt-5.6-luna", upstreamId: "gpt-5.6-luna" }],
         validate: false,
       }),
     });
     assert.equal(r.status, 200);
+    const collisionStatus = (await r.json()) as {
+      status: { models: Array<{ id: string; upstreamId?: string }> };
+    };
+    assert.deepEqual(collisionStatus.status.models, [{ id: "collision/gpt-5.6-luna", upstreamId: "gpt-5.6-luna" }]);
     const callsBeforeBuiltInCollision = seen.filter((s) => s.path.endsWith("/chat/completions")).length;
     r = await api("/v1/admin/custom-providers/collision/test", {
       method: "POST",
-      body: JSON.stringify({ modelId: "gpt-5.6-luna" }),
+      body: JSON.stringify({ modelId: "collision/gpt-5.6-luna" }),
     });
-    assert.equal(r.status, 409);
-    assert.equal(seen.filter((s) => s.path.endsWith("/chat/completions")).length, callsBeforeBuiltInCollision);
+    assert.equal(r.status, 200);
+    const builtInCollisionCalls = seen.filter((s) => s.path.endsWith("/chat/completions"));
+    assert.equal(builtInCollisionCalls.length, callsBeforeBuiltInCollision + 1);
+    assert.equal(builtInCollisionCalls.at(-1)?.model, "gpt-5.6-luna");
     assert.equal((await api("/v1/admin/custom-providers/collision", { method: "DELETE" })).status, 200);
 
     const callsBeforeCustomCollision = seen.filter((s) => s.path.endsWith("/chat/completions")).length;
@@ -519,7 +525,7 @@ test("QA: registrations survive a restart (shared durable backing + same secret)
   // and the hydration path wires it into the runtime registry
   setCustomProviders(enabled);
   assert.ok(resolveModel("survivor-model"), "hydrated model resolves");
-  setCustomProviders([]);
+  setCustomProviders([], []);
 });
 
 test("QA: a corrupt stored key degrades that provider only — admin surface stays intact", async () => {

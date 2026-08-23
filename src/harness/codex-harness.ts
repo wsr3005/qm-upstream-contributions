@@ -46,6 +46,7 @@ export interface CodexCustomProviderBinding {
   name: string;
   baseUrl: string;
   apiKey: string;
+  modelId?: string;
 }
 
 export function codexHarnessConfigOptions(config: Config): CodexHarnessOptions {
@@ -678,11 +679,13 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
     const setupTimer = wallMs > 0 ? setTimeout(() => stopSetup(setupTimedOut), wallMs) : undefined;
     const awaitSetup = <T>(operation: Promise<T>): Promise<T> => Promise.race([operation, setupStop]);
     const model = turn.model ?? resolveModelId(turn.scopeLabel);
+    let runtimeModel: string;
     let rt: Runtime;
     let runtimeConfig: Record<string, unknown>;
     let reservedRuntimeKey: string | null = null;
     try {
       const binding = opts.resolveCustomProvider ? await awaitSetup(opts.resolveCustomProvider(model)) : null;
+      runtimeModel = binding?.modelId ?? model;
       const spec = codexCustomRuntimeSpec(opts.env ?? {}, binding);
       runtimeConfig = spec.config;
       reservedRuntimeKey = spec.key;
@@ -717,7 +720,7 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
       inputSchema: tool.parameters,
     }));
     const threadStartRequest = {
-      ...(model ? { model } : {}),
+      ...(runtimeModel ? { model: runtimeModel } : {}),
       cwd: rt.jail,
       approvalPolicy: "never",
       sandbox: "read-only",
@@ -843,7 +846,7 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
           model: selectedModel,
           promptEnvelope,
           truncated: Boolean(turn.images?.length),
-          transport: { modelId: selectedModel },
+          transport: { modelId: runtimeModel },
           ttftMs: state.firstOutputAt ? state.firstOutputAt - startedAt : null,
           durationMs: Date.now() - startedAt,
           usage: sumUsage(state.usageByThread),
@@ -917,7 +920,11 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
     let timer: NodeJS.Timeout | undefined;
     try {
       const response = await rt.server
-        .request<{ turn: CodexTurn }>("turn/start", { threadId, input, ...(model ? { model } : {}) })
+        .request<{ turn: CodexTurn }>("turn/start", {
+          threadId,
+          input,
+          ...(runtimeModel ? { model: runtimeModel } : {}),
+        })
         .catch((error: unknown) => {
           throw error instanceof CodexRpcError ? codexProviderFailure(error.message) : error;
         });

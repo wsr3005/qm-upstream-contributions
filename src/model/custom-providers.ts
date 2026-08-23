@@ -3,8 +3,9 @@ import { parseProviderBaseUrl, PROVIDER_IDS } from "./provider-endpoints.ts";
 export const CUSTOM_PROVIDER_PROTOCOLS = ["openai", "openai-responses", "anthropic"] as const;
 export type CustomProviderProtocol = (typeof CUSTOM_PROVIDER_PROTOCOLS)[number];
 
-interface CustomModelSpec {
+export interface CustomModelSpec {
   id: string;
+  upstreamId?: string;
   name?: string;
   contextWindow?: number;
   maxTokens?: number;
@@ -42,12 +43,27 @@ export function validateCustomProviderSpec(spec: CustomProviderSpec): void {
   }
   if (spec.models.length > 200) throw new Error("at most 200 models per provider");
   const seen = new Set<string>();
+  const upstreamSeen = new Set<string>();
   for (const m of spec.models) {
-    if (!m.id?.trim() || m.id.length > 200) throw new Error("every model needs an id (<=200 chars)");
+    if (!m || typeof m !== "object" || typeof m.id !== "string" || !m.id.trim() || m.id.length > 200) {
+      throw new Error("every model needs an id (<=200 chars)");
+    }
     if (m.name !== undefined && (typeof m.name !== "string" || m.name.length > 200))
       throw new Error(`model "${m.id}": name must be a string of 200 chars or fewer`);
     if (seen.has(m.id)) throw new Error(`duplicate model id "${m.id}"`);
     seen.add(m.id);
+    if (
+      m.upstreamId !== undefined &&
+      (typeof m.upstreamId !== "string" ||
+        !m.upstreamId.trim() ||
+        m.upstreamId.length > 200 ||
+        m.upstreamId !== m.upstreamId.trim())
+    ) {
+      throw new Error(`model "${m.id}": upstreamId must be a non-empty string of 200 chars or fewer`);
+    }
+    const upstreamId = m.upstreamId?.trim() || m.id;
+    if (upstreamSeen.has(upstreamId)) throw new Error(`duplicate upstream model id "${upstreamId}"`);
+    upstreamSeen.add(upstreamId);
     for (const [field, v] of [
       ["contextWindow", m.contextWindow],
       ["maxTokens", m.maxTokens],
@@ -74,6 +90,7 @@ export function validateCustomProviderSpec(spec: CustomProviderSpec): void {
  */
 export interface CustomRuntimeModel {
   id: string;
+  wireId: string;
   name: string;
   provider: string;
   api: "openai-completions" | "openai-responses" | "anthropic-messages";
@@ -97,6 +114,7 @@ function runtimeApi(protocol: CustomProviderProtocol): CustomRuntimeModel["api"]
 function toRuntimeModel(provider: CustomProviderSpec, m: CustomModelSpec): CustomRuntimeModel {
   return {
     id: m.id,
+    wireId: m.upstreamId?.trim() || m.id,
     name: m.name?.trim() || m.id,
     provider: provider.id,
     api: runtimeApi(provider.protocol),
@@ -114,11 +132,14 @@ export function runtimeModelForCustomProvider(
   modelId: string,
 ): CustomRuntimeModel | undefined {
   const model = provider.models.find((candidate) => candidate.id === modelId);
-  return model ? toRuntimeModel(provider, model) : undefined;
+  if (!model) return undefined;
+  const runtime = toRuntimeModel(provider, model);
+  return { ...runtime, id: runtime.wireId };
 }
 
 let registry = new Map<string, CustomRuntimeModel>();
 let providers: CustomProviderSpec[] = [];
+let knownModelIds = new Set<string>();
 let version = 0;
 
 /**
@@ -127,9 +148,8 @@ let version = 0;
  * ids shadow custom ones at resolution, so a collision can't hijack a
  * built-in.
  */
-export function setCustomProviders(specs: CustomProviderSpec[]): void {
+export function setCustomProviders(specs: CustomProviderSpec[], knownIds?: readonly string[]): void {
   const snapshot = specs.map((spec) => ({ ...spec, models: [...spec.models] }));
-  if (JSON.stringify(snapshot) === JSON.stringify(providers)) return;
   const next = new Map<string, CustomRuntimeModel>();
   for (const spec of snapshot) {
     for (const m of spec.models) {
@@ -137,8 +157,18 @@ export function setCustomProviders(specs: CustomProviderSpec[]): void {
       next.set(m.id, toRuntimeModel(spec, m));
     }
   }
+  const nextKnown = new Set((knownIds ?? [...knownModelIds]).filter((id) => typeof id === "string" && id.length > 0));
+  for (const id of next.keys()) nextKnown.add(id);
+  if (
+    JSON.stringify(snapshot) === JSON.stringify(providers) &&
+    nextKnown.size === knownModelIds.size &&
+    [...nextKnown].every((id) => knownModelIds.has(id))
+  ) {
+    return;
+  }
   registry = next;
   providers = snapshot;
+  knownModelIds = nextKnown;
   version += 1;
 }
 
@@ -153,6 +183,10 @@ export function resolveCustomModel(id: string): CustomRuntimeModel | undefined {
 
 export function isCustomModelId(id: string): boolean {
   return registry.has(id);
+}
+
+export function isKnownCustomModelId(id: string): boolean {
+  return knownModelIds.has(id);
 }
 
 export function customModelCatalog(): Array<{ id: string; name: string; provider: string }> {
@@ -179,7 +213,7 @@ export function customModelsJsonForProviders(
           baseUrl: spec.baseUrl,
           api: runtimeApi(spec.protocol),
           models: spec.models.map((m) => ({
-            id: m.id,
+            id: m.upstreamId?.trim() || m.id,
             name: m.name ?? m.id,
             contextWindow: m.contextWindow ?? 128_000,
             maxTokens: m.maxTokens ?? 8_192,

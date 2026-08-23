@@ -183,7 +183,10 @@ export function modelRef(id: string): { providerID: string; modelID: string } {
   // those must route to the registered provider, not a phantom "bedrock".
   if (isCustomModelId(id)) {
     const resolved = resolveModel(id);
-    if (resolved?.provider) return { providerID: String(resolved.provider), modelID: id };
+    if (resolved?.provider) {
+      const custom = resolved as typeof resolved & { wireId?: string };
+      return { providerID: String(resolved.provider), modelID: custom.wireId ?? id };
+    }
   }
   const slash = id.indexOf("/");
   if (slash > 0) return { providerID: id.slice(0, slash), modelID: id.slice(slash + 1) };
@@ -708,7 +711,7 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
                 options: { baseURL: spec.baseUrl, ...(apiKey ? { apiKey } : {}) },
                 models: Object.fromEntries(
                   spec.models.map((m) => [
-                    m.id,
+                    m.upstreamId?.trim() || m.id,
                     {
                       name: m.name ?? m.id,
                       limit: {

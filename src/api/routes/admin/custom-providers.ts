@@ -1,11 +1,16 @@
 import {
   CUSTOM_PROVIDER_PROTOCOLS,
   runtimeModelForCustomProvider,
+  validateCustomProviderSpec,
   type CustomProviderSpec,
   type CustomProviderProtocol,
 } from "../../../model/custom-providers.ts";
+import {
+  CUSTOM_PROVIDER_WIRE_ID_SCHEMA,
+  CustomProviderRuntimeNotReadyError,
+} from "../../../model/custom-provider-store.ts";
 import { oneShot } from "../../../harness/pi-harness.ts";
-import { resolveModel } from "../../../model/pi-models.ts";
+import { resolveModel, resolveStaticModel } from "../../../model/pi-models.ts";
 import { sendJson } from "../../http.ts";
 import type { ApiCtx } from "../route.ts";
 import { audit, authorizeAdmin, orgScope } from "../shared.ts";
@@ -62,6 +67,9 @@ export async function putCustomProvider(ctx: ApiCtx): Promise<void> {
   if (!ctx.deps.customProviders) return sendJson(ctx.res, 404, { error: "not_found" });
   const id = ctx.params.provider;
   if (!id) return sendJson(ctx.res, 404, { error: "not_found" });
+  if (!ctx.body || typeof ctx.body !== "object" || Array.isArray(ctx.body)) {
+    return sendJson(ctx.res, 400, { error: "bad_request", message: "a JSON object is required" });
+  }
   const body = ctx.body as {
     name?: unknown;
     protocol?: unknown;
@@ -79,13 +87,32 @@ export async function putCustomProvider(ctx: ApiCtx): Promise<void> {
       message: `protocol must be one of ${CUSTOM_PROVIDER_PROTOCOLS.join(", ")}`,
     });
   }
+  const submittedModels = Array.isArray(body.models) ? (body.models as CustomProviderSpec["models"]) : [];
   const spec: CustomProviderSpec = {
     id,
     name: body.name,
     protocol: body.protocol as CustomProviderProtocol,
     baseUrl: body.baseUrl.trim().replace(/\/+$/, ""),
-    models: Array.isArray(body.models) ? (body.models as CustomProviderSpec["models"]) : [],
+    models: submittedModels.map((model) =>
+      typeof model?.id === "string" && resolveStaticModel(model.id)
+        ? { ...model, id: `${id}/${model.id}`, upstreamId: model.upstreamId ?? model.id }
+        : model,
+    ),
   };
+  try {
+    validateCustomProviderSpec(spec);
+  } catch (e) {
+    return sendJson(ctx.res, 400, { error: "bad_request", message: (e as Error).message });
+  }
+  if (
+    spec.models.some((model) => model.upstreamId !== undefined) &&
+    !(await ctx.deps.customProviders.runtimeSchemaWritable(CUSTOM_PROVIDER_WIRE_ID_SCHEMA))
+  ) {
+    return sendJson(ctx.res, 409, {
+      error: "runtime_rollout_incomplete",
+      message: "custom model aliases are unavailable until the compatibility rollout is complete",
+    });
+  }
   const apiKey = typeof body.apiKey === "string" && body.apiKey.trim() ? body.apiKey.trim() : undefined;
   const shouldValidate = body.validate !== false && apiKey !== undefined;
   if (shouldValidate && !(await validateKey(ctx, spec.protocol, spec.baseUrl, apiKey!))) {
@@ -97,7 +124,11 @@ export async function putCustomProvider(ctx: ApiCtx): Promise<void> {
   try {
     await ctx.deps.customProviders.upsert(spec, apiKey, authorized.id);
   } catch (e) {
-    return sendJson(ctx.res, 400, { error: "bad_request", message: (e as Error).message });
+    const rollout = e instanceof CustomProviderRuntimeNotReadyError;
+    return sendJson(ctx.res, rollout ? 409 : 400, {
+      error: rollout ? "runtime_rollout_incomplete" : "bad_request",
+      message: (e as Error).message,
+    });
   }
   await ctx.deps.refreshCustomProviders?.();
   audit(ctx.deps, {
@@ -116,6 +147,9 @@ export async function testCustomProvider(ctx: ApiCtx): Promise<void> {
   if (!ctx.deps.customProviders) return sendJson(ctx.res, 404, { error: "not_found" });
   const id = ctx.params.provider;
   if (!id) return sendJson(ctx.res, 404, { error: "not_found" });
+  if (!ctx.body || typeof ctx.body !== "object" || Array.isArray(ctx.body)) {
+    return sendJson(ctx.res, 400, { error: "bad_request", message: "a JSON object is required" });
+  }
   const body = ctx.body as { modelId?: unknown };
   if (typeof body.modelId !== "string" || !body.modelId.trim()) {
     return sendJson(ctx.res, 400, { error: "bad_request", message: "modelId is required" });

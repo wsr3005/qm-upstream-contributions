@@ -136,16 +136,19 @@ rl.on("line", (line) => {
   if (msg.method === "initialized") return;
   if (msg.method === "thread/start") {
     const provider = msg.params.config?.model_providers?.gateway;
-    if (msg.params.model !== "responses-model" || msg.params.config?.model_provider !== "gateway" ||
+    if (msg.params.model !== "gpt-5.6-luna" || msg.params.config?.model_provider !== "gateway" ||
         provider?.base_url !== "https://gateway.example.com/v1" || provider?.wire_api !== "responses" ||
         provider?.env_key !== "QM_CODEX_PROVIDER_KEY" || process.env.QM_CODEX_PROVIDER_KEY !== "sk-custom" ||
         process.env.OPENAI_API_KEY || process.env.OPENAI_BASE_URL || process.env.CODEX_ACCESS_TOKEN ||
         line.includes("sk-custom")) {
       return send({ id: msg.id, error: { code: -1, message: "bad custom provider binding" } });
     }
-    return send({ id: msg.id, result: { thread: { id: "thread-custom" }, model: "responses-model" } });
+    return send({ id: msg.id, result: { thread: { id: "thread-custom" }, model: "gpt-5.6-luna" } });
   }
   if (msg.method === "turn/start") {
+    if (msg.params.model !== "gpt-5.6-luna") {
+      return send({ id: msg.id, error: { code: -1, message: "bad custom turn model" } });
+    }
     send({ id: msg.id, result: { turn: { id: "turn-custom", status: "inProgress", items: [] } } });
     return send({ method: "turn/completed", params: { threadId: "thread-custom", turn: { id: "turn-custom", status: "completed", items: [{ type: "agentMessage", text: "CUSTOM-OK", phase: "final_answer" }] } } });
   }
@@ -349,7 +352,7 @@ test("Codex binds a Responses custom provider without exposing its key in RPC", 
       name: "Gateway",
       protocol: "openai-responses",
       baseUrl: "https://gateway.example.com/v1",
-      models: [{ id: "responses-model" }],
+      models: [{ id: "gateway/gpt-luna", upstreamId: "gpt-5.6-luna" }],
     },
   ]);
   const harness = createCodexHarness({
@@ -361,35 +364,44 @@ test("Codex binds a Responses custom provider without exposing its key in RPC", 
       CODEX_ACCESS_TOKEN: "official-token",
     },
     resolveCustomProvider: async (modelId) => {
-      assert.equal(modelId, "responses-model");
+      assert.equal(modelId, "gateway/gpt-luna");
       return {
         id: "gateway",
         name: "Gateway",
         baseUrl: "https://gateway.example.com/v1",
         apiKey: "sk-custom",
+        modelId: "gpt-5.6-luna",
       };
     },
   });
   t.after(async () => {
     await harness.turns.close?.();
-    setCustomProviders([]);
+    setCustomProviders([], []);
     rmSync(dir, { recursive: true, force: true });
   });
   const scope = { kind: "org", id: "test" } as unknown as ScopeId;
   const session = { id: "session-custom" } as Session;
+  const modelCalls: Array<{ model: string }> = [];
+  const llmRows: HarnessLlmRequestRecord[] = [];
   const result = await harness.turns.runTurn({
     session,
     input: "hi",
-    model: "responses-model",
+    model: "gateway/gpt-luna",
     systemPrompt: "be concise",
     history: [],
     tools: {} as HarnessTurnInput["tools"],
     scopeLabel: scope,
     orgScopeId: scope,
     emit: async (entry) => ({ ...entry, sessionId: session.id, seq: 1, createdAt: Date.now() }) as SessionEntry,
-    recordModelCall: () => {},
+    recordModelCall: (record) => modelCalls.push(record),
+    recordLlmRequest: async (record) => {
+      llmRows.push(record);
+    },
   });
   assert.equal(result.reply, "CUSTOM-OK");
+  assert.equal(modelCalls[0]?.model, "gateway/gpt-luna");
+  assert.equal(llmRows[0]?.model, "gateway/gpt-luna");
+  assert.equal(llmRows[0]?.transport?.modelId, "gpt-5.6-luna");
 });
 
 test("custom Codex runtime identity rotates with endpoint or key and strips built-in credentials", () => {
@@ -445,7 +457,7 @@ test("Codex retires an idle provider process when its saved key rotates", async 
   });
   t.after(async () => {
     await harness.turns.close?.();
-    setCustomProviders([]);
+    setCustomProviders([], []);
     rmSync(dir, { recursive: true, force: true });
   });
   const scope = { kind: "org", id: "test" } as unknown as ScopeId;
@@ -690,7 +702,7 @@ test("a timed-out custom Codex startup closes after its background initializatio
   });
   t.after(async () => {
     await harness.turns.close?.();
-    setCustomProviders([]);
+    setCustomProviders([], []);
     rmSync(dir, { recursive: true, force: true });
   });
   const scope = { kind: "org", id: "test" } as unknown as ScopeId;
@@ -1037,7 +1049,7 @@ test(
           object: "response",
           created_at: Math.floor(Date.now() / 1000),
           status: "completed",
-          model: "responses-model",
+          model: "gpt-5.6-luna",
           output: [item],
           usage: {
             input_tokens: 5,
@@ -1100,30 +1112,31 @@ test(
         name: "Gateway",
         protocol: "openai-responses",
         baseUrl,
-        models: [{ id: "responses-model" }],
+        models: [{ id: "gateway/gpt-luna", upstreamId: "gpt-5.6-luna" }],
       },
     ]);
     const harness = createCodexHarness({
       binaryPath: realCodexBinary!,
       env: { PATH: process.env.PATH },
       turnWallClockMs: 10_000,
-      resolveCustomProvider: async () => ({
+      resolveCustomProvider: async (modelId) => ({
         id: "gateway",
         name: "Gateway",
         baseUrl,
         apiKey: "sk-codex-qa",
+        modelId: modelId === "gateway/gpt-luna" ? "gpt-5.6-luna" : modelId,
       }),
     });
     t.after(async () => {
       await harness.turns.close?.();
       upstream.close();
-      setCustomProviders([]);
+      setCustomProviders([], []);
     });
     const scope = { kind: "org", id: "test" } as unknown as ScopeId;
     const result = await harness.turns.runTurn({
       session: { id: "real-custom-provider" } as Session,
       input: "reply briefly",
-      model: "responses-model",
+      model: "gateway/gpt-luna",
       systemPrompt: "be concise",
       history: [],
       tools: {} as HarnessTurnInput["tools"],
@@ -1138,6 +1151,6 @@ test(
     assert.equal(requests.length, 1);
     assert.equal(requests[0]?.path, "/v1/responses");
     assert.equal(requests[0]?.auth, "Bearer sk-codex-qa");
-    assert.equal(requests[0]?.model, "responses-model");
+    assert.equal(requests[0]?.model, "gpt-5.6-luna");
   },
 );
