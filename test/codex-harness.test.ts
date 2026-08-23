@@ -431,6 +431,24 @@ test("custom Codex runtime identity rotates with endpoint or key and strips buil
   assert.equal(first.env.PATH, "/bin");
   assert.equal(JSON.stringify(first.config).includes("sk-one"), false);
   assert.equal(first.key.includes("sk-one"), false);
+  const singleAttempt = codexCustomRuntimeSpec(
+    source,
+    {
+      id: "gateway",
+      name: "Gateway",
+      baseUrl: "https://gateway.example.com/v1",
+      apiKey: "sk-one",
+    },
+    true,
+  );
+  assert.deepEqual((singleAttempt.config.model_providers as Record<string, Record<string, unknown>>).gateway, {
+    name: "Gateway",
+    base_url: "https://gateway.example.com/v1",
+    env_key: "QM_CODEX_PROVIDER_KEY",
+    wire_api: "responses",
+    request_max_retries: 0,
+    stream_max_retries: 0,
+  });
 });
 
 test("Codex retires an idle provider process when its saved key rotates", async (t) => {

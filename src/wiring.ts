@@ -2,7 +2,12 @@ import { mkdirSync } from "node:fs";
 import { randomBytes, randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import { baseModelProviders, configuredModelForHarness, providerKeysPresent, type Config } from "./config.ts";
-import type { ServerDeps } from "./api/deps.ts";
+import {
+  CustomProviderHarnessTestRolloutIncompleteError,
+  CustomProviderTestConfigurationChangedError,
+  type CustomProviderHarnessTestRunner,
+  type ServerDeps,
+} from "./api/deps.ts";
 import { createIdentityService, type DeactivationRecord, type IdentityService } from "./identity/identity-service.ts";
 import {
   createMemoryConfigStore,
@@ -171,9 +176,10 @@ import { createConsentLinkStore, type ConsentLinkStore, type ConsentLinkRecord }
 import { createModelGateway, type ModelGateway } from "./model/model-gateway.ts";
 import { createModelCredentialStore, type ModelCredentialStore } from "./model/model-credential-store.ts";
 import { setProviderBaseUrls } from "./model/provider-endpoints.ts";
-import { resolveCustomModel, setCustomProviders } from "./model/custom-providers.ts";
+import { resolveCustomModel, runtimeModelForCustomProvider, setCustomProviders } from "./model/custom-providers.ts";
 import {
   createCustomProviderStore,
+  CUSTOM_PROVIDER_HARNESS_TEST_CAPABILITY,
   CUSTOM_PROVIDER_WIRE_ID_CAPABILITY,
   CUSTOM_PROVIDER_WIRE_ID_SCHEMA,
   type CustomProviderStore,
@@ -345,6 +351,8 @@ export interface BuiltApp {
   modelCredentials: ModelCredentialStore;
   customProviders: CustomProviderStore;
   refreshCustomProviders: () => Promise<void>;
+  customProviderHarnessTest: CustomProviderHarnessTestRunner;
+  customProviderHarnessTestFence: () => Promise<string | null>;
   mcpServers: McpServerStore;
   mcpToolService: McpToolService;
   acl: AclStore;
@@ -745,19 +753,25 @@ export function buildApp(
           instanceId: randomUUID(),
           buildSha: config.buildSha,
           startedAt: Date.now(),
-          capabilities: [CUSTOM_PROVIDER_WIRE_ID_CAPABILITY],
+          capabilities: [CUSTOM_PROVIDER_WIRE_ID_CAPABILITY, CUSTOM_PROVIDER_HARNESS_TEST_CAPABILITY],
         })
       : createNoopInstanceRegistry());
+  const customProviderRuntimeSchemaReady = async (schema: number) => {
+    if (schema !== CUSTOM_PROVIDER_WIRE_ID_SCHEMA) return false;
+    if (!config.production) return true;
+    return (await instanceRegistry.allLiveSupport?.(CUSTOM_PROVIDER_WIRE_ID_CAPABILITY)) ?? false;
+  };
+  const customProviderHarnessTestFence = async (): Promise<string | null> => {
+    if (!config.production) return "non-production";
+    const snapshot = await instanceRegistry.capabilitySnapshot?.(CUSTOM_PROVIDER_HARNESS_TEST_CAPABILITY);
+    return snapshot?.ready ? snapshot.epoch : null;
+  };
   const customProviders = createCustomProviderStore({
     backing: artifactMap("custom_model_providers"),
     keyMaterial: config.connectorSecretKey ?? randomBytes(32),
     advisoryLock,
-    runtimeSchemaReady: async (schema) => {
-      if (schema !== CUSTOM_PROVIDER_WIRE_ID_SCHEMA) return false;
-      if (!config.production) return true;
-      return (await instanceRegistry.allLiveSupport?.(CUSTOM_PROVIDER_WIRE_ID_CAPABILITY)) ?? false;
-    },
-    runtimeSchemaWritable: async (schema) => schema === CUSTOM_PROVIDER_WIRE_ID_SCHEMA && !config.production,
+    runtimeSchemaReady: customProviderRuntimeSchemaReady,
+    runtimeSchemaWritable: customProviderRuntimeSchemaReady,
   });
   const refreshCustomProviders = async () => {
     const [enabled, knownIds] = await Promise.all([customProviders.enabled(), customProviders.knownModelIds()]);
@@ -883,6 +897,54 @@ export function buildApp(
       ...(input.model ? { modelId: input.model } : {}),
     });
   });
+  const customProviderHarnessTest: CustomProviderHarnessTestRunner = async (input) => {
+    await refreshCustomProviders();
+    const initialState = await customProviders.harnessTestState(input.providerId, customProviderHarnessTestFence);
+    if (initialState.rolloutFence !== input.rolloutFence) {
+      throw new CustomProviderHarnessTestRolloutIncompleteError(
+        "custom provider harness testing is unavailable during a mixed-version rollout",
+      );
+    }
+    const active = initialState.active;
+    if (
+      !active?.apiKey ||
+      active.revision !== input.expectedRevision ||
+      !active.provider.models.some((model) => model.id === input.modelId)
+    ) {
+      if (active?.revision !== input.expectedRevision) {
+        throw new CustomProviderTestConfigurationChangedError("custom provider changed before the test started");
+      }
+      throw new Error("custom provider model is not active");
+    }
+    const runtimeModel = runtimeModelForCustomProvider(active.provider, input.modelId);
+    if (!runtimeModel) throw new Error("custom provider model is not active");
+    if (input.harnessId === "codex" && active.provider.protocol !== "openai-responses") {
+      throw new Error(`model ${input.modelId} is unavailable to ${input.harnessId}`);
+    }
+    const testModel = adapters.get(input.harnessId)?.models.testModel;
+    if (!testModel) throw new Error(`harness ${input.harnessId} cannot test a model`);
+    const result = await testModel({
+      model: input.modelId,
+      systemPrompt: "You are testing a model connection for an organization administrator. Do not use tools.",
+      prompt: "Reply with a short confirmation that the model connection works.",
+      signal: input.signal,
+      customProvider: { spec: active.provider, apiKey: active.apiKey },
+    });
+    const finalState = await customProviders.harnessTestState(input.providerId, customProviderHarnessTestFence);
+    if (finalState.rolloutFence !== input.rolloutFence) {
+      throw new CustomProviderHarnessTestRolloutIncompleteError(
+        "custom provider harness testing became unavailable during the request",
+      );
+    }
+    if (finalState.active?.revision !== active.revision) {
+      throw new CustomProviderTestConfigurationChangedError("custom provider changed during the test");
+    }
+    return {
+      ...result,
+      providerRevision: active.revision,
+      upstreamModelId: runtimeModel.id,
+    };
+  };
 
   const leaseTtlMs = config.leaseTtlMs;
   const maxAttempts = config.maxAttempts;
@@ -1563,6 +1625,8 @@ export function buildApp(
     modelCredentials,
     customProviders,
     refreshCustomProviders,
+    customProviderHarnessTest,
+    customProviderHarnessTestFence,
     mcpServers,
     mcpToolService,
     acl,
@@ -1634,6 +1698,8 @@ export function serverDeps(
     modelCredentials: built.modelCredentials,
     customProviders: built.customProviders,
     refreshCustomProviders: built.refreshCustomProviders,
+    customProviderHarnessTest: built.customProviderHarnessTest,
+    customProviderHarnessTestFence: built.customProviderHarnessTestFence,
     mcpServers: built.mcpServers,
     mcpToolService: built.mcpToolService,
     ...(config.brandingDefault ? { brandingDefault: config.brandingDefault } : {}),

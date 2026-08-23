@@ -14,10 +14,17 @@ import { swallow } from "../util/errors.ts";
 import { countTokens } from "../util/tokens.ts";
 import { parseSecurityScreenVerdict, SECURITY_SCREEN_SYSTEM_PROMPT } from "../security/security-posture.ts";
 import { CodexAppServer, CodexRpcError } from "./codex-app-server.ts";
-import { defineHarness, type Harness, type HarnessTurnInput, type HarnessTurnResult } from "./harness.ts";
+import {
+  defineHarness,
+  type Harness,
+  type HarnessModelTestInput,
+  type HarnessTurnInput,
+  type HarnessTurnResult,
+} from "./harness.ts";
 import { coreToolOptions, createPiTools, type PiToolsOptions, type ToolContextRef } from "./pi-tools.ts";
 import type { McpToolDescriptor } from "../mcp/mcp-tool-service.ts";
 import { reconstructMessagesFromHistory, seedPriorTurns, type PiReplayMessage } from "./replay.ts";
+import { createModelTestProxy } from "./model-test-proxy.ts";
 
 export interface CodexHarnessOptions {
   modelId?: string | ((scope?: ScopeId) => string | undefined);
@@ -232,6 +239,7 @@ export function prepareCodexHome(source: NodeJS.ProcessEnv, jail: string): strin
 export function codexCustomRuntimeSpec(
   source: NodeJS.ProcessEnv,
   binding: CodexCustomProviderBinding | null,
+  disableRetries = false,
 ): { key: string; family: string; env: NodeJS.ProcessEnv; config: Record<string, unknown> } {
   if (!binding) return { key: "default", family: "default", env: source, config: {} };
   const env: NodeJS.ProcessEnv = { ...source, QM_CODEX_PROVIDER_KEY: binding.apiKey };
@@ -253,6 +261,7 @@ export function codexCustomRuntimeSpec(
           base_url: binding.baseUrl,
           env_key: "QM_CODEX_PROVIDER_KEY",
           wire_api: "responses",
+          ...(disableRetries ? { request_max_retries: 0, stream_max_retries: 0 } : {}),
         },
       },
     },
@@ -655,9 +664,14 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
     }
   };
 
-  const runPrompt = async (turn: HarnessTurnInput, toolsEnabled = true): Promise<HarnessTurnResult> => {
+  const runPrompt = async (
+    turn: HarnessTurnInput,
+    toolsEnabled = true,
+    disableProviderRetries = false,
+    customProvider?: HarnessModelTestInput["customProvider"],
+  ): Promise<HarnessTurnResult> => {
     if (turn.cancel?.aborted) return { reply: "", stopped: true };
-    if (turn.model && !modelSupportedByHarness(turn.model, "codex")) {
+    if (turn.model && !customProvider && !modelSupportedByHarness(turn.model, "codex")) {
       throw new NonRetryableTurnError(`Codex does not support requested model ${turn.model}`);
     }
     const wallMs = turn.turnWallClockMs ?? defaultTurnWallClockMs;
@@ -684,9 +698,25 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
     let runtimeConfig: Record<string, unknown>;
     let reservedRuntimeKey: string | null = null;
     try {
-      const binding = opts.resolveCustomProvider ? await awaitSetup(opts.resolveCustomProvider(model)) : null;
+      const customModel = customProvider?.spec.models.find((candidate) => candidate.id === model);
+      if (customProvider?.spec.protocol !== undefined && customProvider.spec.protocol !== "openai-responses")
+        throw new NonRetryableTurnError(`Codex requires an OpenAI Responses custom provider`);
+      if (customProvider && !customModel)
+        throw new NonRetryableTurnError(`Codex custom provider snapshot does not contain model ${model}`);
+      let binding: CodexCustomProviderBinding | null = null;
+      if (customProvider) {
+        binding = {
+          id: customProvider.spec.id,
+          name: customProvider.spec.name,
+          baseUrl: customProvider.spec.baseUrl,
+          apiKey: customProvider.apiKey,
+          modelId: customModel!.upstreamId?.trim() || customModel!.id,
+        };
+      } else if (opts.resolveCustomProvider) {
+        binding = await awaitSetup(opts.resolveCustomProvider(model));
+      }
       runtimeModel = binding?.modelId ?? model;
-      const spec = codexCustomRuntimeSpec(opts.env ?? {}, binding);
+      const spec = codexCustomRuntimeSpec(opts.env ?? {}, binding, disableProviderRetries);
       runtimeConfig = spec.config;
       reservedRuntimeKey = spec.key;
       reservations.set(spec.key, (reservations.get(spec.key) ?? 0) + 1);
@@ -994,6 +1024,8 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
     signal?: AbortSignal,
     observe?: Pick<HarnessTurnInput, "recordModelCall" | "recordLlmRequest">,
     modelOverride?: string,
+    disableProviderRetries = false,
+    customProvider?: HarnessModelTestInput["customProvider"],
   ): Promise<string | undefined> => {
     const session = { id: `oneshot-${randomBytes(8).toString("hex")}` } as HarnessTurnInput["session"];
     const scope = { kind: "org", id: "oneshot" } as unknown as ScopeId;
@@ -1024,6 +1056,8 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
         ...(observe?.recordLlmRequest ? { recordLlmRequest: observe.recordLlmRequest } : {}),
       },
       false,
+      disableProviderRetries,
+      customProvider,
     );
     return result.reply || undefined;
   };
@@ -1050,6 +1084,29 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
       },
       resetSession: () => {},
       oneShot: (system, prompt) => single(system, prompt),
+      testModel: async (input) => {
+        if (!input.customProvider)
+          throw new NonRetryableTurnError("Codex model test requires a custom provider snapshot");
+        const proxy = await createModelTestProxy(input.customProvider.spec.baseUrl, input.signal);
+        try {
+          const customProvider = {
+            ...input.customProvider,
+            spec: { ...input.customProvider.spec, baseUrl: proxy.baseUrl },
+          };
+          const reply = await single(
+            input.systemPrompt,
+            input.prompt,
+            input.signal,
+            undefined,
+            input.model,
+            true,
+            customProvider,
+          );
+          return reply ? { reply } : {};
+        } finally {
+          await proxy.close();
+        }
+      },
       judge: (system, prompt) => single(system, prompt, undefined, undefined, judgeModelId),
       screenSecurity: async ({ payload, signal, recordModelCall, recordLlmRequest }) =>
         parseSecurityScreenVerdict(

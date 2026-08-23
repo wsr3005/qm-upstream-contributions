@@ -205,6 +205,7 @@ test("store round-trip: upsert encrypts the key, statuses never leak it, delete 
   const raw = await backing.get("acme-gateway");
   assert.ok(raw?.apiKeyEnc);
   assert.equal(raw!.apiKeyEnc!.includes("sk-secret-123"), false);
+  assert.equal(raw?.revision, 1);
 
   assert.equal(await store.resolveKey("acme-gateway"), "sk-secret-123");
   assert.deepEqual(await store.enabled(), [GATEWAY]);
@@ -212,11 +213,13 @@ test("store round-trip: upsert encrypts the key, statuses never leak it, delete 
   // Upsert without a key keeps the existing one.
   await store.upsert({ ...GATEWAY, name: "Renamed" }, undefined, "admin@example.com");
   assert.equal(await store.resolveKey("acme-gateway"), "sk-secret-123");
+  assert.equal((await store.resolveActive("acme-gateway"))?.revision, 2);
 
   assert.equal(await store.delete("acme-gateway", "admin@example.com"), true);
   assert.equal(await store.resolveKey("acme-gateway"), null);
   assert.deepEqual(await store.enabled(), []);
   assert.equal((await store.statuses())[0]!.disabled, true);
+  assert.equal((await backing.get("acme-gateway"))?.revision, 3);
   assert.equal(await store.delete("never-existed", "admin@example.com"), false);
 });
 

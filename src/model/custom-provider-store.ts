@@ -15,6 +15,7 @@ import { validateCustomProviderSpec, type CustomProviderSpec } from "./custom-pr
 
 export const CUSTOM_PROVIDER_WIRE_ID_SCHEMA = 1;
 export const CUSTOM_PROVIDER_WIRE_ID_CAPABILITY = "custom-provider-wire-id-v1";
+export const CUSTOM_PROVIDER_HARNESS_TEST_CAPABILITY = "custom-provider-harness-test-v1";
 
 export class CustomProviderRuntimeNotReadyError extends Error {}
 
@@ -24,6 +25,7 @@ export interface StoredCustomProvider extends CustomProviderSpec {
   compatibilityDisabled?: boolean;
   runtimeSchema?: number;
   modelHistory?: string[];
+  revision?: number;
   updatedAt: number;
   updatedBy: string;
 }
@@ -35,6 +37,17 @@ interface CustomProviderStatus extends CustomProviderSpec {
   updatedBy: string;
 }
 
+export interface ActiveCustomProvider {
+  provider: CustomProviderSpec;
+  apiKey: string | null;
+  revision: number;
+}
+
+export interface CustomProviderHarnessTestState {
+  active: ActiveCustomProvider | null;
+  rolloutFence: string | null;
+}
+
 export interface CustomProviderStore {
   /** Enabled specs only — what the runtime registry should serve. */
   enabled(): Promise<CustomProviderSpec[]>;
@@ -42,7 +55,8 @@ export interface CustomProviderStore {
   statuses(): Promise<CustomProviderStatus[]>;
   /** Plaintext key for one provider, or null when absent/disabled. */
   resolveKey(id: string): Promise<string | null>;
-  resolveActive(id: string): Promise<{ provider: CustomProviderSpec; apiKey: string | null } | null>;
+  resolveActive(id: string): Promise<ActiveCustomProvider | null>;
+  harnessTestState(id: string, readRolloutFence: () => Promise<string | null>): Promise<CustomProviderHarnessTestState>;
   active(): Promise<Array<{ provider: CustomProviderSpec; apiKey: string | null }>>;
   knowsModel(id: string): Promise<boolean>;
   knownModelIds(): Promise<string[]>;
@@ -92,6 +106,15 @@ export function createCustomProviderStore(input: {
     return compatibilityEncoded(saved) && wireIdReady;
   };
   const wireIdReady = (): Promise<boolean> => runtimeSchemaReady(CUSTOM_PROVIDER_WIRE_ID_SCHEMA);
+  const resolveActive = async (id: string): Promise<ActiveCustomProvider | null> => {
+    const saved = await input.backing.get(id);
+    if (!saved || !runtimeEnabled(saved, await wireIdReady())) return null;
+    return {
+      provider: strip(saved),
+      apiKey: saved.apiKeyEnc ? decryptSecret(saved.apiKeyEnc, key) : null,
+      revision: saved.revision ?? 0,
+    };
+  };
 
   return {
     async enabled() {
@@ -120,13 +143,18 @@ export function createCustomProviderStore(input: {
       return decryptSecret(saved.apiKeyEnc, key);
     },
 
-    async resolveActive(id) {
-      const saved = await input.backing.get(id);
-      if (!saved || !runtimeEnabled(saved, await wireIdReady())) return null;
-      return {
-        provider: strip(saved),
-        apiKey: saved.apiKeyEnc ? decryptSecret(saved.apiKeyEnc, key) : null,
-      };
+    resolveActive,
+
+    async harnessTestState(id, readRolloutFence) {
+      const before = await readRolloutFence();
+      return withRegistryLock(async () => {
+        const active = await resolveActive(id);
+        const after = await readRolloutFence();
+        return {
+          active,
+          rolloutFence: before !== null && before === after ? before : null,
+        };
+      });
     },
 
     async active() {
@@ -205,6 +233,7 @@ export function createCustomProviderStore(input: {
           ...(runtimeSchema !== undefined
             ? { runtimeSchema, compatibilityDisabled: true, disabled: true }
             : { compatibilityDisabled: false, disabled: false }),
+          revision: (existing?.revision ?? 0) + 1,
           updatedAt: Date.now(),
           updatedBy: actor,
         });
@@ -219,6 +248,7 @@ export function createCustomProviderStore(input: {
           ...existing,
           disabled: true,
           compatibilityDisabled: false,
+          revision: (existing.revision ?? 0) + 1,
           updatedAt: Date.now(),
           updatedBy,
         });

@@ -1,7 +1,6 @@
 import "./support/auto-fake-sprites.ts";
 
 import assert from "node:assert/strict";
-import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -12,18 +11,17 @@ import { buildApp, type BuiltApp } from "../src/wiring.ts";
 import { testConfig } from "./support/test-config.ts";
 import { resolveModel } from "../src/model/pi-models.ts";
 import { setCustomProviders } from "../src/model/custom-providers.ts";
-import { mintPortalIdentity } from "../plugins/chassis/src/portal-identity.ts";
 
 const ADMIN = { "content-type": "application/json", "x-admin-actor": "admin-alice@default-org" };
 const USER = { "content-type": "application/json", "x-admin-actor": "bob@default-org" };
-const PROD_PORTAL_IDENTITY_SECRET = "custom-provider-production-portal-identity-secret";
 
 afterEach(() => setCustomProviders([], []));
 
 function start(
   modelCredentialFetch: typeof fetch = async () => new Response(null, { status: 200 }),
   runtimeSchemaReady?: boolean,
-  production = false,
+  customProviderHarnessTest?: BuiltApp["customProviderHarnessTest"],
+  customProviderHarnessTestFence?: BuiltApp["customProviderHarnessTestFence"],
 ): {
   base: string;
   built: BuiltApp;
@@ -41,9 +39,9 @@ function start(
     modelCredentials: built.modelCredentials,
     customProviders: built.customProviders,
     refreshCustomProviders: built.refreshCustomProviders,
+    customProviderHarnessTest: customProviderHarnessTest ?? built.customProviderHarnessTest,
+    customProviderHarnessTestFence: customProviderHarnessTestFence ?? built.customProviderHarnessTestFence,
     modelCredentialFetch,
-    production,
-    ...(production ? { portalIdentitySecret: PROD_PORTAL_IDENTITY_SECRET } : {}),
     harnessId: "pi",
     providerKeys: { anthropic: true, openai: false, openrouter: false },
     admin: built.admin,
@@ -56,67 +54,6 @@ function start(
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   };
 }
-
-test("production closes the legacy paid test endpoint before a mixed-version rollout", async () => {
-  let upstreamRequests = 0;
-  const upstream = createServer((_req, res) => {
-    upstreamRequests += 1;
-    res.writeHead(500, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: { message: "must not be called" } }));
-  });
-  await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
-  const upstreamUrl = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}/v1`;
-  const srv = start(undefined, undefined, true);
-  try {
-    await srv.built.customProviders.upsert(
-      {
-        id: "acme-gateway",
-        name: "Acme Gateway",
-        protocol: "openai",
-        baseUrl: upstreamUrl,
-        models: [{ id: "acme-large" }],
-      },
-      "sk-production-guard",
-      "admin-alice",
-    );
-    await srv.built.refreshCustomProviders();
-    let providerReads = 0;
-    const resolveActive = srv.built.customProviders.resolveActive.bind(srv.built.customProviders);
-    srv.built.customProviders.resolveActive = async (id) => {
-      providerReads += 1;
-      return resolveActive(id);
-    };
-    const request = (identity?: string) =>
-      fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/test`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          ...(identity ? { "x-portal-identity": identity } : {}),
-        },
-        body: JSON.stringify({ modelId: "acme-large" }),
-      });
-    const unauthenticated = await request();
-    assert.equal(unauthenticated.status, 401);
-    const nonAdmin = await request(
-      mintPortalIdentity({ p: "bob", exp: Date.now() + 60_000 }, PROD_PORTAL_IDENTITY_SECRET),
-    );
-    assert.equal(nonAdmin.status, 403);
-    const tested = await request(
-      mintPortalIdentity({ p: "admin-alice", exp: Date.now() + 60_000 }, PROD_PORTAL_IDENTITY_SECRET),
-    );
-    assert.equal(tested.status, 409);
-    assert.equal(((await tested.json()) as { error: string }).error, "harness_test_rollout_incomplete");
-    assert.equal(providerReads, 0);
-    assert.equal(upstreamRequests, 0);
-    assert.equal(
-      (await srv.built.auditLog.events()).some((event) => event.action === "custom-providers.test"),
-      false,
-    );
-  } finally {
-    await srv.close();
-    await new Promise<void>((resolve) => upstream.close(() => resolve()));
-  }
-});
 
 const BODY = {
   name: "Acme Gateway",
@@ -158,7 +95,7 @@ test("custom provider lifecycle: register, list, resolve, delete — admin only,
     // Non-admin gets refused.
     const denied = await fetch(`${srv.base}/v1/admin/custom-providers`, { headers: USER });
     assert.notEqual(denied.status, 200);
-    const deniedTest = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/test`, {
+    const deniedTest = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/harness-test`, {
       method: "POST",
       headers: USER,
       body: JSON.stringify({ modelId: "acme-large" }),
@@ -186,7 +123,7 @@ test("generation self-test requires an active stored key", async () => {
       body: JSON.stringify({ ...BODY, apiKey: undefined, validate: false }),
     });
     assert.equal(put.status, 200);
-    const tested = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/test`, {
+    const tested = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/harness-test`, {
       method: "POST",
       headers: ADMIN,
       body: JSON.stringify({ modelId: "acme-large" }),
@@ -194,6 +131,362 @@ test("generation self-test requires an active stored key", async () => {
     assert.equal(tested.status, 400);
     assert.equal(((await tested.json()) as { error: string }).error, "missing_api_key");
   } finally {
+    await srv.close();
+  }
+});
+
+test("generation self-test dispatches the selected real harness", async () => {
+  const calls: Array<{ harnessId: string; modelId: string }> = [];
+  const srv = start(undefined, undefined, async (input) => {
+    calls.push({ harnessId: input.harnessId, modelId: input.modelId });
+    return {
+      reply: `${input.harnessId} ready`,
+      providerRevision: input.expectedRevision,
+      upstreamModelId: input.modelId,
+    };
+  });
+  try {
+    const put = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify({
+        ...BODY,
+        protocol: "openai-responses",
+        models: [{ id: "responses-model" }],
+        validate: false,
+      }),
+    });
+    assert.equal(put.status, 200);
+
+    for (const harness of ["pi", "opencode", "codex"]) {
+      const tested = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/harness-test`, {
+        method: "POST",
+        headers: ADMIN,
+        body: JSON.stringify({ modelId: "responses-model", harness }),
+      });
+      assert.equal(tested.status, 200);
+      const result = (await tested.json()) as { harness: string; reply: string };
+      assert.equal(result.harness, harness);
+      assert.equal(result.reply, `${harness} ready`);
+    }
+    assert.deepEqual(calls, [
+      { harnessId: "pi", modelId: "responses-model" },
+      { harnessId: "opencode", modelId: "responses-model" },
+      { harnessId: "codex", modelId: "responses-model" },
+    ]);
+
+    const invalid = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/harness-test`, {
+      method: "POST",
+      headers: ADMIN,
+      body: JSON.stringify({ modelId: "responses-model", harness: "slack" }),
+    });
+    assert.equal(invalid.status, 400);
+    assert.equal(calls.length, 3);
+
+    const chatOnly = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify({ ...BODY, models: [{ id: "responses-model" }], validate: false }),
+    });
+    assert.equal(chatOnly.status, 200);
+    const unsupported = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/harness-test`, {
+      method: "POST",
+      headers: ADMIN,
+      body: JSON.stringify({ modelId: "responses-model", harness: "codex" }),
+    });
+    assert.equal(unsupported.status, 400);
+    assert.equal(((await unsupported.json()) as { error: string }).error, "harness_not_supported");
+    assert.equal(calls.length, 3);
+  } finally {
+    await srv.close();
+  }
+});
+
+test("generation self-test stays closed until every live runtime supports its protocol", async () => {
+  let calls = 0;
+  const srv = start(
+    undefined,
+    undefined,
+    async (input) => {
+      calls += 1;
+      return {
+        reply: "ready",
+        providerRevision: input.expectedRevision,
+        upstreamModelId: input.modelId,
+      };
+    },
+    async () => null,
+  );
+  try {
+    const put = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify({ ...BODY, validate: false }),
+    });
+    assert.equal(put.status, 200);
+
+    const tested = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/harness-test`, {
+      method: "POST",
+      headers: ADMIN,
+      body: JSON.stringify({ modelId: "acme-large", harness: "pi" }),
+    });
+    assert.equal(tested.status, 409);
+    assert.equal(((await tested.json()) as { error: string }).error, "harness_test_rollout_incomplete");
+    assert.equal(calls, 0);
+
+    const legacy = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/test`, {
+      method: "POST",
+      headers: ADMIN,
+      body: JSON.stringify({ modelId: "acme-large" }),
+    });
+    assert.equal(legacy.status, 404);
+  } finally {
+    await srv.close();
+  }
+});
+
+test("generation self-test cannot report success when the rollout fence changes in flight", async () => {
+  let rolloutFence = "epoch-1";
+  let notifyStarted!: () => void;
+  let releaseRunner!: () => void;
+  const started = new Promise<void>((resolve) => {
+    notifyStarted = resolve;
+  });
+  const released = new Promise<void>((resolve) => {
+    releaseRunner = resolve;
+  });
+  const srv = start(
+    undefined,
+    undefined,
+    async (input) => {
+      notifyStarted();
+      await released;
+      return {
+        reply: "ready",
+        providerRevision: input.expectedRevision,
+        upstreamModelId: input.modelId,
+      };
+    },
+    async () => rolloutFence,
+  );
+  try {
+    const put = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify({ ...BODY, validate: false }),
+    });
+    assert.equal(put.status, 200);
+
+    const pending = fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/harness-test`, {
+      method: "POST",
+      headers: ADMIN,
+      body: JSON.stringify({ modelId: "acme-large", harness: "pi" }),
+    });
+    await started;
+    rolloutFence = "epoch-2";
+    releaseRunner();
+
+    const tested = await pending;
+    assert.equal(tested.status, 409);
+    assert.equal(((await tested.json()) as { error: string }).error, "harness_test_rollout_incomplete");
+    const audits = (await srv.built.auditLog.events()).filter((event) => event.action === "custom-providers.test");
+    assert.deepEqual(
+      audits.map((event) => event.status),
+      ["attempted", "failed"],
+    );
+  } finally {
+    releaseRunner();
+    await srv.close();
+  }
+});
+
+test("generation self-test sees a provider update completed during its final fence read", async () => {
+  let runnerFinished = false;
+  let finalFenceBlocked = false;
+  let notifyFinalFence!: () => void;
+  let releaseFinalFence!: () => void;
+  const finalFenceStarted = new Promise<void>((resolve) => {
+    notifyFinalFence = resolve;
+  });
+  const finalFenceReleased = new Promise<void>((resolve) => {
+    releaseFinalFence = resolve;
+  });
+  const srv = start(
+    undefined,
+    undefined,
+    async (input) => {
+      runnerFinished = true;
+      return {
+        reply: "old revision ready",
+        providerRevision: input.expectedRevision,
+        upstreamModelId: "wire-old",
+      };
+    },
+    async () => {
+      if (runnerFinished && !finalFenceBlocked) {
+        finalFenceBlocked = true;
+        notifyFinalFence();
+        await finalFenceReleased;
+      }
+      return "epoch-1";
+    },
+  );
+  try {
+    const put = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify({
+        ...BODY,
+        protocol: "openai-responses",
+        models: [{ id: "race-model", upstreamId: "wire-old" }],
+        validate: false,
+      }),
+    });
+    assert.equal(put.status, 200);
+
+    const pending = fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/harness-test`, {
+      method: "POST",
+      headers: ADMIN,
+      body: JSON.stringify({ modelId: "race-model", harness: "pi" }),
+    });
+    await finalFenceStarted;
+    const update = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify({
+        ...BODY,
+        protocol: "openai-responses",
+        apiKey: "sk-new-secret",
+        models: [{ id: "race-model", upstreamId: "wire-new" }],
+        validate: false,
+      }),
+    });
+    assert.equal(update.status, 200);
+    releaseFinalFence();
+
+    const tested = await pending;
+    assert.equal(tested.status, 409);
+    assert.equal(((await tested.json()) as { error: string }).error, "provider_changed_during_test");
+    const audits = (await srv.built.auditLog.events()).filter((event) => event.action === "custom-providers.test");
+    assert.deepEqual(
+      audits.map((event) => event.status),
+      ["attempted", "failed"],
+    );
+  } finally {
+    releaseFinalFence();
+    await srv.close();
+  }
+});
+
+test("generation self-test sees a rollout change between its final fence and provider snapshots", async () => {
+  let runnerFinished = false;
+  let finalFenceReads = 0;
+  const srv = start(
+    undefined,
+    undefined,
+    async (input) => {
+      runnerFinished = true;
+      return {
+        reply: "ready",
+        providerRevision: input.expectedRevision,
+        upstreamModelId: input.modelId,
+      };
+    },
+    async () => {
+      if (!runnerFinished) return "epoch-1";
+      finalFenceReads += 1;
+      return finalFenceReads === 1 ? "epoch-1" : "epoch-2";
+    },
+  );
+  try {
+    const put = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify({ ...BODY, validate: false }),
+    });
+    assert.equal(put.status, 200);
+
+    const tested = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/harness-test`, {
+      method: "POST",
+      headers: ADMIN,
+      body: JSON.stringify({ modelId: "acme-large", harness: "pi" }),
+    });
+    assert.equal(tested.status, 409);
+    assert.equal(((await tested.json()) as { error: string }).error, "harness_test_rollout_incomplete");
+    assert.equal(finalFenceReads, 2);
+    const audits = (await srv.built.auditLog.events()).filter((event) => event.action === "custom-providers.test");
+    assert.deepEqual(
+      audits.map((event) => event.status),
+      ["attempted", "failed"],
+    );
+  } finally {
+    await srv.close();
+  }
+});
+
+test("generation self-test cannot report success for a provider revision changed in flight", async () => {
+  let notifyStarted!: () => void;
+  let releaseRunner!: () => void;
+  const started = new Promise<void>((resolve) => {
+    notifyStarted = resolve;
+  });
+  const released = new Promise<void>((resolve) => {
+    releaseRunner = resolve;
+  });
+  const srv = start(undefined, undefined, async (input) => {
+    notifyStarted();
+    await released;
+    return {
+      reply: "old revision ready",
+      providerRevision: input.expectedRevision,
+      upstreamModelId: "wire-old",
+    };
+  });
+  try {
+    const put = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify({
+        ...BODY,
+        protocol: "openai-responses",
+        models: [{ id: "race-model", upstreamId: "wire-old" }],
+        validate: false,
+      }),
+    });
+    assert.equal(put.status, 200);
+
+    const pending = fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/harness-test`, {
+      method: "POST",
+      headers: ADMIN,
+      body: JSON.stringify({ modelId: "race-model", harness: "pi" }),
+    });
+    await started;
+
+    const update = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify({
+        ...BODY,
+        protocol: "openai-responses",
+        apiKey: "sk-new-secret",
+        models: [{ id: "race-model", upstreamId: "wire-new" }],
+        validate: false,
+      }),
+    });
+    assert.equal(update.status, 200);
+    releaseRunner();
+
+    const tested = await pending;
+    assert.equal(tested.status, 409);
+    assert.equal(((await tested.json()) as { error: string }).error, "provider_changed_during_test");
+    const audits = (await srv.built.auditLog.events()).filter((event) => event.action === "custom-providers.test");
+    assert.deepEqual(
+      audits.map((event) => event.status),
+      ["attempted", "failed"],
+    );
+    assert.ok(audits.every((event) => event.detail?.includes("upstreamModelId=wire-old")));
+  } finally {
+    releaseRunner();
     await srv.close();
   }
 });
@@ -262,7 +555,7 @@ test("null JSON bodies return a client error", async () => {
     assert.equal(put.status, 400);
     assert.equal(((await put.json()) as { error: string }).error, "bad_request");
 
-    const tested = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/test`, {
+    const tested = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/harness-test`, {
       method: "POST",
       headers: ADMIN,
       body: "null",

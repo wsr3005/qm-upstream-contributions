@@ -3980,12 +3980,16 @@
                     placeholder="Write-only; blank on edit keeps the stored key"
                 /></label>
                 <label
-                  >Models (one per line: id | name | context | maxTokens)
+                  >Models (one per line: local id | name | context | maxTokens | upstream id)
                   <textarea
                     id="custom-provider-models"
                     rows="3"
-                    placeholder="deepseek-chat | DeepSeek V3.2 | 128000 | 8192"
+                    placeholder="gpt-5.6-luna | GPT 5.6 Luna | 1050000 | 128000"
                   ></textarea>
+                  <small
+                    >The optional fifth value overrides the model id sent upstream. Built-in id conflicts are namespaced
+                    automatically.</small
+                  >
                 </label>
                 <label class="inline"
                   ><input type="checkbox" id="custom-provider-validate" checked /> Validate key against the endpoint
@@ -4001,13 +4005,22 @@
                   >Test a saved model
                   <select id="custom-provider-test-model"></select
                 ></label>
+                <label
+                  >Harness
+                  <select id="custom-provider-test-harness">
+                    <option value="pi">Pi</option>
+                    <option value="opencode">OpenCode</option>
+                    <option value="codex">Codex</option>
+                  </select></label
+                >
                 <p class="muted">
-                  This sends one real generation request to the saved endpoint, capped at 128 output tokens, and may
-                  incur charges.
+                  Each run sends at most one real billable model request through the selected Harness. Pi is capped at
+                  128 output tokens; OpenCode and Codex use their native runtime limits. Automatic provider retries are
+                  disabled.
                 </p>
               </div>
               <div class="foot">
-                <button id="custom-provider-test">Run paid generation test</button
+                <button id="custom-provider-test">Run paid Harness test</button
                 ><span class="status" id="st-custom-provider-test" role="status" aria-live="polite"></span>
               </div>
             </section>
@@ -7361,11 +7374,12 @@
           .map((line) => line.trim())
           .filter(Boolean)
           .map((line) => {
-            const [id, name, contextWindow, maxTokens] = line.split("|").map((part) => part.trim());
+            const [id, name, contextWindow, maxTokens, upstreamId] = line.split("|").map((part) => part.trim());
             const model = { id };
             if (name) model.name = name;
             if (contextWindow) model.contextWindow = Number(contextWindow);
             if (maxTokens) model.maxTokens = Number(maxTokens);
+            if (upstreamId) model.upstreamId = upstreamId;
             return model;
           });
       }
@@ -7374,7 +7388,13 @@
         if (!res.ok) return;
         customProvidersLoaded = (res.data?.providers || []).filter((provider) => !provider.disabled);
         customProviderTestTargets = customProvidersLoaded.flatMap((provider) =>
-          provider.models.map((model) => ({ providerId: provider.id, providerName: provider.name, modelId: model.id })),
+          provider.models.map((model) => ({
+            providerId: provider.id,
+            providerName: provider.name,
+            protocol: provider.protocol,
+            modelId: model.id,
+            upstreamModelId: model.upstreamId || model.id,
+          })),
         );
         const testSelect = $("custom-provider-test-model");
         testSelect.textContent = "";
@@ -7384,6 +7404,7 @@
           option.textContent = target.providerName + " · " + target.modelId;
           testSelect.appendChild(option);
         });
+        syncCustomProviderTestHarnesses();
         $("custom-provider-test").disabled = customProviderTestTargets.length === 0;
         const rows = $("custom-provider-rows");
         rows.textContent = "";
@@ -7398,7 +7419,9 @@
               "openai-responses": "OpenAI Responses",
             }[provider.protocol] || provider.protocol,
             provider.baseUrl,
-            provider.models.map((model) => model.id).join(", "),
+            provider.models
+              .map((model) => (model.upstreamId ? model.id + " → " + model.upstreamId : model.id))
+              .join(", "),
             provider.hasKey ? "set (write-only)" : "none",
           ];
           cells.forEach((textContent) => {
@@ -7417,7 +7440,10 @@
             $("custom-provider-key").value = "";
             $("custom-provider-models").value = provider.models
               .map((model) =>
-                [model.id, model.name, model.contextWindow, model.maxTokens].filter((part) => part != null).join(" | "),
+                [model.id, model.name, model.contextWindow, model.maxTokens, model.upstreamId]
+                  .map((part) => part ?? "")
+                  .join(" | ")
+                  .replace(/(?: \| )+$/, ""),
               )
               .join("\n");
           };
@@ -7440,6 +7466,30 @@
           rows.appendChild(tr);
         });
       }
+      function customProviderTestResultText(data, target) {
+        const reply = String(data?.reply || "").trim();
+        const testedModelId = String(data?.modelId || target.modelId);
+        const testedUpstreamModelId = String(data?.upstreamModelId || testedModelId);
+        return (
+          data.harness +
+          " · " +
+          testedModelId +
+          (testedUpstreamModelId !== testedModelId ? " → " + testedUpstreamModelId : "") +
+          " replied in " +
+          data.latencyMs +
+          " ms: " +
+          reply.slice(0, 300)
+        );
+      }
+      function syncCustomProviderTestHarnesses() {
+        const target = customProviderTestTargets[Number($("custom-provider-test-model").value)];
+        const select = $("custom-provider-test-harness");
+        Array.from(select.options).forEach((option) => {
+          option.disabled = option.value === "codex" && target?.protocol !== "openai-responses";
+        });
+        if (select.selectedOptions[0]?.disabled) select.value = "pi";
+      }
+      $("custom-provider-test-model").onchange = syncCustomProviderTestHarnesses;
       $("custom-provider-save").onclick = async () => {
         const id = $("custom-provider-id").value.trim();
         const name = $("custom-provider-name").value.trim();
@@ -7477,12 +7527,18 @@
           return;
         }
         $("custom-provider-test").disabled = true;
-        setStatus("st-custom-provider-test", "Sending a real paid generation request…", "saving", true);
+        const harness = $("custom-provider-test-harness").value;
+        setStatus("st-custom-provider-test", "Running a real paid " + harness + " test turn…", "saving", true);
         let tested;
         try {
-          tested = await api("POST", "/api/custom-providers/" + encodeURIComponent(target.providerId) + "/test", {
-            modelId: target.modelId,
-          });
+          tested = await api(
+            "POST",
+            "/api/custom-providers/" + encodeURIComponent(target.providerId) + "/harness-test",
+            {
+              modelId: target.modelId,
+              harness,
+            },
+          );
         } catch {
           setStatus("st-custom-provider-test", "The generation test could not reach QM.", "err", true);
           return;
@@ -7493,12 +7549,7 @@
           setStatus("st-custom-provider-test", tested.data?.message || "The generation test failed.", "err", true);
           return;
         }
-        const reply = String(tested.data?.reply || "").trim();
-        setStatus(
-          "st-custom-provider-test",
-          target.modelId + " replied in " + tested.data.latencyMs + " ms: " + reply.slice(0, 300),
-          "ok",
-        );
+        setStatus("st-custom-provider-test", customProviderTestResultText(tested.data, target), "ok");
       };
       function openOnboardingTarget(target) {
         setView("connectors");

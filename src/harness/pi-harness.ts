@@ -89,6 +89,7 @@ import { parseSecurityScreenVerdict, SECURITY_SCREEN_SYSTEM_PROMPT } from "../se
 import { errMessage } from "../util/errors.ts";
 import { createGrindMeter, meterGrindCall } from "./grind.ts";
 import { enforceGoal, goalSteeringNote, meterGoalCall, type GoalRecord } from "./goal.ts";
+import { createModelTestProxy } from "./model-test-proxy.ts";
 
 export interface PiHarnessOptions {
   modelId?: string | ((scope?: ScopeId) => string | undefined);
@@ -2138,6 +2139,38 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
         return oneShot("pi-oneshot", model, providerRuntime.keys, systemPrompt, prompt, {
           customProviders: providerRuntime.customProviders,
         });
+      },
+
+      async testModel(input) {
+        const proxy = input.customProvider
+          ? await createModelTestProxy(input.customProvider.spec.baseUrl, input.signal)
+          : null;
+        try {
+          const customProvider =
+            input.customProvider && proxy
+              ? {
+                  ...input.customProvider,
+                  spec: { ...input.customProvider.spec, baseUrl: proxy.baseUrl },
+                }
+              : input.customProvider;
+          const providerRuntime = customProvider
+            ? {
+                keys: { [customProvider.spec.id]: customProvider.apiKey },
+                customProviders: [customProvider.spec],
+              }
+            : await resolveProviderRuntime();
+          const resolved = modelForRuntime(input.model, providerRuntime);
+          if (!keyForModel(providerRuntime.keys, resolved)) return {};
+          const model = { ...resolved, maxTokens: Math.min(resolved.maxTokens, 128) };
+          const reply = await oneShot("pi-model-test", model, providerRuntime.keys, input.systemPrompt, input.prompt, {
+            ...(input.signal ? { signal: input.signal } : {}),
+            disableRetries: true,
+            customProviders: providerRuntime.customProviders,
+          });
+          return { ...(reply ? { reply } : {}), maxOutputTokens: model.maxTokens };
+        } finally {
+          await proxy?.close();
+        }
       },
 
       async judge(systemPrompt: string, prompt: string): Promise<string | undefined> {

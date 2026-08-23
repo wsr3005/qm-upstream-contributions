@@ -22,6 +22,7 @@ import {
   defineHarness,
   envelopeWithoutMessages,
   type Harness,
+  type HarnessModelTestInput,
   type HarnessTurnInput,
   type HarnessTurnResult,
 } from "./harness.ts";
@@ -30,6 +31,7 @@ import type { McpToolDescriptor } from "../mcp/mcp-tool-service.ts";
 import { reconstructMessagesFromHistory } from "./replay.ts";
 import { parseSecurityScreenVerdict, SECURITY_SCREEN_SYSTEM_PROMPT } from "../security/security-posture.ts";
 import { countTokens } from "../util/tokens.ts";
+import { createModelTestProxy } from "./model-test-proxy.ts";
 
 const OPENCODE_VERSION = "1.17.18";
 const OPENCODE_IDLE_WAIT_MS = 30 * 60_000;
@@ -500,11 +502,13 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
     if (candidate?.retired && !runtimeInUse(candidate)) await closeRuntime(candidate).catch(() => undefined);
   };
 
-  const resolveRuntimeSpec = async () => {
-    const custom = (await opts.resolveCustomProviders?.()) ?? [];
+  const resolveRuntimeSpec = async (customProvider?: HarnessModelTestInput["customProvider"], toolsEnabled = true) => {
+    const custom = customProvider
+      ? [{ spec: customProvider.spec, apiKey: customProvider.apiKey }]
+      : ((await opts.resolveCustomProviders?.()) ?? []);
     custom.sort((left, right) => left.spec.id.localeCompare(right.spec.id));
-    const key = createHash("sha256").update(JSON.stringify(custom)).digest("hex");
-    return { key, custom };
+    const key = createHash("sha256").update(JSON.stringify({ custom, toolsEnabled })).digest("hex");
+    return { key, custom, toolsEnabled };
   };
 
   const childState = (parent: ActiveTurn): ActiveTurn => ({
@@ -696,7 +700,7 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
         if (!address || typeof address === "string") throw new Error("failed to bind OpenCode bridge");
         const bridgeUrl = `http://127.0.0.1:${address.port}`;
         const pluginUrl = pathToFileURL(join(import.meta.dirname, "opencode-plugin.ts")).href;
-        const enabledTools = Object.fromEntries(definitions.map((item) => [item.name, true]));
+        const enabledTools = Object.fromEntries(definitions.map((item) => [item.name, spec.toolsEnabled]));
         const custom = spec.custom;
         const customProviderConfig = Object.fromEntries(
           custom.map(({ spec, apiKey }) => {
@@ -741,7 +745,7 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
           },
           tools: {
             ...enabledTools,
-            task: true,
+            task: spec.toolsEnabled,
             read: false,
             write: false,
             bash: false,
@@ -772,7 +776,7 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
             doom_loop: "deny",
           },
           agent: {
-            qm: { mode: "primary", prompt: "", tools: { ...enabledTools, task: true } },
+            qm: { mode: "primary", prompt: "", tools: { ...enabledTools, task: spec.toolsEnabled } },
             research: {
               mode: "subagent",
               description: "Research a bounded question and report evidence.",
@@ -889,13 +893,20 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
     }
   };
 
-  const runPrompt = async (turn: HarnessTurnInput): Promise<HarnessTurnResult> => {
+  const runPrompt = async (
+    turn: HarnessTurnInput,
+    customProvider?: HarnessModelTestInput["customProvider"],
+    toolsEnabled = true,
+  ): Promise<HarnessTurnResult> => {
     if (turn.cancel?.aborted) return { reply: "", stopped: true };
-    if (turn.model && !modelSupportedByHarness(turn.model, "opencode")) {
+    if (turn.model && !customProvider && !modelSupportedByHarness(turn.model, "opencode")) {
       throw new NonRetryableTurnError(`OpenCode does not support requested model ${turn.model}`);
     }
     const selectedModel = turn.model ?? resolveModelId(turn.scopeLabel);
-    const runtimeSpec = await resolveRuntimeSpec();
+    const selectedCustomModel = customProvider?.spec.models.find((candidate) => candidate.id === selectedModel);
+    if (customProvider && !selectedCustomModel)
+      throw new NonRetryableTurnError(`OpenCode custom provider snapshot does not contain model ${selectedModel}`);
+    const runtimeSpec = await resolveRuntimeSpec(customProvider, toolsEnabled);
     reservations.set(runtimeSpec.key, (reservations.get(runtimeSpec.key) ?? 0) + 1);
     let rt: Runtime;
     try {
@@ -908,7 +919,12 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
       await releaseReservation(runtimeSpec.key);
       return { reply: "", stopped: true };
     }
-    const model = modelRef(selectedModel);
+    const model = customProvider
+      ? {
+          providerID: customProvider.spec.id,
+          modelID: selectedCustomModel!.upstreamId?.trim() || selectedCustomModel!.id,
+        }
+      : modelRef(selectedModel);
     let created;
     try {
       created = await rt.client.session.create({ body: { title: `qm:${turn.session.id}` } });
@@ -944,7 +960,7 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
       };
       const controller = new AbortController();
       ref.abortSignal = controller.signal;
-      const tools = asTools(ref, toolOptions(opts, turn));
+      const tools = toolsEnabled ? asTools(ref, toolOptions(opts, turn)) : [];
       prepared = {
         ref,
         controller,
@@ -1104,7 +1120,7 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
     ];
     const enabled = Object.fromEntries(definitions.map((tool) => [tool.name, false]));
     for (const name of state.tools.keys()) enabled[name] = true;
-    enabled.task = !turn.readOnly;
+    enabled.task = toolsEnabled && !turn.readOnly;
     let timer: NodeJS.Timeout | undefined;
     let signalsStopped = false;
     try {
@@ -1215,33 +1231,41 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
     prompt: string,
     instrumentation?: Pick<HarnessTurnInput, "recordModelCall" | "recordLlmRequest">,
     signal?: AbortSignal,
+    modelOverride?: string,
+    customProvider?: HarnessModelTestInput["customProvider"],
+    toolsEnabled = true,
   ): Promise<string | undefined> => {
     const session = { id: `oneshot-${randomBytes(8).toString("hex")}` } as HarnessTurnInput["session"];
     const scope = { kind: "org", id: "oneshot" } as unknown as ScopeId;
     const emitted: SessionEntry[] = [];
-    const result = await runPrompt({
-      session,
-      input: prompt,
-      systemPrompt: system,
-      history: [],
-      tools: {} as HarnessTurnInput["tools"],
-      scopeLabel: scope,
-      orgScopeId: scope,
-      ...(signal ? { cancel: signal } : {}),
-      emit: async (entry) => {
-        const saved = {
-          ...entry,
-          sessionId: session.id,
-          seq: emitted.length + 1,
-          createdAt: Date.now(),
-        } as SessionEntry;
-        emitted.push(saved);
-        return saved;
+    const result = await runPrompt(
+      {
+        session,
+        input: prompt,
+        systemPrompt: system,
+        history: [],
+        tools: {} as HarnessTurnInput["tools"],
+        scopeLabel: scope,
+        orgScopeId: scope,
+        ...(signal ? { cancel: signal } : {}),
+        ...(modelOverride ? { model: modelOverride } : {}),
+        emit: async (entry) => {
+          const saved = {
+            ...entry,
+            sessionId: session.id,
+            seq: emitted.length + 1,
+            createdAt: Date.now(),
+          } as SessionEntry;
+          emitted.push(saved);
+          return saved;
+        },
+        recordModelCall: instrumentation?.recordModelCall ?? (() => {}),
+        ...(instrumentation?.recordLlmRequest ? { recordLlmRequest: instrumentation.recordLlmRequest } : {}),
+        readOnly: true,
       },
-      recordModelCall: instrumentation?.recordModelCall ?? (() => {}),
-      ...(instrumentation?.recordLlmRequest ? { recordLlmRequest: instrumentation.recordLlmRequest } : {}),
-      readOnly: true,
-    });
+      customProvider,
+      toolsEnabled,
+    );
     return result.reply || undefined;
   };
 
@@ -1256,11 +1280,34 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
     {
       runTurn: runPrompt,
       close: async () => {
-        await Promise.allSettled([...starting.values()]);
+        await Promise.allSettled(starting.values());
         await Promise.all([...runtimes.values()].map((runtime) => closeRuntime(runtime).catch(() => undefined)));
       },
       resetSession: () => {},
       oneShot: single,
+      testModel: async (input) => {
+        if (!input.customProvider)
+          throw new NonRetryableTurnError("OpenCode model test requires a custom provider snapshot");
+        const proxy = await createModelTestProxy(input.customProvider.spec.baseUrl, input.signal);
+        try {
+          const customProvider = {
+            ...input.customProvider,
+            spec: { ...input.customProvider.spec, baseUrl: proxy.baseUrl },
+          };
+          const reply = await single(
+            input.systemPrompt,
+            input.prompt,
+            undefined,
+            input.signal,
+            input.model,
+            customProvider,
+            false,
+          );
+          return reply ? { reply } : {};
+        } finally {
+          await proxy.close();
+        }
+      },
       judge: single,
       screenSecurity: async ({ payload, signal, recordModelCall, recordLlmRequest }) =>
         parseSecurityScreenVerdict(

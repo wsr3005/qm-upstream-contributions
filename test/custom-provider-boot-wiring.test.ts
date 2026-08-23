@@ -11,6 +11,7 @@ import { buildApp, serverDeps } from "../src/wiring.ts";
 import { testConfig } from "./support/test-config.ts";
 import { defaultModelForHarness } from "../src/model/pi-models.ts";
 import { setCustomProviders } from "../src/model/custom-providers.ts";
+import { CUSTOM_PROVIDER_HARNESS_TEST_CAPABILITY } from "../src/model/custom-provider-store.ts";
 
 const ADMIN = { "content-type": "application/json", "x-admin-actor": "admin-alice@default-org" };
 
@@ -41,6 +42,7 @@ test("serverDeps wires the custom-provider store and resolves a custom boot defa
   const deps = serverDeps(config, built);
   assert.equal(deps.customProviders, built.customProviders);
   assert.equal(deps.refreshCustomProviders, built.refreshCustomProviders);
+  assert.equal(deps.customProviderHarnessTestFence, built.customProviderHarnessTestFence);
   assert.equal(deps.baseModelDefault, "acme-large");
 
   const server = createInsecureTestServer(built.app, deps);
@@ -103,6 +105,31 @@ test("serverDeps wires the custom-provider store and resolves a custom boot defa
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
+});
+
+test("production harness testing returns a stable fence only when every live runtime advertises the B protocol", async () => {
+  let allCapable = false;
+  const checked: string[] = [];
+  const built = buildApp(
+    testConfig({
+      dataDir: mkdtempSync(join(tmpdir(), "custom-provider-capability-")),
+      production: true,
+    }),
+    {
+      instanceRegistry: {
+        beat: async () => false,
+        capabilitySnapshot: async (capability) => {
+          checked.push(capability);
+          return { ready: allCapable, epoch: "epoch-7" };
+        },
+      },
+    },
+  );
+
+  assert.equal(await built.customProviderHarnessTestFence(), null);
+  allCapable = true;
+  assert.equal(await built.customProviderHarnessTestFence(), "epoch-7");
+  assert.equal(checked.filter((capability) => capability === CUSTOM_PROVIDER_HARNESS_TEST_CAPABILITY).length, 2);
 });
 
 test("web turns refresh durable custom providers before runtime validation", async () => {

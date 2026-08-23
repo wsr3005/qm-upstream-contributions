@@ -35,24 +35,24 @@ test.after(() => {
   if (core.listening) core.close();
 });
 
-test("POST /api/custom-providers/:id/test forwards the paid model test with admin attribution", async () => {
-  const response = await fetch(`${base}/api/custom-providers/gateway/test`, {
+test("POST /api/custom-providers/:id/harness-test forwards the paid model test with admin attribution", async () => {
+  const response = await fetch(`${base}/api/custom-providers/gateway/harness-test`, {
     method: "POST",
     headers: { cookie: "admin=U-admin", "content-type": "application/json" },
-    body: JSON.stringify({ modelId: "gpt-5.6-luna" }),
+    body: JSON.stringify({ modelId: "gpt-5.6-luna", harness: "codex" }),
   });
   assert.equal(response.status, 200);
   const call = calls.at(-1)!;
   assert.equal(call.method, "POST");
-  assert.equal(call.url, "/v1/admin/custom-providers/gateway/test");
+  assert.equal(call.url, "/v1/admin/custom-providers/gateway/harness-test");
   assert.equal(call.actor, "U-admin@acme");
   assert.equal(call.signed, true);
-  assert.deepEqual(JSON.parse(call.body), { modelId: "gpt-5.6-luna" });
+  assert.deepEqual(JSON.parse(call.body), { modelId: "gpt-5.6-luna", harness: "codex" });
 });
 
 test("the paid model test rejects signed-out callers before reaching core", async () => {
   const before = calls.length;
-  const response = await fetch(`${base}/api/custom-providers/gateway/test`, {
+  const response = await fetch(`${base}/api/custom-providers/gateway/harness-test`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ modelId: "gpt-5.6-luna" }),

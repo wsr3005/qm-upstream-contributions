@@ -12,6 +12,7 @@ export type { GapWork } from "../sessions/session-store.ts";
 import type { OverheardEntryPayload } from "./replay.ts";
 import type { ToolContext } from "../tools/primitives.ts";
 import type { SecurityScreenVerdict } from "../security/security-posture.ts";
+import type { CustomProviderSpec } from "../model/custom-providers.ts";
 
 interface HarnessImage {
   mimeType: string;
@@ -136,6 +137,22 @@ export interface HarnessCompactInput {
   recordModelCall(rec: { model: string; inputTokens: number; entryCount: number }): void;
 }
 
+export interface HarnessModelTestInput {
+  model: string;
+  systemPrompt: string;
+  prompt: string;
+  signal?: AbortSignal;
+  customProvider?: {
+    spec: CustomProviderSpec;
+    apiKey: string;
+  };
+}
+
+export interface HarnessModelTestResult {
+  reply?: string;
+  maxOutputTokens?: number;
+}
+
 interface HarnessTurnController {
   runTurn(input: HarnessTurnInput): Promise<HarnessTurnResult>;
   close?(): Promise<void> | void;
@@ -147,6 +164,7 @@ export interface HarnessModelUtilities {
   compactHistory?(input: HarnessCompactInput): Promise<string>;
   contextTokenBudget?(scopeLabel?: string, model?: string): number | undefined;
   oneShot?(systemPrompt: string, prompt: string): Promise<string | undefined>;
+  testModel?(input: HarnessModelTestInput): Promise<HarnessModelTestResult>;
   judge?(systemPrompt: string, prompt: string): Promise<string | undefined>;
   screenSecurity?(input: HarnessSecurityScreenInput): Promise<SecurityScreenVerdict | undefined>;
   pickAckEmoji?(text: string, candidates: readonly string[]): Promise<string | undefined>;
@@ -196,6 +214,7 @@ export function defineHarness(
       ? { contextTokenBudget: implementation.contextTokenBudget.bind(implementation) }
       : {}),
     ...(implementation.oneShot ? { oneShot: implementation.oneShot.bind(implementation) } : {}),
+    ...(implementation.testModel ? { testModel: implementation.testModel.bind(implementation) } : {}),
     ...(implementation.judge ? { judge: implementation.judge.bind(implementation) } : {}),
     ...(implementation.screenSecurity ? { screenSecurity: implementation.screenSecurity.bind(implementation) } : {}),
     ...(implementation.pickAckEmoji ? { pickAckEmoji: implementation.pickAckEmoji.bind(implementation) } : {}),

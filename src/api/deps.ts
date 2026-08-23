@@ -53,6 +53,25 @@ import type { RateLimiter } from "../ratelimit/rate-limiter.ts";
 import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
 import type { SlackInstallationStore, SlackSocketAppIdReader } from "../surfaces/slack-installation.ts";
 
+export type CustomProviderTestHarness = "pi" | "opencode" | "codex";
+
+export class CustomProviderTestConfigurationChangedError extends Error {}
+export class CustomProviderHarnessTestRolloutIncompleteError extends Error {}
+
+export type CustomProviderHarnessTestRunner = (input: {
+  providerId: string;
+  modelId: string;
+  harnessId: CustomProviderTestHarness;
+  expectedRevision: number;
+  rolloutFence: string;
+  signal: AbortSignal;
+}) => Promise<{
+  reply?: string;
+  maxOutputTokens?: number;
+  providerRevision: number;
+  upstreamModelId: string;
+}>;
+
 export interface ServerDeps {
   production?: boolean;
   readyForTraffic?: () => boolean;
@@ -93,6 +112,8 @@ export interface ServerDeps {
   modelCredentialFetch?: typeof fetch;
   customProviders?: CustomProviderStore;
   refreshCustomProviders?: () => Promise<void>;
+  customProviderHarnessTest?: CustomProviderHarnessTestRunner;
+  customProviderHarnessTestFence?: () => Promise<string | null>;
   brandingDefault?: OrgBranding;
   harnessId?: string;
   admin?: AdminService;
