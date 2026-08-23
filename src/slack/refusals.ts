@@ -1,15 +1,23 @@
 import { SECURITY_QUARANTINE_REFUSAL_TEXT } from "../../plugins/chassis/src/security-quarantine.ts";
+import type { TurnResult } from "../types.ts";
 
 export function isBoundaryRefusal(reason: string | undefined): boolean {
   return (reason ?? "").startsWith("internal-only");
 }
 
 export function refusalDelivery(
-  result: { refusalKind?: "security_quarantine" },
+  result: { refusalKind?: TurnResult["refusalKind"] },
   unprompted: boolean,
 ): "thread" | "requester" | "silent" {
   if (unprompted) return "silent";
   return result.refusalKind === "security_quarantine" ? "thread" : "requester";
+}
+
+export function safeRefusalDetail(
+  result: { reason?: string; refusalKind?: TurnResult["refusalKind"] },
+  fallback = "refused",
+): string {
+  return result.refusalKind === "security_quarantine" ? "security quarantine" : (result.reason ?? fallback);
 }
 
 export async function postThenAckRunDelivery(opts: {
@@ -27,7 +35,7 @@ export async function postThenAckRunDelivery(opts: {
 }
 
 export function refusalNote(
-  result: { reason?: string; adminUrl?: string; refusalKind?: "security_quarantine" },
+  result: { reason?: string; adminUrl?: string; refusalKind?: TurnResult["refusalKind"] },
   kind: "dm" | "channel",
 ): string {
   if (result.refusalKind === "security_quarantine") {

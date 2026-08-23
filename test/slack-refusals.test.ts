@@ -1,6 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { refusalNote, refusalDelivery, postThenAckRunDelivery, isBoundaryRefusal } from "../src/slack/lib.ts";
+import {
+  refusalNote,
+  refusalDelivery,
+  safeRefusalDetail,
+  postThenAckRunDelivery,
+  isBoundaryRefusal,
+} from "../src/slack/lib.ts";
 
 const ADMIN_URL = "https://portal.example.com/admin/?view=history&session=s-1";
 
@@ -48,6 +54,16 @@ test("refusalDelivery: quarantine posts in-thread only when addressed; every unp
   assert.equal(refusalDelivery({ refusalKind: "security_quarantine" }, true), "silent");
   assert.equal(refusalDelivery({}, true), "silent");
   assert.equal(refusalDelivery({}, false), "requester");
+});
+
+test("safeRefusalDetail: security quarantine never surfaces its internal reason", () => {
+  const detail = safeRefusalDetail({
+    refusalKind: "security_quarantine",
+    reason: "private-reason request-id=secret",
+  });
+  assert.equal(detail, "security quarantine");
+  assert.equal(safeRefusalDetail({ reason: "ordinary failure" }), "ordinary failure");
+  assert.equal(safeRefusalDetail({}, "failed"), "failed");
 });
 
 test("postThenAckRunDelivery: acknowledges only after the Slack post succeeds", async () => {
