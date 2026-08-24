@@ -1712,6 +1712,8 @@ const apiRoutes: readonly WebRoute[] = [
       let timezone: string | undefined;
       let scope: string | undefined;
       let channelName: string | undefined;
+      let idempotencyKey: string | undefined;
+      let invalidIdempotencyKey = false;
       const attachments: CoreAttachment[] = [];
       let approval: { requestId: string; approved: boolean; scope?: string } | undefined;
       let proactiveOpener = false;
@@ -1736,6 +1738,13 @@ const apiRoutes: readonly WebRoute[] = [
         if (typeof p.thinkingLevel === "string") thinkingLevel = p.thinkingLevel;
         if (typeof p.fastMode === "boolean") fastMode = p.fastMode;
         if (typeof p.timezone === "string" && p.timezone.trim()) timezone = p.timezone.trim().slice(0, 64);
+        if (p.idempotencyKey !== undefined) {
+          if (typeof p.idempotencyKey === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(p.idempotencyKey)) {
+            idempotencyKey = p.idempotencyKey;
+          } else {
+            invalidIdempotencyKey = true;
+          }
+        }
         if (Array.isArray(p.attachments)) {
           for (const raw of p.attachments as unknown[]) {
             if (!raw || typeof raw !== "object") continue;
@@ -1752,6 +1761,7 @@ const apiRoutes: readonly WebRoute[] = [
       } catch (e) {
         if (e instanceof PayloadTooLargeError) throw e;
       }
+      if (invalidIdempotencyKey) return json(res, 400, { error: "invalid_idempotency_key" });
       if (!text.trim() && attachments.length === 0 && !approval && !proactiveOpener)
         return json(res, 400, { error: "empty message" });
 
@@ -1771,7 +1781,7 @@ const apiRoutes: readonly WebRoute[] = [
       }
 
       const displayName = resolveIdentity(req)?.name ?? null;
-      const turn = {
+      const baseTurn = {
         surface: "web",
         actor: { externalId: user, ...(displayName ? { displayName } : {}) },
         conversation,
@@ -1787,6 +1797,9 @@ const apiRoutes: readonly WebRoute[] = [
         ...(approval ? { approval } : {}),
         ...(proactiveOpener ? { proactiveOpener: true } : {}),
       };
+      const turn = idempotencyKey
+        ? { ...baseTurn, idempotencyKey: `web-qa:${encodeURIComponent(user)}:${idempotencyKey}` }
+        : baseTurn;
       return postTurnAndMint(res, turn, user, threadRef);
     },
   },
