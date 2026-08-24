@@ -27,6 +27,7 @@ test("web turns hydrate persisted OpenRouter catalog models before runtime resol
   const built = buildApp(
     testConfig({
       dataDir: mkdtempSync(join(tmpdir(), "dynamic-openrouter-model-")),
+      harness: "pi",
       openrouterApiKey: "deployment-openrouter-key",
     }),
     { modelCredentialFetch: oxAlphaCatalog },
