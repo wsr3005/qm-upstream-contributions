@@ -43,6 +43,45 @@ test("ProjectStore atomically maintains a managed-group roster", async () => {
   assert.equal(await projects.name(projectGroupRef(project.id)), "Launch Cohort");
 });
 
+test("Web QA idempotency survives project roster versions without weakening normal project fences", async () => {
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "project-web-qa-dedup-")) }));
+  await built.app.upsertDirectory([
+    { principalId: "owner", displayName: "Owner", type: "internal" },
+    { principalId: "member", displayName: "Member", type: "internal" },
+  ]);
+  const project = await built.app.createProject("owner", "QA dedup");
+  assert.ok(project);
+  const request = {
+    surface: "web" as const,
+    actor: { externalId: "owner" },
+    conversation: {
+      kind: "group" as const,
+      channelRef: projectGroupRef(project.id),
+      threadRef: "web:owner:qa-dedup",
+      audience: [],
+    },
+    text: "first body",
+    async: true,
+  };
+  const firstQa = await built.app.turn({ ...request, idempotencyKey: "web-qa:owner:reservation-1" });
+  assert.equal(firstQa.status, "queued");
+  assert.equal((await built.app.addProjectMember(project.id, "owner", "member")).status, "ok");
+  const replayedQa = await built.app.turn({
+    ...request,
+    text: "different body after roster update",
+    idempotencyKey: "web-qa:owner:reservation-1",
+  });
+  assert.equal(replayedQa.status, "queued");
+  assert.equal(replayedQa.runId, firstQa.runId);
+
+  const firstNormal = await built.app.turn({ ...request, idempotencyKey: "surface:event-1" });
+  assert.equal(firstNormal.status, "queued");
+  assert.equal((await built.app.removeProjectMember(project.id, "owner", "member")).status, "ok");
+  const replayedNormal = await built.app.turn({ ...request, idempotencyKey: "surface:event-1" });
+  assert.equal(replayedNormal.status, "queued");
+  assert.notEqual(replayedNormal.runId, firstNormal.runId);
+});
+
 test("ProjectStore rename is owner-only and cleans the name", async () => {
   let at = 100;
   const projects = createProjectStore(undefined, { id: () => "pr", now: () => at++ });
