@@ -21,7 +21,55 @@ import {
   createMembershipControlsScope,
 } from "../src/resolution/scope-membership.ts";
 import { buildApp } from "../src/wiring.ts";
+import { defaultModelForHarness } from "../src/model/pi-models.ts";
+import {
+  qaPrincipalCorrelation,
+  signQaReservation,
+  type QaReservationClaims,
+} from "../plugins/chassis/src/qa-reservation.ts";
 import { testConfig } from "./support/test-config.ts";
+
+const QA_SECRET = "test-qa-reservation-secret";
+const QA_CANDIDATE = "a".repeat(40);
+
+function qaConfig(dataDir: string) {
+  return testConfig({
+    dataDir,
+    harness: "pi",
+    anthropicApiKey: "test-anthropic-key",
+    modelProvider: "anthropic",
+    qaReservationSecret: QA_SECRET,
+    qaCandidateSha: QA_CANDIDATE,
+  });
+}
+
+function reservation(
+  actor: string,
+  requestId: string,
+  conversation: { kind: "dm" | "group" | "channel"; threadRef: string; channelRef?: string },
+  options: { issuedAt?: number; expiresAt?: number; runAlias?: string } = {},
+): { idempotencyKey: string; qaReservation: string } {
+  const issuedAt = options.issuedAt ?? Date.now();
+  const claims: QaReservationClaims = {
+    version: 1,
+    requestId,
+    runAlias: options.runAlias ?? "base-test-01",
+    candidateSha: QA_CANDIDATE,
+    principalCorrelation: qaPrincipalCorrelation(QA_SECRET, actor),
+    surface: "web",
+    threadRef: conversation.threadRef,
+    conversationKind: conversation.kind,
+    ...(conversation.channelRef ? { channelRef: conversation.channelRef } : {}),
+    harness: "pi",
+    model: defaultModelForHarness("pi"),
+    issuedAt,
+    expiresAt: options.expiresAt ?? issuedAt + 60_000,
+  };
+  return {
+    idempotencyKey: `web-qa:${encodeURIComponent(actor)}:${requestId}`,
+    qaReservation: signQaReservation(claims, QA_SECRET),
+  };
+}
 
 test("ProjectStore atomically maintains a managed-group roster", async () => {
   let at = 10;
@@ -41,6 +89,142 @@ test("ProjectStore atomically maintains a managed-group roster", async () => {
   assert.equal(await projects.membership(projectGroupRef(project.id), "alice"), true);
   assert.deepEqual(await projects.members(projectGroupRef(project.id)), ["owner", "alice", "bob", "mallory"]);
   assert.equal(await projects.name(projectGroupRef(project.id)), "Launch Cohort");
+});
+
+test("Web QA idempotency survives project roster versions without weakening normal project fences", async () => {
+  const built = buildApp(qaConfig(mkdtempSync(join(tmpdir(), "project-web-qa-dedup-"))));
+  await built.app.upsertDirectory([
+    { principalId: "owner", displayName: "Owner", type: "internal" },
+    { principalId: "member", displayName: "Member", type: "internal" },
+  ]);
+  const project = await built.app.createProject("owner", "QA dedup");
+  assert.ok(project);
+  const request = {
+    surface: "web" as const,
+    actor: { externalId: "owner" },
+    conversation: {
+      kind: "group" as const,
+      channelRef: projectGroupRef(project.id),
+      threadRef: "web:owner:qa-dedup",
+      audience: [],
+    },
+    text: "first body",
+    async: true,
+  };
+  const reserved = reservation("owner", "reservation-1", request.conversation);
+  const firstQa = await built.app.turn({ ...request, ...reserved });
+  assert.equal(firstQa.status, "queued", JSON.stringify(firstQa));
+  assert.equal((await built.app.addProjectMember(project.id, "owner", "member")).status, "ok");
+  const replayedQa = await built.app.turn({
+    ...request,
+    text: "different body after roster update",
+    ...reserved,
+  });
+  assert.equal(replayedQa.status, "queued");
+  assert.equal(replayedQa.runId, firstQa.runId);
+
+  const nextBudgetRun = reservation("owner", "reservation-1", request.conversation, {
+    runAlias: "base-test-02",
+  });
+  const isolatedBudgetRun = await built.app.turn({ ...request, ...nextBudgetRun });
+  assert.equal(isolatedBudgetRun.status, "queued");
+  assert.notEqual(isolatedBudgetRun.runId, firstQa.runId);
+
+  const nonWeb = await built.app.turn({
+    ...request,
+    surface: "slack",
+    ...reserved,
+  });
+  assert.equal(nonWeb.status, "refused");
+
+  const crossPrincipal = await built.app.turn({
+    ...request,
+    actor: { externalId: "member" },
+    ...reserved,
+  });
+  assert.equal(crossPrincipal.status, "refused");
+
+  const expiredReplay = reservation("owner", "reservation-1", request.conversation, {
+    issuedAt: Date.now() - 120_000,
+    expiresAt: Date.now() - 60_000,
+  });
+  const replayedAfterExpiry = await built.app.turn({ ...request, ...expiredReplay });
+  assert.equal(replayedAfterExpiry.status, "queued");
+  assert.equal(replayedAfterExpiry.runId, firstQa.runId);
+
+  const expiredUnused = reservation("owner", "reservation-expired", request.conversation, {
+    issuedAt: Date.now() - 120_000,
+    expiresAt: Date.now() - 60_000,
+  });
+  const rejectedAfterExpiry = await built.app.turn({ ...request, ...expiredUnused });
+  assert.equal(rejectedAfterExpiry.status, "refused");
+  assert.match(rejectedAfterExpiry.reason ?? "", /expired/);
+
+  const otherProject = await built.app.createProject("owner", "Other QA context");
+  assert.ok(otherProject);
+  const crossProject = await built.app.turn({
+    ...request,
+    conversation: {
+      ...request.conversation,
+      channelRef: projectGroupRef(otherProject.id),
+      threadRef: "web:owner:other-qa-context",
+    },
+    ...reserved,
+  });
+  assert.equal(crossProject.status, "refused");
+  assert.match(crossProject.reason ?? "", /invalid test reservation/);
+
+  const firstNormal = await built.app.turn({ ...request, idempotencyKey: "surface:event-1" });
+  assert.equal(firstNormal.status, "queued");
+  assert.equal((await built.app.removeProjectMember(project.id, "owner", "member")).status, "ok");
+  const replayedNormal = await built.app.turn({ ...request, idempotencyKey: "surface:event-1" });
+  assert.equal(replayedNormal.status, "queued");
+  assert.notEqual(replayedNormal.runId, firstNormal.runId);
+});
+
+test("a departed project member cannot recover an old Web QA run through another project", async () => {
+  const built = buildApp(qaConfig(mkdtempSync(join(tmpdir(), "project-web-qa-tenure-"))));
+  await built.app.upsertDirectory([
+    { principalId: "owner", displayName: "Owner", type: "internal" },
+    { principalId: "member", displayName: "Member", type: "internal" },
+  ]);
+  const firstProject = await built.app.createProject("owner", "First context");
+  const secondProject = await built.app.createProject("owner", "Second context");
+  assert.ok(firstProject);
+  assert.ok(secondProject);
+  assert.equal((await built.app.addProjectMember(firstProject.id, "owner", "member")).status, "ok");
+  assert.equal((await built.app.addProjectMember(secondProject.id, "owner", "member")).status, "ok");
+  const firstConversation = {
+    kind: "group" as const,
+    channelRef: projectGroupRef(firstProject.id),
+    threadRef: "web:member:first-context",
+  };
+  const reserved = reservation("member", "reservation-1", firstConversation);
+  const first = await built.app.turn({
+    surface: "web",
+    actor: { externalId: "member" },
+    conversation: { ...firstConversation, audience: [] },
+    text: "first context body",
+    async: true,
+    ...reserved,
+  });
+  assert.equal(first.status, "queued", JSON.stringify(first));
+  assert.equal((await built.app.removeProjectMember(firstProject.id, "owner", "member")).status, "ok");
+  const replayed = await built.app.turn({
+    surface: "web",
+    actor: { externalId: "member" },
+    conversation: {
+      kind: "group",
+      channelRef: projectGroupRef(secondProject.id),
+      threadRef: "web:member:second-context",
+      audience: [],
+    },
+    text: "second context body",
+    async: true,
+    ...reserved,
+  });
+  assert.equal(replayed.status, "refused");
+  assert.match(replayed.reason ?? "", /invalid test reservation/);
 });
 
 test("ProjectStore rename is owner-only and cleans the name", async () => {

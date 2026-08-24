@@ -90,6 +90,8 @@ export interface ServerDeps {
   mcpServers?: McpServerStore;
   mcpToolService?: McpToolService;
   modelCredentialFetch?: typeof fetch;
+  qaReservationSecret?: string;
+  qaCandidateSha?: string;
   customProviders?: CustomProviderStore;
   refreshCustomProviders?: () => Promise<void>;
   brandingDefault?: OrgBranding;

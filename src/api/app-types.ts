@@ -522,6 +522,8 @@ export interface AppDeps {
   mcpServers?: McpServerStore;
   mcpToolService?: McpToolService;
   modelCredentialFetch?: typeof fetch;
+  qaReservationSecret?: string;
+  qaCandidateSha?: string;
   customProviders?: CustomProviderStore;
   refreshCustomProviders?: () => Promise<void>;
   acl: AclStore;

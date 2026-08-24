@@ -22,6 +22,7 @@ import {
 } from "../../chassis/src/http.ts";
 import { verifyPortalIdentity, PORTAL_IDENTITY_HEADER } from "../../chassis/src/portal-identity.ts";
 import { createBrandingCache, injectBranding } from "../../chassis/src/branding.ts";
+import { qaPrincipalCorrelation } from "../../chassis/src/qa-reservation.ts";
 import {
   CORE_API_URL as CORE,
   CORE_ORG_ID as ORG,
@@ -37,6 +38,7 @@ const ALLOW_UNSIGNED_TEST_IDENTITY =
   process.env.NODE_ENV === "test" && process.env.ALLOW_UNSIGNED_TEST_IDENTITY === "1";
 const COOKIE_AUTH = !CORE_SIGNING_SECRET || ALLOW_UNSIGNED_TEST_IDENTITY;
 const AUTH_MODE = COOKIE_AUTH ? "dev" : "portal";
+const QA_RESERVATION_SECRET = process.env.QA_RESERVATION_SECRET ?? "";
 const ALLOW = (process.env.WEB_UI_PRINCIPALS ?? "")
   .split(",")
   .map((s) => s.trim())
@@ -813,6 +815,9 @@ const apiRoutes: readonly WebRoute[] = [
         slackWorkspaceUrl: await slackWorkspaceUrl(),
         impersonatedBy: resolveIdentity(req)?.impersonator ?? null,
         permissions,
+        ...(QA_RESERVATION_SECRET && permissions.includes("admin")
+          ? { qaPrincipalCorrelation: qaPrincipalCorrelation(QA_RESERVATION_SECRET, user) }
+          : {}),
       });
     },
   },
@@ -1712,6 +1717,9 @@ const apiRoutes: readonly WebRoute[] = [
       let timezone: string | undefined;
       let scope: string | undefined;
       let channelName: string | undefined;
+      let idempotencyKey: string | undefined;
+      let qaReservation: string | undefined;
+      let invalidIdempotencyKey = false;
       const attachments: CoreAttachment[] = [];
       let approval: { requestId: string; approved: boolean; scope?: string } | undefined;
       let proactiveOpener = false;
@@ -1736,6 +1744,16 @@ const apiRoutes: readonly WebRoute[] = [
         if (typeof p.thinkingLevel === "string") thinkingLevel = p.thinkingLevel;
         if (typeof p.fastMode === "boolean") fastMode = p.fastMode;
         if (typeof p.timezone === "string" && p.timezone.trim()) timezone = p.timezone.trim().slice(0, 64);
+        if (p.idempotencyKey !== undefined) {
+          if (typeof p.idempotencyKey === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(p.idempotencyKey)) {
+            idempotencyKey = p.idempotencyKey;
+          } else {
+            invalidIdempotencyKey = true;
+          }
+        }
+        if (typeof p.qaReservation === "string" && p.qaReservation.length <= 4096) {
+          qaReservation = p.qaReservation;
+        }
         if (Array.isArray(p.attachments)) {
           for (const raw of p.attachments as unknown[]) {
             if (!raw || typeof raw !== "object") continue;
@@ -1751,6 +1769,10 @@ const apiRoutes: readonly WebRoute[] = [
         }
       } catch (e) {
         if (e instanceof PayloadTooLargeError) throw e;
+      }
+      if (invalidIdempotencyKey) return json(res, 400, { error: "invalid_idempotency_key" });
+      if ((idempotencyKey && !qaReservation) || (!idempotencyKey && qaReservation)) {
+        return json(res, 403, { error: "invalid_qa_reservation" });
       }
       if (!text.trim() && attachments.length === 0 && !approval && !proactiveOpener)
         return json(res, 400, { error: "empty message" });
@@ -1771,7 +1793,7 @@ const apiRoutes: readonly WebRoute[] = [
       }
 
       const displayName = resolveIdentity(req)?.name ?? null;
-      const turn = {
+      const baseTurn = {
         surface: "web",
         actor: { externalId: user, ...(displayName ? { displayName } : {}) },
         conversation,
@@ -1787,6 +1809,13 @@ const apiRoutes: readonly WebRoute[] = [
         ...(approval ? { approval } : {}),
         ...(proactiveOpener ? { proactiveOpener: true } : {}),
       };
+      const turn = idempotencyKey
+        ? {
+            ...baseTurn,
+            idempotencyKey: `web-qa:${encodeURIComponent(user)}:${idempotencyKey}`,
+            qaReservation,
+          }
+        : baseTurn;
       return postTurnAndMint(res, turn, user, threadRef);
     },
   },

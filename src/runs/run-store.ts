@@ -70,6 +70,8 @@ export interface RunStore {
 
   get(runId: string): Promise<Run | null>;
 
+  getByDedupKey(dedupKey: string): Promise<Run | null>;
+
   activeForThread(sessionId: string): Promise<Run | null>;
 
   inFlightForThread(sessionId: string): Promise<Run[]>;

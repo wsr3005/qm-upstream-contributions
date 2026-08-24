@@ -17,6 +17,11 @@ import {
 import { selectableCatalogForHarness, selectableModelCatalog } from "../model/model-catalog.ts";
 import { resolveRuntimeChoiceDurable } from "../harness/harness-router.ts";
 import { errMessage } from "../util/errors.ts";
+import {
+  qaPrincipalCorrelation,
+  qaReservationDedupKey,
+  verifyQaReservation,
+} from "../../plugins/chassis/src/qa-reservation.ts";
 
 import type { App, AppDeps } from "./app-types.ts";
 import { STALE_LEASE_GRACE_MS } from "./app-types.ts";
@@ -123,6 +128,8 @@ export function createTurnMethods(
         return (await deps.projects.withVersion(conversationRef, projectVersion, fn)) ?? null;
       }
 
+      let resolvedWebRuntime: { harnessId: string; modelId: string } | undefined;
+
       if (req.surface === "web") {
         const threadRef = req.conversation.threadRef;
         const existing = await deps.sessions.getByThread(threadRef);
@@ -166,6 +173,7 @@ export function createTurnMethods(
                   ...(req.model ? { modelId: req.model } : {}),
                 })
               : configuredRuntime;
+          resolvedWebRuntime = runtime;
         } catch (error) {
           return { status: "refused", reason: errMessage(error) };
         }
@@ -287,7 +295,7 @@ export function createTurnMethods(
         }
       }
       const blocked = await pendingApprovalResultForThread(conversation.threadRef, projectGroup ? actor.id : undefined);
-      let request = input;
+      let request = { ...input };
       if (blocked) {
         const pendingList = blocked.pendingApprovals ?? [];
         const matches = (id?: string): boolean => !!id && pendingList.some((p) => p.requestId === id);
@@ -295,9 +303,45 @@ export function createTurnMethods(
       }
 
       let dedupKey: string | undefined;
+      const qaKey = req.idempotencyKey?.startsWith("web-qa:") ?? false;
+      const stableWebQaKey = req.surface === "web" && qaKey;
       if (req.idempotencyKey) {
-        dedupKey =
-          projectVersion === undefined ? req.idempotencyKey : `${req.idempotencyKey}:project-${projectVersion}`;
+        const projectScoped = projectVersion !== undefined && !stableWebQaKey;
+        dedupKey = projectScoped ? `${req.idempotencyKey}:project-${projectVersion}` : req.idempotencyKey;
+      }
+
+      let reservationExpired = false;
+      if (qaKey || req.qaReservation) {
+        if (
+          !stableWebQaKey ||
+          !dedupKey ||
+          !req.qaReservation ||
+          !deps.qaReservationSecret ||
+          !deps.qaCandidateSha ||
+          !resolvedWebRuntime
+        ) {
+          return { status: "refused", reason: "invalid test reservation" };
+        }
+        const reservationClaims = verifyQaReservation(req.qaReservation, deps.qaReservationSecret);
+        const now = Date.now();
+        const expectedKey = `web-qa:${encodeURIComponent(req.actor.externalId)}:${reservationClaims?.requestId ?? ""}`;
+        if (
+          !reservationClaims ||
+          reservationClaims.candidateSha !== deps.qaCandidateSha ||
+          reservationClaims.principalCorrelation !== qaPrincipalCorrelation(deps.qaReservationSecret, actor.id) ||
+          reservationClaims.surface !== req.surface ||
+          reservationClaims.threadRef !== conversation.threadRef ||
+          reservationClaims.conversationKind !== conversation.kind ||
+          reservationClaims.channelRef !== conversation.channelRef ||
+          reservationClaims.harness !== resolvedWebRuntime.harnessId ||
+          reservationClaims.model !== resolvedWebRuntime.modelId ||
+          req.idempotencyKey !== expectedKey ||
+          reservationClaims.issuedAt > now + 30_000
+        ) {
+          return { status: "refused", reason: "invalid test reservation" };
+        }
+        dedupKey = qaReservationDedupKey(reservationClaims, deps.qaReservationSecret);
+        reservationExpired = reservationClaims.expiresAt < now;
       }
 
       if (origin.kind === "human" && !req.approval) deps.reaperPoke?.();
@@ -381,12 +425,12 @@ export function createTurnMethods(
 
       const spineRouted = !req.approval && shouldRouteToSpine(request as OrchestratorInput);
       if (spineRouted) {
-        request = { ...input, surfaceTools: true };
+        request = { ...request, surfaceTools: true };
         if (origin.kind !== "ambient")
           request = {
             ...request,
-            text: await addressedWakeText(input as OrchestratorInput),
-            displayText: input.text,
+            text: await addressedWakeText(request as OrchestratorInput),
+            displayText: request.text,
             envelopeWrapped: true,
           };
       }
@@ -430,6 +474,21 @@ export function createTurnMethods(
 
       const known = await deps.sessions.getByThread(conversation.threadRef);
       const participants = known ? await deps.sessions.participantsOf(known.id) : [];
+      if (reservationExpired && dedupKey) {
+        const existing = await deps.runs.getByDedupKey(dedupKey);
+        if (
+          !existing ||
+          existing.sessionId !== conversation.threadRef ||
+          existing.request.actor.id !== actor.id ||
+          existing.request.conversation.kind !== conversation.kind ||
+          existing.request.conversation.channelRef !== conversation.channelRef
+        ) {
+          return { status: "refused", reason: "test reservation expired" };
+        }
+        if (existing.result && isTerminal(existing.status)) return withAdminLink(existing.result);
+        if (req.async) return { status: "queued", runId: existing.id };
+        return drive(existing.id);
+      }
       const enqueue = () =>
         deps.runs.enqueue({
           sessionId: conversation.threadRef,
@@ -440,6 +499,16 @@ export function createTurnMethods(
       const enqueued = await withCurrentProjectRoster(enqueue);
       if (!enqueued) return { status: "refused", reason: "project membership changed; retry from the current project" };
       const { run, deduped } = enqueued;
+      if (
+        deduped &&
+        stableWebQaKey &&
+        (run.sessionId !== conversation.threadRef ||
+          run.request.actor.id !== actor.id ||
+          run.request.conversation.kind !== conversation.kind ||
+          run.request.conversation.channelRef !== conversation.channelRef)
+      ) {
+        return { status: "refused", reason: "that test reservation belongs to a different context" };
+      }
       if (!deduped) {
         deps.sessionStateBus?.emit({
           threadRef: conversation.threadRef,

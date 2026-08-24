@@ -60,6 +60,8 @@ export interface Config {
   piSystemCacheSplit: boolean;
   sessionTapeMode: "shadow" | "serve";
   adminGrants?: string;
+  qaReservationSecret?: string;
+  qaCandidateSha?: string;
   rateLimitPerWindow: number;
   rateLimitWindowMs: number;
   budgetUsdPerWindow?: number;
@@ -795,6 +797,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(modelProvider ? { modelProvider } : {}),
     providerBaseUrls,
     ...(env.ADMIN_GRANTS ? { adminGrants: env.ADMIN_GRANTS } : {}),
+    ...(env.QA_RESERVATION_SECRET ? { qaReservationSecret: env.QA_RESERVATION_SECRET } : {}),
+    ...(env.QA_CANDIDATE_SHA ? { qaCandidateSha: env.QA_CANDIDATE_SHA } : {}),
     piCaptureRequests: boolEnvStrict("PI_CAPTURE_REQUESTS", env.PI_CAPTURE_REQUESTS) ?? true,
     piSystemCacheSplit: boolEnvStrict("PI_SYSTEM_CACHE_SPLIT", env.PI_SYSTEM_CACHE_SPLIT) ?? false,
     sessionTapeMode: env.SESSION_TAPE_MODE === "shadow" ? "shadow" : "serve",

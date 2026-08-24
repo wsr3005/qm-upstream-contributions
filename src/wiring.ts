@@ -1165,6 +1165,8 @@ export function buildApp(
     mcpServers,
     mcpToolService,
     ...(overrides.modelCredentialFetch ? { modelCredentialFetch: overrides.modelCredentialFetch } : {}),
+    ...(config.qaReservationSecret ? { qaReservationSecret: config.qaReservationSecret } : {}),
+    ...(config.qaCandidateSha ? { qaCandidateSha: config.qaCandidateSha } : {}),
     acl,
     admin,
     skills,

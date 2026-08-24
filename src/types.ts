@@ -441,6 +441,7 @@ export interface TurnRequest {
   proactiveOpener?: boolean;
   spawned?: boolean;
   idempotencyKey?: string;
+  qaReservation?: string;
   async?: boolean;
 }
 

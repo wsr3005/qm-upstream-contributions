@@ -131,6 +131,11 @@ export function createMemoryRunStore(opts?: { maxClaims?: number }): MemoryRunti
       return runs.get(runId) ?? null;
     },
 
+    async getByDedupKey(dedupKey) {
+      const id = byKey.get(dedupKey);
+      return id ? (runs.get(id) ?? null) : null;
+    },
+
     async activeForThread(sessionId) {
       return (
         [...runs.values()]

@@ -261,6 +261,11 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
 
     get: getRun,
 
+    async getByDedupKey(dedupKey) {
+      const { rows } = await q("SELECT * FROM runs WHERE idempotency_key = $1", [dedupKey]);
+      return rows[0] ? rowToRun(rows[0]) : null;
+    },
+
     async activeForThread(sessionId: string): Promise<Run | null> {
       const { rows } = await q(
         "SELECT * FROM runs WHERE session_id = $1 AND status IN ('pending','running') ORDER BY created_at DESC LIMIT 1",
