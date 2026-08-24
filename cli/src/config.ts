@@ -45,7 +45,7 @@ export interface PluginEntry {
 }
 
 export interface SandboxConfig {
-  backend?: "sprites" | "aws";
+  backend?: "sprites" | "aws" | "local";
   app?: string;
   image?: string;
   baseImage?: string;
@@ -231,10 +231,13 @@ export function sandboxCoreEnv(
     if (!sb.image) throw new CliError(SANDBOX_PIN_PENDING, { clause: "config.v1" });
     const violation = sandboxImagePinErrors(config)[0];
     if (violation) throw new CliError(violation.message, { clause: violation.clause });
-    env.FLY_SANDBOX_APP_NAME = sb.app;
-    env.FLY_BASE_IMAGE = sb.image;
     const backend = sb.backend ?? (config.target === "fly" ? "sprites" : undefined);
     if (backend) env.SANDBOX_BACKEND = backend;
+    if (backend === "local") env.LOCAL_SANDBOX_IMAGE = sb.image;
+    else {
+      env.FLY_SANDBOX_APP_NAME = sb.app;
+      env.FLY_BASE_IMAGE = sb.image;
+    }
   }
   for (const [k, v] of Object.entries(sb.env ?? {})) env[`FLY_RESIDENT_ENV_${k}`] = v;
   for (const name of sb.secretEnv ?? []) {
@@ -680,6 +683,30 @@ function validate(raw: unknown, path: string): QmConfig {
     return v;
   });
   const sandbox = validateSandbox(o["sandbox"], path, target);
+  if (sandbox?.backend && env.core?.SANDBOX_BACKEND !== undefined && env.core.SANDBOX_BACKEND !== sandbox.backend) {
+    throw new CliError(`${path}: env.core.SANDBOX_BACKEND conflicts with sandbox.backend`);
+  }
+  if (sandbox?.backend === "local") {
+    for (const name of [
+      "LOCAL_SANDBOX_IMAGE",
+      "LOCAL_SANDBOX_CONTROLLER_CONTAINER",
+      "DOCKER_HOST",
+      "DOCKER_CONTEXT",
+      "DOCKER_TLS_VERIFY",
+      "DOCKER_CERT_PATH",
+      "DOCKER_CONFIG",
+    ]) {
+      if (env.core?.[name] !== undefined || secretEnv.core?.[name] !== undefined) {
+        throw new CliError(`${path}: ${name} is managed by sandbox.backend "local" and cannot be overridden`);
+      }
+    }
+    if (secretEnv.core?.SANDBOX_BACKEND !== undefined) {
+      throw new CliError(`${path}: SANDBOX_BACKEND is managed by sandbox.backend and cannot be a secret alias`);
+    }
+  }
+  if (target === "docker" && env.core?.SANDBOX_SECONDARY_BACKEND === "local") {
+    throw new CliError(`${path}: Docker does not support a secondary local sandbox`);
+  }
 
   const out: QmConfig = {
     contract,
@@ -1326,16 +1353,16 @@ function validateSandbox(raw: unknown, path: string, target: Target): SandboxCon
   };
   const out: SandboxConfig = {};
   if (o["backend"] !== undefined) {
-    if (o["backend"] !== "sprites" && o["backend"] !== "aws") {
+    if (o["backend"] !== "sprites" && o["backend"] !== "aws" && o["backend"] !== "local") {
       throw new CliError(
-        `${path}: "sandbox.backend" must be "sprites" (Fly Sprites, booting the operator-published layer image from the Fly app in "sandbox.app") or "aws" (Lambda MicroVM sandboxes)`,
+        `${path}: "sandbox.backend" must be "sprites" (Fly Sprites), "aws" (Lambda MicroVM sandboxes), or "local" (Docker Engine sandboxes)`,
       );
     }
     out.backend = o["backend"];
   }
   if (o["app"] !== undefined) {
     if (typeof o["app"] !== "string" || !o["app"].trim()) {
-      throw new CliError(`${path}: "sandbox.app" must be a non-empty string (the Fly sandbox app name)`);
+      throw new CliError(`${path}: "sandbox.app" must be a non-empty agent-computer app identity`);
     }
     out.app = o["app"];
   }
@@ -1378,8 +1405,17 @@ function validateSandbox(raw: unknown, path: string, target: Target): SandboxCon
       );
     }
   }
+  if (out.backend === "local" && (!out.app || !out.image || !isDigestPinned(out.image))) {
+    throw new CliError(`${path}: "sandbox.backend": "local" requires digest-pinned "sandbox.image" and "sandbox.app"`);
+  }
+  if (
+    out.backend === "local" &&
+    ((out.env && Object.keys(out.env).length > 0) || (out.secretEnv && out.secretEnv.length > 0))
+  ) {
+    throw new CliError(`${path}: "sandbox.backend": "local" does not support sandbox.env or sandbox.secretEnv`);
+  }
   if (out.image && !out.app) {
-    throw new CliError(`${path}: "sandbox.image" requires "sandbox.app" (the app the microVMs run in)`);
+    throw new CliError(`${path}: "sandbox.image" requires "sandbox.app" (the agent-computer app identity)`);
   }
   if (out.backend === "sprites" && !out.app) {
     throw new CliError(
