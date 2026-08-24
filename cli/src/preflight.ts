@@ -72,6 +72,7 @@ export async function flySandboxTokenPreflight(
   secrets: ReadonlyMap<string, string>,
   fetchImpl: typeof fetch = fetch,
 ): Promise<void> {
+  if (config.sandbox?.backend === "local") return;
   const app = config.sandbox?.app?.trim();
   if (!app) return;
   const token = deploymentSecretValue("FLY_SANDBOX_API_TOKEN", secrets.get("FLY_SANDBOX_API_TOKEN"))?.trim();
