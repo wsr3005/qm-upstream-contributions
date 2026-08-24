@@ -197,6 +197,7 @@ import { createOpenCodeHarness, openCodeHarnessConfigOptions } from "./harness/o
 import { createCodexHarness, codexHarnessConfigOptions } from "./harness/codex-harness.ts";
 import { createClaudeHarness, claudeHarnessConfigOptions } from "./harness/claude-harness.ts";
 import { createPiHarness, piHarnessConfigOptions } from "./harness/pi-harness.ts";
+import { MODEL_TEST_MAX_OUTPUT_TOKENS } from "./harness/model-test-proxy.ts";
 import { createHarnessRouter, resolveRuntimeChoiceDurable } from "./harness/harness-router.ts";
 import type { Harness } from "./harness/harness.ts";
 import { createSecurityScreenProxy, type SecurityScreener } from "./security/security-screener.ts";
@@ -936,6 +937,8 @@ export function buildApp(
     if (!testModel) throw new Error(`harness ${input.harnessId} cannot test a model`);
     const result = await testModel({
       model: input.modelId,
+      expectedUpstreamModel: runtimeModel.id,
+      maxOutputTokens: MODEL_TEST_MAX_OUTPUT_TOKENS,
       systemPrompt: "You are testing a model connection for an organization administrator. Do not use tools.",
       prompt: "Reply with a short confirmation that the model connection works.",
       signal: input.signal,

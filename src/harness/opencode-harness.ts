@@ -503,12 +503,13 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
   };
 
   const resolveRuntimeSpec = async (customProvider?: HarnessModelTestInput["customProvider"], toolsEnabled = true) => {
+    const exclusive = Boolean(customProvider);
     const custom = customProvider
       ? [{ spec: customProvider.spec, apiKey: customProvider.apiKey }]
       : ((await opts.resolveCustomProviders?.()) ?? []);
     custom.sort((left, right) => left.spec.id.localeCompare(right.spec.id));
-    const key = createHash("sha256").update(JSON.stringify({ custom, toolsEnabled })).digest("hex");
-    return { key, custom, toolsEnabled };
+    const key = createHash("sha256").update(JSON.stringify({ custom, exclusive, toolsEnabled })).digest("hex");
+    return { key, custom, exclusive, toolsEnabled };
   };
 
   const childState = (parent: ActiveTurn): ActiveTurn => ({
@@ -737,10 +738,14 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
           lsp: false,
           formatter: false,
           instructions: [],
-          enabled_providers: ["anthropic", "openai", ...custom.map(({ spec }) => spec.id)],
+          enabled_providers: [...(spec.exclusive ? [] : ["anthropic", "openai"]), ...custom.map(({ spec }) => spec.id)],
           provider: {
-            anthropic: { options: { apiKey: opts.apiKey ?? "" } },
-            openai: { options: { apiKey: opts.openaiApiKey ?? "" } },
+            ...(spec.exclusive
+              ? {}
+              : {
+                  anthropic: { options: { apiKey: opts.apiKey ?? "" } },
+                  openai: { options: { apiKey: opts.openaiApiKey ?? "" } },
+                }),
             ...customProviderConfig,
           },
           tools: {
@@ -1288,7 +1293,11 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
       testModel: async (input) => {
         if (!input.customProvider)
           throw new NonRetryableTurnError("OpenCode model test requires a custom provider snapshot");
-        const proxy = await createModelTestProxy(input.customProvider.spec.baseUrl, input.signal);
+        const proxy = await createModelTestProxy(input.customProvider.spec.baseUrl, {
+          ...(input.signal ? { signal: input.signal } : {}),
+          expectedModel: input.expectedUpstreamModel,
+          maxOutputTokens: input.maxOutputTokens,
+        });
         try {
           const customProvider = {
             ...input.customProvider,
@@ -1303,7 +1312,11 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
             customProvider,
             false,
           );
-          return reply ? { reply } : {};
+          return {
+            ...(reply ? { reply } : {}),
+            maxOutputTokens: input.maxOutputTokens,
+            evidence: proxy.evidence(),
+          };
         } finally {
           await proxy.close();
         }

@@ -1265,6 +1265,30 @@
       .status.muted {
         color: var(--muted);
       }
+      .custom-provider-test-foot {
+        flex-wrap: wrap;
+      }
+      #st-custom-provider-test:not(:empty) {
+        flex: 1 0 100%;
+        padding: 11px 13px;
+        border: 1px solid var(--border);
+        border-left: 3px solid currentColor;
+        border-radius: var(--radius);
+        background: var(--subtle);
+        color: var(--text);
+        line-height: 1.55;
+        white-space: pre-line;
+      }
+      #st-custom-provider-test.ok {
+        border-left-color: var(--ok);
+      }
+      #st-custom-provider-test.err {
+        border-left-color: var(--danger);
+      }
+      #st-custom-provider-test.muted,
+      #st-custom-provider-test.saving {
+        border-left-color: var(--muted);
+      }
       .center {
         min-height: 60vh;
         display: grid;
@@ -3923,7 +3947,7 @@
                   <input type="password" id="onboarding-model-key" autocomplete="off" placeholder="Write-only API key"
                 /></label>
               </div>
-              <div class="foot">
+              <div class="foot custom-provider-test-foot">
                 <button class="primary" id="onboarding-model-save">Validate and save</button
                 ><button class="danger" id="onboarding-model-delete">Disable this provider</button
                 ><span class="status" id="st-onboarding-model"></span>
@@ -4020,13 +4044,14 @@
                   </select></label
                 >
                 <p class="muted">
-                  Each run sends at most one real billable model request through the selected Harness. Pi is capped at
-                  128 output tokens; OpenCode and Codex use their native runtime limits. Automatic provider retries are
-                  disabled. Each click starts a new test. If the response is lost, retrying from this page reuses the
+                  Each run sends at most one real billable model request through the selected Harness and caps every
+                  Harness at 128 output tokens. Automatic provider retries are disabled. The result verifies the
+                  response model and shows the endpoint alias, first-token and total latency, streaming status, and
+                  token usage. Each click starts a new test. If the response is lost, retrying from this page reuses the
                   same durable request receipt for five minutes without another model charge.
                 </p>
               </div>
-              <div class="foot">
+              <div class="foot custom-provider-test-foot">
                 <button id="custom-provider-test" disabled>Run paid Harness test</button
                 ><span class="status" id="st-custom-provider-test" role="status" aria-live="polite"></span>
               </div>
@@ -7749,20 +7774,59 @@
         return testedRevision + testedAt;
       }
       function customProviderTestResultText(data, target) {
-        const reply = String(data?.reply || "").trim();
         const testedModelId = String(data?.modelId || target.modelId);
-        const testedUpstreamModelId = String(data?.upstreamModelId || testedModelId);
+        const usage = data.usage;
         return (
           (data.cached ? "Recent saved result · no new model charge · " : "") +
           customProviderTestEvidenceText(data) +
+          data.endpointAlias +
+          " endpoint · " +
           data.harness +
           " · " +
           testedModelId +
-          (testedUpstreamModelId !== testedModelId ? " → " + testedUpstreamModelId : "") +
-          " replied in " +
+          " · requested " +
+          data.requestedModel +
+          " · response " +
+          data.responseModel +
+          "\nFirst token " +
+          data.firstTokenMs +
+          " ms · provider " +
+          data.providerTotalMs +
+          " ms · total " +
           data.latencyMs +
-          " ms: " +
-          reply.slice(0, 300)
+          " ms · " +
+          (data.streamed ? "stream verified" : "not streamed") +
+          (data.noDefaultEgress ? " · custom endpoint verified" : "") +
+          "\nUsage " +
+          usage.inputTokens +
+          " input / " +
+          usage.outputTokens +
+          " output / " +
+          usage.totalTokens +
+          " total · cache read " +
+          usage.cachedInputTokens +
+          " / cache write " +
+          usage.cacheCreationInputTokens +
+          " · output cap " +
+          data.maxOutputTokens +
+          " · generation verified"
+        );
+      }
+      function customProviderTestUsageKnown(usage, maxOutputTokens) {
+        return (
+          usage &&
+          Number.isSafeInteger(usage.inputTokens) &&
+          usage.inputTokens > 0 &&
+          Number.isSafeInteger(usage.outputTokens) &&
+          usage.outputTokens > 0 &&
+          usage.outputTokens <= maxOutputTokens &&
+          Number.isSafeInteger(usage.totalTokens) &&
+          usage.totalTokens >= usage.inputTokens + usage.outputTokens &&
+          Number.isSafeInteger(usage.cachedInputTokens) &&
+          usage.cachedInputTokens >= 0 &&
+          Number.isSafeInteger(usage.cacheCreationInputTokens) &&
+          usage.cacheCreationInputTokens >= 0 &&
+          usage.cachedInputTokens + usage.cacheCreationInputTokens <= usage.inputTokens
         );
       }
       function customProviderTestResponseKnown(tested, requestId, target, harness) {
@@ -7781,8 +7845,22 @@
           data.modelId === target.modelId &&
           data.harness === harness &&
           typeof data.upstreamModelId === "string" &&
+          data.requestedModel === data.upstreamModelId &&
+          data.responseModel === data.upstreamModelId &&
+          data.endpointAlias === target.providerName &&
           typeof data.reply === "string" &&
           Number.isFinite(data.latencyMs) &&
+          Number.isSafeInteger(data.firstTokenMs) &&
+          data.firstTokenMs >= 1 &&
+          Number.isSafeInteger(data.providerTotalMs) &&
+          data.providerTotalMs >= data.firstTokenMs &&
+          data.streamed === true &&
+          data.upstreamRequests === 1 &&
+          data.noDefaultEgress === true &&
+          Number.isSafeInteger(data.maxOutputTokens) &&
+          data.maxOutputTokens > 0 &&
+          data.maxOutputTokens <= 128 &&
+          customProviderTestUsageKnown(data.usage, data.maxOutputTokens) &&
           Number.isSafeInteger(data.providerRevision) &&
           Number.isFinite(data.testedAt)
         );

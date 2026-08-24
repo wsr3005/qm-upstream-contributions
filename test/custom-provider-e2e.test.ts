@@ -117,7 +117,7 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
         }
         res.writeHead(200, { "content-type": "text/event-stream" });
         const chunk = (delta: object, finish: string | null) =>
-          `data: ${JSON.stringify({ id: "cmpl-qa", object: "chat.completion.chunk", model: "qa-chat", choices: [{ index: 0, delta, finish_reason: finish }], usage: finish ? { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 } : undefined })}\n\n`;
+          `data: ${JSON.stringify({ id: "cmpl-qa", object: "chat.completion.chunk", model: payload.model, choices: [{ index: 0, delta, finish_reason: finish }], usage: finish ? { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 } : undefined })}\n\n`;
         res.write(chunk({ role: "assistant", content: "QA UPSTREAM REPLY" }, null));
         res.write(chunk({}, "stop"));
         res.write("data: [DONE]\n\n");
@@ -265,6 +265,21 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
       reply: string;
       latencyMs: number;
       maxOutputTokens: number;
+      requestedModel: string;
+      endpointAlias: string;
+      responseModel: string;
+      firstTokenMs: number;
+      providerTotalMs: number;
+      usage: {
+        inputTokens: number;
+        outputTokens: number;
+        totalTokens: number;
+        cachedInputTokens: number;
+        cacheCreationInputTokens: number;
+      };
+      streamed: boolean;
+      upstreamRequests: number;
+      noDefaultEgress: boolean;
     };
     assert.equal(testResult.ok, true);
     assert.equal(testResult.providerId, "qa");
@@ -274,6 +289,21 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
     assert.equal(testResult.reply, "QA UPSTREAM REPLY");
     assert.ok(testResult.latencyMs >= 0);
     assert.equal(testResult.maxOutputTokens, 128);
+    assert.equal(testResult.requestedModel, "qa-chat");
+    assert.equal(testResult.endpointAlias, "QA Provider");
+    assert.equal(testResult.responseModel, "qa-chat");
+    assert.ok(testResult.firstTokenMs >= 1);
+    assert.ok(testResult.providerTotalMs >= testResult.firstTokenMs);
+    assert.deepEqual(testResult.usage, {
+      inputTokens: 5,
+      outputTokens: 3,
+      totalTokens: 8,
+      cachedInputTokens: 0,
+      cacheCreationInputTokens: 0,
+    });
+    assert.equal(testResult.streamed, true);
+    assert.equal(testResult.upstreamRequests, 1);
+    assert.equal(testResult.noDefaultEgress, true);
     assert.ok(!JSON.stringify(testResult).includes("sk-qa-good"));
     assert.deepEqual(staleSeen, []);
     const call = seen.find((s) => s.path.endsWith("/chat/completions"));
@@ -296,14 +326,15 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
       ["attempted", "succeeded", "attempted", "failed"],
     );
     assert.ok(testAudits.every((event) => !JSON.stringify(event).includes("sk-qa-good")));
-    assert.ok(
-      testAudits
-        .filter((event) => event.status !== "attempted")
-        .every((event) =>
-          /^harness=pi upstreamModelId=qa-chat providerRevision=\d+ latencyMs=\d+ requestIdHash=/.test(
-            event.detail ?? "",
-          ),
-        ),
+    const succeededAudit = testAudits.find((event) => event.status === "succeeded");
+    assert.match(
+      succeededAudit?.detail ?? "",
+      /^harness=pi upstreamModelId=qa-chat providerRevision=\d+ latencyMs=\d+ responseModel=qa-chat firstTokenMs=\d+ providerTotalMs=\d+ inputTokens=5 outputTokens=3 totalTokens=8 cachedInputTokens=0 cacheCreationInputTokens=0 maxOutputTokens=128 streamed=true upstreamRequests=1 requestIdHash=/,
+    );
+    const failedAudit = testAudits.find((event) => event.status === "failed");
+    assert.match(
+      failedAudit?.detail ?? "",
+      /^harness=pi upstreamModelId=qa-chat providerRevision=\d+ latencyMs=\d+ requestIdHash=/,
     );
     failCompletions = false;
 
@@ -527,20 +558,49 @@ test("QA: OpenAI Responses custom provider serves the Admin self-test path", asy
         modelId: string;
         upstreamModelId: string;
         harness: string;
-        maxOutputTokens?: number;
+        maxOutputTokens: number;
+        requestedModel: string;
+        endpointAlias: string;
+        responseModel: string;
+        firstTokenMs: number;
+        providerTotalMs: number;
+        usage: {
+          inputTokens: number;
+          outputTokens: number;
+          totalTokens: number;
+          cachedInputTokens: number;
+          cacheCreationInputTokens: number;
+        };
+        streamed: boolean;
+        upstreamRequests: number;
+        noDefaultEgress: boolean;
       };
       assert.equal(body.reply, "RESPONSES QA REPLY");
       assert.equal(body.modelId, "responses/gpt-5.6-luna");
       assert.equal(body.upstreamModelId, "gpt-5.6-luna");
       assert.equal(body.harness, harness);
-      if (harness === "pi") assert.equal(body.maxOutputTokens, 128);
-      else assert.equal(body.maxOutputTokens, undefined);
+      assert.equal(body.maxOutputTokens, 128);
+      assert.equal(body.requestedModel, "gpt-5.6-luna");
+      assert.equal(body.endpointAlias, "Responses");
+      assert.equal(body.responseModel, "gpt-5.6-luna");
+      assert.ok(body.firstTokenMs >= 1);
+      assert.ok(body.providerTotalMs >= body.firstTokenMs);
+      assert.deepEqual(body.usage, {
+        inputTokens: 5,
+        outputTokens: 3,
+        totalTokens: 8,
+        cachedInputTokens: 0,
+        cacheCreationInputTokens: 0,
+      });
+      assert.equal(body.streamed, true);
+      assert.equal(body.upstreamRequests, 1);
+      assert.equal(body.noDefaultEgress, true);
     }
     const calls = seen.filter((request) => request.path.endsWith("/responses"));
     assert.equal(calls.length, 3);
     assert.ok(calls.every((call) => call.auth === "Bearer sk-responses"));
     assert.ok(calls.every((call) => call.model === "gpt-5.6-luna"));
-    assert.equal(calls[0]?.maxTokens, 128);
+    assert.ok(calls.every((call) => call.maxTokens === 128));
     const audits = (await built.auditLog.events()).filter((event) => event.action === "custom-providers.test");
     assert.deepEqual(
       audits.map((event) => [event.status, event.resource]),

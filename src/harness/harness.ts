@@ -13,6 +13,7 @@ import type { OverheardEntryPayload } from "./replay.ts";
 import type { ToolContext } from "../tools/primitives.ts";
 import type { SecurityScreenVerdict } from "../security/security-posture.ts";
 import type { CustomProviderSpec } from "../model/custom-providers.ts";
+import type { ModelTestProxyEvidence } from "./model-test-proxy.ts";
 
 interface HarnessImage {
   mimeType: string;
@@ -139,6 +140,8 @@ export interface HarnessCompactInput {
 
 export interface HarnessModelTestInput {
   model: string;
+  expectedUpstreamModel: string;
+  maxOutputTokens: number;
   systemPrompt: string;
   prompt: string;
   signal?: AbortSignal;
@@ -151,6 +154,7 @@ export interface HarnessModelTestInput {
 export interface HarnessModelTestResult {
   reply?: string;
   maxOutputTokens?: number;
+  evidence?: ModelTestProxyEvidence;
 }
 
 interface HarnessTurnController {

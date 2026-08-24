@@ -53,6 +53,7 @@ import type { UiStateStore } from "../surfaces/ui-state.ts";
 import type { RateLimiter } from "../ratelimit/rate-limiter.ts";
 import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
 import type { SlackInstallationStore, SlackSocketAppIdReader } from "../surfaces/slack-installation.ts";
+import type { ModelTestProxyEvidence } from "../harness/model-test-proxy.ts";
 
 export type CustomProviderTestHarness = "pi" | "opencode" | "codex";
 
@@ -69,6 +70,7 @@ export type CustomProviderHarnessTestRunner = (input: {
 }) => Promise<{
   reply?: string;
   maxOutputTokens?: number;
+  evidence?: ModelTestProxyEvidence;
   providerRevision: number;
   upstreamModelId: string;
 }>;

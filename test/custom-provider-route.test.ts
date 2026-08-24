@@ -16,6 +16,24 @@ const ADMIN = { "content-type": "application/json", "x-admin-actor": "admin-alic
 const ADMIN_BOB = { "content-type": "application/json", "x-admin-actor": "admin-bob@default-org" };
 const USER = { "content-type": "application/json", "x-admin-actor": "bob@default-org" };
 
+function modelTestEvidence(model: string) {
+  return {
+    requestedModel: model,
+    responseModel: model,
+    firstTokenMs: 12,
+    totalMs: 40,
+    usage: {
+      inputTokens: 5,
+      outputTokens: 3,
+      totalTokens: 8,
+      cachedInputTokens: 0,
+      cacheCreationInputTokens: 0,
+    },
+    streamed: true,
+    upstreamRequests: 1,
+  };
+}
+
 afterEach(() => setCustomProviders([], []));
 
 function start(
@@ -149,6 +167,8 @@ test("generation self-test dispatches the selected real harness", async () => {
       reply: `${input.harnessId} ready`,
       providerRevision: input.expectedRevision,
       upstreamModelId: input.modelId,
+      evidence: modelTestEvidence(input.modelId),
+      maxOutputTokens: input.harnessId === "pi" ? 64 : 128,
     };
   });
   try {
@@ -174,12 +194,22 @@ test("generation self-test dispatches the selected real harness", async () => {
       const result = (await tested.json()) as {
         harness: string;
         reply: string;
+        requestedModel: string;
+        responseModel: string;
+        endpointAlias: string;
+        noDefaultEgress: boolean;
         providerRevision: number;
         testedAt: number;
+        maxOutputTokens: number;
       };
       assert.equal(result.harness, harness);
       assert.equal(result.reply, `${harness} ready`);
+      assert.equal(result.requestedModel, "responses-model");
+      assert.equal(result.responseModel, "responses-model");
+      assert.equal(result.endpointAlias, "Acme Gateway");
+      assert.equal(result.noDefaultEgress, true);
       assert.equal(result.providerRevision, 1);
+      assert.equal(result.maxOutputTokens, harness === "pi" ? 64 : 128);
       assert.ok(Number.isFinite(result.testedAt));
     }
     assert.deepEqual(calls, [
@@ -228,6 +258,136 @@ test("generation self-test dispatches the selected real harness", async () => {
   }
 });
 
+test("generation self-test rejects incomplete or unsafe model evidence", async () => {
+  const variants = [
+    { evidence: undefined, maxOutputTokens: 128 },
+    {
+      evidence: { ...modelTestEvidence("responses-model"), responseModel: "gpt-5.6-sol" },
+      maxOutputTokens: 128,
+    },
+    { evidence: { ...modelTestEvidence("responses-model"), streamed: false }, maxOutputTokens: 128 },
+    {
+      evidence: {
+        ...modelTestEvidence("responses-model"),
+        usage: {
+          inputTokens: 5,
+          outputTokens: 129,
+          totalTokens: 134,
+          cachedInputTokens: 0,
+          cacheCreationInputTokens: 0,
+        },
+      },
+      maxOutputTokens: 128,
+    },
+    {
+      evidence: {
+        ...modelTestEvidence("responses-model"),
+        usage: {
+          inputTokens: -1,
+          outputTokens: 3,
+          totalTokens: 2,
+          cachedInputTokens: 0,
+          cacheCreationInputTokens: 0,
+        },
+      },
+      maxOutputTokens: 128,
+    },
+    {
+      evidence: {
+        ...modelTestEvidence("responses-model"),
+        usage: {
+          inputTokens: 5,
+          outputTokens: 3,
+          totalTokens: 7,
+          cachedInputTokens: 0,
+          cacheCreationInputTokens: 0,
+        },
+      },
+      maxOutputTokens: 128,
+    },
+    {
+      evidence: {
+        ...modelTestEvidence("responses-model"),
+        usage: {
+          inputTokens: 5,
+          outputTokens: 3,
+          totalTokens: 8,
+          cachedInputTokens: 6,
+          cacheCreationInputTokens: 0,
+        },
+      },
+      maxOutputTokens: 128,
+    },
+    {
+      evidence: {
+        ...modelTestEvidence("responses-model"),
+        usage: {
+          inputTokens: 5,
+          outputTokens: 3,
+          totalTokens: 8,
+          cachedInputTokens: 3,
+          cacheCreationInputTokens: 3,
+        },
+      },
+      maxOutputTokens: 128,
+    },
+    {
+      evidence: { ...modelTestEvidence("responses-model"), firstTokenMs: 41, totalMs: 40 },
+      maxOutputTokens: 128,
+    },
+    {
+      evidence: { ...modelTestEvidence("responses-model"), upstreamRequests: 2 },
+      maxOutputTokens: 128,
+    },
+    { evidence: modelTestEvidence("responses-model"), maxOutputTokens: 129 },
+  ];
+  let calls = 0;
+  const srv = start(undefined, undefined, async (input) => {
+    const variant = variants[calls++];
+    assert.ok(variant);
+    return {
+      reply: "ready",
+      providerRevision: input.expectedRevision,
+      upstreamModelId: input.modelId,
+      ...variant,
+    };
+  });
+  try {
+    const put = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify({
+        ...BODY,
+        protocol: "openai-responses",
+        models: [{ id: "responses-model" }],
+        validate: false,
+      }),
+    });
+    assert.equal(put.status, 200);
+    for (let index = 0; index < variants.length; index += 1) {
+      const tested = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/harness-test`, {
+        method: "POST",
+        headers: ADMIN,
+        body: JSON.stringify({
+          modelId: "responses-model",
+          harness: "pi",
+          requestId: `request-unsafe-${index}`,
+        }),
+      });
+      assert.equal(tested.status, 502);
+      const result = (await tested.json()) as Record<string, unknown>;
+      assert.equal(result.error, "provider_test_failed");
+      assert.equal(result.message, "the model response could not be verified");
+      assert.equal(result.requestId, `request-unsafe-${index}`);
+      assert.equal(result.providerRevision, 1);
+      assert.ok(Number.isFinite(result.testedAt));
+    }
+    assert.equal(calls, variants.length);
+  } finally {
+    await srv.close();
+  }
+});
+
 test("generation self-test admits one paid call across independent admin clients and replays its result", async () => {
   let calls = 0;
   let notifyStarted!: () => void;
@@ -246,6 +406,8 @@ test("generation self-test admits one paid call across independent admin clients
       reply: "ready",
       providerRevision: input.expectedRevision,
       upstreamModelId: input.modelId,
+      evidence: modelTestEvidence(input.modelId),
+      maxOutputTokens: 128,
     };
   });
   try {
@@ -330,6 +492,8 @@ test("generation self-test persists a paid result after the requesting client di
       reply: "survived disconnect",
       providerRevision: input.expectedRevision,
       upstreamModelId: input.modelId,
+      evidence: modelTestEvidence(input.modelId),
+      maxOutputTokens: 128,
     };
   });
   try {
@@ -375,6 +539,8 @@ test("generation self-test does not spend when the durable billing guard cannot 
       reply: "ready",
       providerRevision: input.expectedRevision,
       upstreamModelId: input.modelId,
+      evidence: modelTestEvidence(input.modelId),
+      maxOutputTokens: 128,
     };
   });
   try {
@@ -408,6 +574,8 @@ test("generation self-test does not spend when an old request receipt has no rec
       reply: "ready",
       providerRevision: input.expectedRevision,
       upstreamModelId: input.modelId,
+      evidence: modelTestEvidence(input.modelId),
+      maxOutputTokens: 128,
     };
   });
   try {
@@ -446,6 +614,8 @@ test("generation self-test keeps the safety window closed when paid-result persi
       reply: "ready",
       providerRevision: input.expectedRevision,
       upstreamModelId: input.modelId,
+      evidence: modelTestEvidence(input.modelId),
+      maxOutputTokens: 128,
     };
   });
   try {
@@ -485,6 +655,8 @@ test("generation self-test stays closed until every live runtime supports its pr
         reply: "ready",
         providerRevision: input.expectedRevision,
         upstreamModelId: input.modelId,
+        evidence: modelTestEvidence(input.modelId),
+        maxOutputTokens: 128,
       };
     },
     async () => null,
@@ -539,6 +711,8 @@ test("generation self-test cannot report success when the rollout fence changes 
         reply: "ready",
         providerRevision: input.expectedRevision,
         upstreamModelId: input.modelId,
+        evidence: modelTestEvidence(input.modelId),
+        maxOutputTokens: 128,
       };
     },
     async () => rolloutFence,
@@ -612,6 +786,8 @@ test("generation self-test sees a provider update completed during its final fen
         reply: "old revision ready",
         providerRevision: input.expectedRevision,
         upstreamModelId: "wire-old",
+        evidence: modelTestEvidence("wire-old"),
+        maxOutputTokens: 128,
       };
     },
     async () => {
@@ -682,6 +858,8 @@ test("generation self-test sees a rollout change between its final fence and pro
         reply: "ready",
         providerRevision: input.expectedRevision,
         upstreamModelId: input.modelId,
+        evidence: modelTestEvidence(input.modelId),
+        maxOutputTokens: 128,
       };
     },
     async () => {
@@ -732,6 +910,8 @@ test("generation self-test cannot report success for a provider revision changed
       reply: "old revision ready",
       providerRevision: input.expectedRevision,
       upstreamModelId: "wire-old",
+      evidence: modelTestEvidence("wire-old"),
+      maxOutputTokens: 128,
     };
   });
   try {

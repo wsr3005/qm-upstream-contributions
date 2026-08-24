@@ -37,6 +37,25 @@ function renderCustomProviderTestResult(data: object, target: object): string {
 type ApiResponse = { ok: boolean; status?: number; data?: Record<string, unknown> };
 type ApiHandler = (method: string, path: string, body?: unknown) => Promise<ApiResponse>;
 
+const TEST_MODEL_EVIDENCE = {
+  requestedModel: "gpt-5.6-luna",
+  responseModel: "gpt-5.6-luna",
+  endpointAlias: "Gateway",
+  firstTokenMs: 12,
+  providerTotalMs: 40,
+  usage: {
+    inputTokens: 5,
+    outputTokens: 3,
+    totalTokens: 8,
+    cachedInputTokens: 0,
+    cacheCreationInputTokens: 0,
+  },
+  streamed: true,
+  upstreamRequests: 1,
+  noDefaultEgress: true,
+  maxOutputTokens: 128,
+};
+
 function successfulHarnessResponse(requestId: string, overrides: Record<string, unknown> = {}): ApiResponse {
   return {
     ok: true,
@@ -50,6 +69,7 @@ function successfulHarnessResponse(requestId: string, overrides: Record<string, 
       harness: "pi",
       reply: "ready",
       latencyMs: 42,
+      ...TEST_MODEL_EVIDENCE,
       providerRevision: 1,
       testedAt: Date.UTC(2026, 7, 24),
       ...overrides,
@@ -288,7 +308,8 @@ test("custom provider setup exposes an explicit paid generation test", () => {
   assert.match(html, /value="openai">OpenAI Chat Completions/);
   assert.match(html, /value="openai-responses">OpenAI Responses \(Codex-compatible\)/);
   assert.match(html, /at most one real billable model request through the selected Harness/);
-  assert.match(html, /Pi is capped at\s+128 output.*OpenCode and Codex use their native runtime limits/s);
+  assert.match(html, /caps every\s+Harness at 128 output tokens/s);
+  assert.match(html, /first-token and total latency, streaming status, and\s+token usage/s);
   assert.match(html, /Automatic provider retries are\s+disabled/);
   assert.match(html, /Each click starts a new test/);
   assert.match(html, /same durable request receipt for five minutes without another model charge/);
@@ -345,7 +366,10 @@ test("custom provider paid test stays locked across refresh and rejects a duplic
   assert.equal(harness.testButton.disabled, false);
   assert.equal(harness.modelSelect.disabled, false);
   assert.equal(harness.harnessSelect.disabled, false);
-  assert.match(harness.testStatus.textContent, /pi · luna → gpt-5\.6-luna replied in 42 ms: ready$/);
+  assert.match(
+    harness.testStatus.textContent,
+    /Gateway endpoint · pi · luna · requested gpt-5\.6-luna · response gpt-5\.6-luna\nFirst token 12 ms · provider 40 ms · total 42 ms · stream verified · custom endpoint verified\nUsage 5 input \/ 3 output \/ 8 total · cache read 0 \/ cache write 0 · output cap 128 · generation verified$/,
+  );
   assert.equal(harness.statuses.at(-1)?.sticky, true);
 });
 
@@ -512,6 +536,73 @@ for (const scenario of [
     assert.match(harness.testStatus.textContent, /^Recent saved result · no new model charge/);
   });
 }
+
+test("custom provider non-streamed success keeps the same paid request receipt", async () => {
+  const requestIds: string[] = [];
+  let posts = 0;
+  const harness = createCustomProviderUi(async (method, _path, body) => {
+    if (method === "GET") return { ok: true, data: { providers: [customProvider(1)] } };
+    posts += 1;
+    requestIds.push((body as { requestId: string }).requestId);
+    return posts === 1
+      ? successfulHarnessResponse(requestIds.at(-1)!, { streamed: false })
+      : successfulHarnessResponse(requestIds.at(-1)!, { cached: true });
+  });
+
+  await harness.ui.loadCustomProviders();
+  await harness.ui.runTest();
+  assert.equal(harness.testButton.disabled, true);
+  assert.equal(harness.retryStorage.size, 1);
+  harness.fireTimers();
+  await harness.ui.runTest();
+  assert.equal(requestIds[0], requestIds[1]);
+  assert.match(harness.testStatus.textContent, /^Recent saved result · no new model charge/);
+});
+
+test("custom provider over-cap success keeps the same paid request receipt", async () => {
+  const requestIds: string[] = [];
+  let posts = 0;
+  const harness = createCustomProviderUi(async (method, _path, body) => {
+    if (method === "GET") return { ok: true, data: { providers: [customProvider(1)] } };
+    posts += 1;
+    requestIds.push((body as { requestId: string }).requestId);
+    return posts === 1
+      ? successfulHarnessResponse(requestIds.at(-1)!, {
+          maxOutputTokens: 64,
+          usage: {
+            inputTokens: 5,
+            outputTokens: 65,
+            totalTokens: 70,
+            cachedInputTokens: 0,
+            cacheCreationInputTokens: 0,
+          },
+        })
+      : successfulHarnessResponse(requestIds.at(-1)!, { cached: true });
+  });
+
+  await harness.ui.loadCustomProviders();
+  await harness.ui.runTest();
+  assert.equal(harness.testButton.disabled, true);
+  assert.equal(harness.retryStorage.size, 1);
+  harness.fireTimers();
+  await harness.ui.runTest();
+  assert.equal(requestIds[0], requestIds[1]);
+  assert.match(harness.testStatus.textContent, /^Recent saved result · no new model charge/);
+});
+
+test("custom provider accepts and displays a lower safe model output cap", async () => {
+  const harness = createCustomProviderUi(async (method, _path, body) =>
+    method === "GET"
+      ? { ok: true, data: { providers: [customProvider(1)] } }
+      : successfulHarnessResponse((body as { requestId: string }).requestId, { maxOutputTokens: 64 }),
+  );
+
+  await harness.ui.loadCustomProviders();
+  await harness.ui.runTest();
+  assert.equal(harness.retryStorage.size, 0);
+  assert.equal(harness.testButton.disabled, false);
+  assert.match(harness.testStatus.textContent, /output cap 64 · generation verified$/);
+});
 
 test("custom provider signed-out response clears the unspent request receipt", async () => {
   const requestIds: string[] = [];
@@ -786,11 +877,17 @@ test("custom provider test success attributes the server-confirmed upstream mode
       modelId: "luna",
       upstreamModelId: "wire-new",
       latencyMs: 42,
+      ...TEST_MODEL_EVIDENCE,
+      requestedModel: "wire-new",
+      responseModel: "wire-new",
       reply: "ready",
     },
-    { modelId: "luna", upstreamModelId: "wire-old" },
+    { modelId: "luna", upstreamModelId: "wire-old", providerName: "Gateway" },
   );
-  assert.equal(rendered, "codex · luna → wire-new replied in 42 ms: ready");
+  assert.equal(
+    rendered,
+    "Gateway endpoint · codex · luna · requested wire-new · response wire-new\nFirst token 12 ms · provider 40 ms · total 42 ms · stream verified · custom endpoint verified\nUsage 5 input / 3 output / 8 total · cache read 0 / cache write 0 · output cap 128 · generation verified",
+  );
   assert.doesNotMatch(rendered, /wire-old/);
 });
 
@@ -802,11 +899,12 @@ test("custom provider test labels a replay as not newly charged", () => {
       modelId: "luna",
       upstreamModelId: "gpt-5.6-luna",
       latencyMs: 42,
+      ...TEST_MODEL_EVIDENCE,
       reply: "ready",
     },
-    { modelId: "luna" },
+    { modelId: "luna", providerName: "Gateway" },
   );
-  assert.match(rendered, /^Recent saved result · no new model charge · pi/);
+  assert.match(rendered, /^Recent saved result · no new model charge · Gateway endpoint · pi/);
 });
 
 test("custom provider test binds its visible result to a saved revision and time", () => {
@@ -817,11 +915,13 @@ test("custom provider test binds its visible result to a saved revision and time
       providerRevision: 7,
       testedAt: Date.UTC(2026, 7, 24, 8, 0, 0),
       latencyMs: 42,
+      upstreamModelId: "gpt-5.6-luna",
+      ...TEST_MODEL_EVIDENCE,
       reply: "ready",
     },
-    { modelId: "luna" },
+    { modelId: "luna", providerName: "Gateway" },
   );
-  assert.match(rendered, /^saved revision 7 · tested .+ · codex · luna/);
+  assert.match(rendered, /^saved revision 7 · tested .+ · Gateway endpoint · codex · luna/);
 });
 
 test("custom provider test labels a replayed failure as not newly charged", async () => {

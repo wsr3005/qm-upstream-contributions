@@ -1087,7 +1087,11 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
       testModel: async (input) => {
         if (!input.customProvider)
           throw new NonRetryableTurnError("Codex model test requires a custom provider snapshot");
-        const proxy = await createModelTestProxy(input.customProvider.spec.baseUrl, input.signal);
+        const proxy = await createModelTestProxy(input.customProvider.spec.baseUrl, {
+          ...(input.signal ? { signal: input.signal } : {}),
+          expectedModel: input.expectedUpstreamModel,
+          maxOutputTokens: input.maxOutputTokens,
+        });
         try {
           const customProvider = {
             ...input.customProvider,
@@ -1102,7 +1106,11 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
             true,
             customProvider,
           );
-          return reply ? { reply } : {};
+          return {
+            ...(reply ? { reply } : {}),
+            maxOutputTokens: input.maxOutputTokens,
+            evidence: proxy.evidence(),
+          };
         } finally {
           await proxy.close();
         }

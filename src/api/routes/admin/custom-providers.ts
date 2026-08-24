@@ -24,6 +24,7 @@ import {
   type CustomProviderTestRunClaim,
   type CustomProviderTestRunResponse,
 } from "../../../model/custom-provider-test-runs.ts";
+import { isValidModelTestProxyEvidence, MODEL_TEST_MAX_OUTPUT_TOKENS } from "../../../harness/model-test-proxy.ts";
 
 const TEST_HARNESSES = new Set<CustomProviderTestHarness>(["pi", "opencode", "codex"]);
 const TEST_REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -345,6 +346,7 @@ export async function testCustomProvider(ctx: ApiCtx): Promise<void> {
   const recordResult = (
     status: "succeeded" | "failed",
     identity: { upstreamModelId: string; providerRevision: number } = { upstreamModelId, providerRevision: revision },
+    metrics = "",
   ) =>
     audit(ctx.deps, {
       principalId: authorized.id,
@@ -352,7 +354,7 @@ export async function testCustomProvider(ctx: ApiCtx): Promise<void> {
       resource: `${id}/${modelId}/${testHarness}`,
       scopeLabel: orgScope(ctx.deps),
       status,
-      detail: `harness=${testHarness} upstreamModelId=${identity.upstreamModelId} providerRevision=${identity.providerRevision} latencyMs=${Date.now() - startedAt} ${auditCorrelation}`,
+      detail: `harness=${testHarness} upstreamModelId=${identity.upstreamModelId} providerRevision=${identity.providerRevision} latencyMs=${Date.now() - startedAt}${metrics} ${auditCorrelation}`,
     });
   let response: CustomProviderTestRunResponse;
   try {
@@ -378,11 +380,26 @@ export async function testCustomProvider(ctx: ApiCtx): Promise<void> {
       providerRevision: result.providerRevision,
     };
     const reply = result.reply;
-    if (!reply?.trim()) {
+    const evidence = result.evidence;
+    const maxOutputTokens = result.maxOutputTokens;
+    if (
+      !reply?.trim() ||
+      !Number.isSafeInteger(maxOutputTokens) ||
+      maxOutputTokens! <= 0 ||
+      maxOutputTokens! > MODEL_TEST_MAX_OUTPUT_TOKENS ||
+      !isValidModelTestProxyEvidence(evidence, result.upstreamModelId, maxOutputTokens!)
+    ) {
       recordResult("failed", identity);
-      response = { status: 502, body: { error: "provider_test_failed", message: "the model returned no text" } };
+      response = {
+        status: 502,
+        body: { error: "provider_test_failed", message: "the model response could not be verified" },
+      };
     } else {
-      recordResult("succeeded", identity);
+      recordResult(
+        "succeeded",
+        identity,
+        ` responseModel=${evidence.responseModel} firstTokenMs=${evidence.firstTokenMs} providerTotalMs=${evidence.totalMs} inputTokens=${evidence.usage.inputTokens} outputTokens=${evidence.usage.outputTokens} totalTokens=${evidence.usage.totalTokens} cachedInputTokens=${evidence.usage.cachedInputTokens} cacheCreationInputTokens=${evidence.usage.cacheCreationInputTokens} maxOutputTokens=${maxOutputTokens} streamed=${evidence.streamed} upstreamRequests=${evidence.upstreamRequests}`,
+      );
       response = {
         status: 200,
         body: {
@@ -390,10 +407,19 @@ export async function testCustomProvider(ctx: ApiCtx): Promise<void> {
           providerId: id,
           modelId,
           upstreamModelId: result.upstreamModelId,
+          requestedModel: evidence.requestedModel,
+          endpointAlias: provider.name,
           harness: testHarness,
           reply: reply.trim(),
           latencyMs: Date.now() - startedAt,
-          ...(result.maxOutputTokens !== undefined ? { maxOutputTokens: result.maxOutputTokens } : {}),
+          responseModel: evidence.responseModel,
+          firstTokenMs: evidence.firstTokenMs,
+          providerTotalMs: evidence.totalMs,
+          usage: evidence.usage,
+          streamed: evidence.streamed,
+          upstreamRequests: evidence.upstreamRequests,
+          noDefaultEgress: true,
+          maxOutputTokens,
         },
       };
     }

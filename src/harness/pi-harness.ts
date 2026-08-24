@@ -2143,7 +2143,11 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
 
       async testModel(input) {
         const proxy = input.customProvider
-          ? await createModelTestProxy(input.customProvider.spec.baseUrl, input.signal)
+          ? await createModelTestProxy(input.customProvider.spec.baseUrl, {
+              ...(input.signal ? { signal: input.signal } : {}),
+              expectedModel: input.expectedUpstreamModel,
+              maxOutputTokens: input.maxOutputTokens,
+            })
           : null;
         try {
           const customProvider =
@@ -2161,13 +2165,17 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
             : await resolveProviderRuntime();
           const resolved = modelForRuntime(input.model, providerRuntime);
           if (!keyForModel(providerRuntime.keys, resolved)) return {};
-          const model = { ...resolved, maxTokens: Math.min(resolved.maxTokens, 128) };
+          const model = { ...resolved, maxTokens: Math.min(resolved.maxTokens, input.maxOutputTokens) };
           const reply = await oneShot("pi-model-test", model, providerRuntime.keys, input.systemPrompt, input.prompt, {
             ...(input.signal ? { signal: input.signal } : {}),
             disableRetries: true,
             customProviders: providerRuntime.customProviders,
           });
-          return { ...(reply ? { reply } : {}), maxOutputTokens: model.maxTokens };
+          return {
+            ...(reply ? { reply } : {}),
+            maxOutputTokens: model.maxTokens,
+            ...(proxy ? { evidence: proxy.evidence() } : {}),
+          };
         } finally {
           await proxy?.close();
         }
