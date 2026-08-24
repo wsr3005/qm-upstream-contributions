@@ -128,14 +128,30 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
   {
     name: "SPRITES_TOKEN",
     service: "core",
-    required: { when: { kind: "env-equals", service: "core", name: "SANDBOX_BACKEND", value: "sprites" } },
+    required: {
+      when: {
+        kind: "any",
+        conditions: [
+          { kind: "env-equals", service: "core", name: "SANDBOX_BACKEND", value: "sprites" },
+          { kind: "env-equals", service: "core", name: "SANDBOX_SECONDARY_BACKEND", value: "sprites" },
+        ],
+      },
+    },
     description: "Fly Sprites API token for the agent-computer substrate.",
     generate: "sprite login   # then copy the token from ~/.sprite/credentials",
   },
   {
     name: "SMOLMACHINES_TOKEN",
     service: "core",
-    required: { when: { kind: "env-equals", service: "core", name: "SANDBOX_BACKEND", value: "smolmachines" } },
+    required: {
+      when: {
+        kind: "any",
+        conditions: [
+          { kind: "env-equals", service: "core", name: "SANDBOX_BACKEND", value: "smolmachines" },
+          { kind: "env-equals", service: "core", name: "SANDBOX_SECONDARY_BACKEND", value: "smolmachines" },
+        ],
+      },
+    },
     description: "smolmachines API key for the agent-computer substrate.",
     generate: "create an API key in the smolmachines console (https://smolmachines.com/console)",
   },
