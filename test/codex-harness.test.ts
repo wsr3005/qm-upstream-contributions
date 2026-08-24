@@ -137,7 +137,7 @@ rl.on("line", (line) => {
   if (msg.method === "thread/start") {
     const provider = msg.params.config?.model_providers?.gateway;
     if (msg.params.model !== "gpt-5.6-luna" || msg.params.config?.model_provider !== "gateway" ||
-        provider?.base_url !== "https://gateway.example.com/v1" || provider?.wire_api !== "responses" ||
+        !String(provider?.base_url).startsWith("http://127.0.0.1:") || provider?.wire_api !== "responses" ||
         provider?.env_key !== "QM_CODEX_PROVIDER_KEY" || process.env.QM_CODEX_PROVIDER_KEY !== "sk-custom" ||
         process.env.OPENAI_API_KEY || process.env.OPENAI_BASE_URL || process.env.CODEX_ACCESS_TOKEN ||
         line.includes("sk-custom")) {
@@ -410,6 +410,8 @@ test("custom Codex runtime identity rotates with endpoint or key and strips buil
     OPENAI_BASE_URL: "https://official.example.com/v1",
     CODEX_ACCESS_TOKEN: "official-token",
     PATH: "/bin",
+    NO_PROXY: "corp.internal",
+    no_proxy: "service.local",
   };
   const first = codexCustomRuntimeSpec(source, {
     id: "gateway",
@@ -428,6 +430,10 @@ test("custom Codex runtime identity rotates with endpoint or key and strips buil
   assert.equal(first.env.OPENAI_API_KEY, undefined);
   assert.equal(first.env.OPENAI_BASE_URL, undefined);
   assert.equal(first.env.CODEX_ACCESS_TOKEN, undefined);
+  assert.match(first.env.NO_PROXY!, /(?:^|,)127\.0\.0\.1(?:,|$)/);
+  assert.match(first.env.no_proxy!, /(?:^|,)localhost(?:,|$)/);
+  assert.match(first.env.NO_PROXY!, /(?:^|,)corp\.internal(?:,|$)/);
+  assert.match(first.env.no_proxy!, /(?:^|,)service\.local(?:,|$)/);
   assert.equal(first.env.PATH, "/bin");
   assert.equal(JSON.stringify(first.config).includes("sk-one"), false);
   assert.equal(first.key.includes("sk-one"), false);
@@ -1044,13 +1050,27 @@ test(
   "the installed Codex app-server completes a turn through a saved Responses provider binding",
   { skip: realCodexBinary && existsSync(realCodexBinary) ? false : "@openai/codex is not resolvable" },
   async (t) => {
-    const requests: Array<{ path: string; auth?: string; model?: string }> = [];
+    const requests: Array<{ path: string; auth?: string; model?: string; responsesLite?: string }> = [];
+    let proxyRequests = 0;
+    const hostileProxy = createServer((req, res) => {
+      proxyRequests += 1;
+      req.resume();
+      res.writeHead(502);
+      res.end();
+    });
+    await new Promise<void>((resolve) => hostileProxy.listen(0, "127.0.0.1", resolve));
+    const hostileProxyUrl = `http://127.0.0.1:${(hostileProxy.address() as AddressInfo).port}`;
     const upstream = createServer((req, res) => {
       let body = "";
       req.on("data", (chunk) => (body += chunk));
       req.on("end", () => {
         const payload = body ? (JSON.parse(body) as { model?: string }) : {};
-        requests.push({ path: req.url ?? "", auth: req.headers.authorization, model: payload.model });
+        requests.push({
+          path: req.url ?? "",
+          auth: req.headers.authorization,
+          model: payload.model,
+          responsesLite: req.headers["x-openai-internal-codex-responses-lite"] as string | undefined,
+        });
         if (!req.url?.endsWith("/responses")) {
           res.writeHead(404);
           return res.end();
@@ -1135,7 +1155,13 @@ test(
     ]);
     const harness = createCodexHarness({
       binaryPath: realCodexBinary!,
-      env: { PATH: process.env.PATH },
+      env: {
+        PATH: process.env.PATH,
+        HTTP_PROXY: hostileProxyUrl,
+        HTTPS_PROXY: hostileProxyUrl,
+        ALL_PROXY: hostileProxyUrl,
+        NO_PROXY: "",
+      },
       turnWallClockMs: 10_000,
       resolveCustomProvider: async (modelId) => ({
         id: "gateway",
@@ -1147,6 +1173,7 @@ test(
     });
     t.after(async () => {
       await harness.turns.close?.();
+      hostileProxy.close();
       upstream.close();
       setCustomProviders([], []);
     });
@@ -1170,5 +1197,7 @@ test(
     assert.equal(requests[0]?.path, "/v1/responses");
     assert.equal(requests[0]?.auth, "Bearer sk-codex-qa");
     assert.equal(requests[0]?.model, "gpt-5.6-luna");
+    assert.equal(requests[0]?.responsesLite, undefined);
+    assert.equal(proxyRequests, 0);
   },
 );

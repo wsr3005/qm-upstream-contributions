@@ -25,6 +25,7 @@ import { coreToolOptions, createPiTools, type PiToolsOptions, type ToolContextRe
 import type { McpToolDescriptor } from "../mcp/mcp-tool-service.ts";
 import { reconstructMessagesFromHistory, seedPriorTurns, type PiReplayMessage } from "./replay.ts";
 import { createModelTestProxy } from "./model-test-proxy.ts";
+import { createCodexProviderProxy } from "./codex-provider-proxy.ts";
 
 export interface CodexHarnessOptions {
   modelId?: string | ((scope?: ScopeId) => string | undefined);
@@ -121,6 +122,7 @@ type ActiveTurn = {
 
 type Runtime = {
   server: CodexAppServer;
+  providerProxy?: Awaited<ReturnType<typeof createCodexProviderProxy>>;
   jail: string;
   key: string;
   family: string;
@@ -206,6 +208,7 @@ const CODEX_ENV_PASSTHROUGH = [
   "HTTPS_PROXY",
   "NO_PROXY",
   "ALL_PROXY",
+  "no_proxy",
   "OPENAI_API_KEY",
   "OPENAI_BASE_URL",
   "CODEX_ACCESS_TOKEN",
@@ -242,7 +245,24 @@ export function codexCustomRuntimeSpec(
   disableRetries = false,
 ): { key: string; family: string; env: NodeJS.ProcessEnv; config: Record<string, unknown> } {
   if (!binding) return { key: "default", family: "default", env: source, config: {} };
-  const env: NodeJS.ProcessEnv = { ...source, QM_CODEX_PROVIDER_KEY: binding.apiKey };
+  const noProxy = [
+    ...new Set([
+      ...(source.NO_PROXY ?? "").split(","),
+      ...(source.no_proxy ?? "").split(","),
+      "127.0.0.1",
+      "localhost",
+      "::1",
+    ]),
+  ]
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .join(",");
+  const env: NodeJS.ProcessEnv = {
+    ...source,
+    QM_CODEX_PROVIDER_KEY: binding.apiKey,
+    NO_PROXY: noProxy,
+    no_proxy: noProxy,
+  };
   delete env.OPENAI_API_KEY;
   delete env.OPENAI_BASE_URL;
   delete env.CODEX_ACCESS_TOKEN;
@@ -426,6 +446,7 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
     try {
       await runtime.server.close();
     } finally {
+      await runtime.providerProxy?.close();
       rmSync(runtime.jail, { recursive: true, force: true });
     }
   };
@@ -500,7 +521,12 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
     }
   };
 
-  const ensureRuntime = async (spec: { key: string; family: string; env: NodeJS.ProcessEnv }): Promise<Runtime> => {
+  const ensureRuntime = async (spec: {
+    key: string;
+    family: string;
+    env: NodeJS.ProcessEnv;
+    providerBaseUrl?: string;
+  }): Promise<Runtime> => {
     desiredRuntimeByFamily.set(spec.family, spec.key);
     const current = runtimes.get(spec.key);
     if (current && !current.closing && current.server.process.exitCode === null) return current;
@@ -516,6 +542,7 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
       const sourceEnv = spec.env;
       prepareCodexHome(sourceEnv, jail);
       const binaryPath = opts.binaryPath ?? resolve("node_modules/.bin/codex");
+      const providerProxy = spec.providerBaseUrl ? await createCodexProviderProxy(spec.providerBaseUrl) : undefined;
       const server = new CodexAppServer({
         binaryPath,
         cwd: jail,
@@ -620,6 +647,7 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
         ]);
       } catch (error) {
         await server.close().catch(() => undefined);
+        await providerProxy?.close().catch(() => undefined);
         rmSync(jail, { recursive: true, force: true });
         throw error;
       } finally {
@@ -628,6 +656,7 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
       }
       const runtime = {
         server,
+        ...(providerProxy ? { providerProxy } : {}),
         jail,
         key: spec.key,
         family: spec.family,
@@ -642,6 +671,7 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
             state.reject(server.error() ?? new Error("Codex app-server exited during a turn"));
         for (const [threadId, state] of active) if (state.runtime.server === server) active.delete(threadId);
         runtimes.delete(spec.key);
+        void providerProxy?.close();
         rmSync(jail, { recursive: true, force: true });
       });
       const idlePriorVersions: Runtime[] = [];
@@ -717,10 +747,20 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
       }
       runtimeModel = binding?.modelId ?? model;
       const spec = codexCustomRuntimeSpec(opts.env ?? {}, binding, disableProviderRetries);
-      runtimeConfig = spec.config;
       reservedRuntimeKey = spec.key;
       reservations.set(spec.key, (reservations.get(spec.key) ?? 0) + 1);
-      rt = await awaitSetup(ensureRuntime(spec));
+      rt = await awaitSetup(ensureRuntime({ ...spec, ...(binding ? { providerBaseUrl: binding.baseUrl } : {}) }));
+      runtimeConfig = binding
+        ? {
+            ...spec.config,
+            model_providers: {
+              [binding.id]: {
+                ...(spec.config.model_providers as Record<string, Record<string, unknown>>)[binding.id],
+                base_url: rt.providerProxy?.baseUrl ?? binding.baseUrl,
+              },
+            },
+          }
+        : spec.config;
       if (spec.family.startsWith("custom:")) rt.retired = true;
     } catch (error) {
       if (reservedRuntimeKey) await releaseReservation(reservedRuntimeKey);
