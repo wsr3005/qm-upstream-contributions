@@ -1,6 +1,7 @@
 import type { ModelProviderAvailability } from "../model/pi-models.ts";
 import type { ModelCredentialStore } from "../model/model-credential-store.ts";
 import type { CustomProviderStore } from "../model/custom-provider-store.ts";
+import type { CustomProviderSpec } from "../model/custom-providers.ts";
 import type { CustomProviderTestRunStore } from "../model/custom-provider-test-runs.ts";
 import type { McpServerStore } from "../mcp/mcp-server-store.ts";
 import type { McpToolService } from "../mcp/mcp-tool-service.ts";
@@ -67,6 +68,7 @@ export type CustomProviderHarnessTestRunner = (input: {
   expectedRevision: number;
   rolloutFence: string;
   signal: AbortSignal;
+  draft?: { provider: CustomProviderSpec; apiKey: string };
 }) => Promise<{
   reply?: string;
   maxOutputTokens?: number;

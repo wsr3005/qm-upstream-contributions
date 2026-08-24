@@ -215,6 +215,8 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
       }),
     });
     assert.equal(r.status, 200);
+    const saved = (await r.json()) as { status: { revision: number; published: boolean } };
+    assert.equal(saved.status.published, false);
     assert.ok(
       seen.some((s) => s.path.endsWith("/models") && s.auth === "Bearer sk-qa-good"),
       "validation actually reached the upstream",
@@ -225,6 +227,19 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
     const listing = JSON.stringify(await r.json());
     assert.ok(listing.includes('"hasKey":true'));
     assert.ok(!listing.includes("sk-qa-good"), "key never readable");
+
+    for (const harness of ["pi", "opencode"]) {
+      r = await api("/v1/admin/custom-providers/qa/harness-test", {
+        method: "POST",
+        body: JSON.stringify({ modelId: "qa-chat", harness, requestId: `qa-publish-${harness}` }),
+      });
+      assert.equal(r.status, 200);
+    }
+    r = await api("/v1/admin/custom-providers/qa/publish", {
+      method: "POST",
+      body: JSON.stringify({ revision: saved.status.revision }),
+    });
+    assert.equal(r.status, 200);
 
     // 5. model resolves like a built-in and is catalog-visible
     const model = resolveModel("qa-chat");
@@ -323,7 +338,7 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
     const testAudits = (await built.auditLog.events()).filter((event) => event.action === "custom-providers.test");
     assert.deepEqual(
       testAudits.map((event) => event.status),
-      ["attempted", "succeeded", "attempted", "failed"],
+      ["attempted", "succeeded", "attempted", "succeeded", "attempted", "succeeded", "attempted", "failed"],
     );
     assert.ok(testAudits.every((event) => !JSON.stringify(event).includes("sk-qa-good")));
     const succeededAudit = testAudits.find((event) => event.status === "succeeded");
@@ -935,6 +950,22 @@ test("QA: anthropic-protocol custom provider serves a real turn (correct wire sh
       }),
     });
     assert.equal(r.status, 200, "anthropic-protocol registration validates against /v1/models with x-api-key");
+    const saved = (await r.json()) as { status: { revision: number } };
+    for (const harness of ["pi", "opencode"]) {
+      r = await fetch(`${base}/v1/admin/custom-providers/antcompat/harness-test`, {
+        method: "POST",
+        headers: ADMIN,
+        body: JSON.stringify({ modelId: "claude-compat", harness, requestId: `publish-anthropic-${harness}` }),
+      });
+      const testBody = await r.text();
+      assert.equal(r.status, 200, `${harness}: ${testBody}; seen=${JSON.stringify(seen)}`);
+    }
+    r = await fetch(`${base}/v1/admin/custom-providers/antcompat/publish`, {
+      method: "POST",
+      headers: ADMIN,
+      body: JSON.stringify({ revision: saved.status.revision }),
+    });
+    assert.equal(r.status, 200);
     const model = resolveModel("claude-compat");
     assert.ok(model);
     assert.equal((model as { api?: string }).api, "anthropic-messages");

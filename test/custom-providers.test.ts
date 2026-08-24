@@ -13,6 +13,7 @@ import { builtInModelCatalog } from "../src/model/model-catalog.ts";
 import {
   createCustomProviderStore,
   CUSTOM_PROVIDER_INPUT_MODALITIES_SCHEMA,
+  CUSTOM_PROVIDER_PUBLICATION_SCHEMA,
   CUSTOM_PROVIDER_WIRE_ID_SCHEMA,
 } from "../src/model/custom-provider-store.ts";
 import {
@@ -261,6 +262,26 @@ test("store round-trip: upsert encrypts the key, statuses never leak it, delete 
   assert.equal((await store.statuses())[0]!.disabled, true);
   assert.equal((await backing.get("acme-gateway"))?.revision, 3);
   assert.equal(await store.delete("never-existed", "admin@example.com"), false);
+});
+
+test("staged providers use a rollback-safe disabled encoding until publication", async () => {
+  const backing = createMemoryMap<StoredCustomProvider>();
+  const store = createCustomProviderStore({ backing, keyMaterial: "test-key-material" });
+  await store.upsert(GATEWAY, "sk-stage-secret", "admin@example.com", { stage: true });
+  const raw = await backing.get(GATEWAY.id);
+  assert.equal(raw?.runtimeSchema, CUSTOM_PROVIDER_PUBLICATION_SCHEMA);
+  assert.equal(raw?.compatibilityDisabled, true);
+  assert.equal(raw?.disabled, true);
+  assert.equal(raw?.published, false);
+  assert.deepEqual(await store.enabled(), []);
+  assert.ok(await store.resolveTestable(GATEWAY.id));
+  assert.notEqual(store.fingerprintSensitive("low-entropy-secret"), "low-entropy-secret");
+  assert.notEqual(
+    store.fingerprintSensitive("low-entropy-secret"),
+    createCustomProviderStore({ backing, keyMaterial: "different-key-material" }).fingerprintSensitive(
+      "low-entropy-secret",
+    ),
+  );
 });
 
 test("store validates specs on upsert", async () => {

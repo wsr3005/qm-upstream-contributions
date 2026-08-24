@@ -9,10 +9,10 @@ import {
   CustomProviderRuntimeNotReadyError,
   requiredCustomProviderRuntimeSchema,
 } from "../../../model/custom-provider-store.ts";
-import { modelSupportedByHarness, resolveModel, resolveStaticModel } from "../../../model/pi-models.ts";
+import { resolveStaticModel } from "../../../model/pi-models.ts";
 import { sendJson } from "../../http.ts";
 import type { ApiCtx } from "../route.ts";
-import { audit, authorizeAdmin, orgScope } from "../shared.ts";
+import { audit, auditRequired, authorizeAdmin, orgScope } from "../shared.ts";
 import {
   CustomProviderHarnessTestRolloutIncompleteError,
   CustomProviderTestConfigurationChangedError,
@@ -136,7 +136,7 @@ export async function putCustomProvider(ctx: ApiCtx): Promise<void> {
     });
   }
   try {
-    await ctx.deps.customProviders.upsert(spec, apiKey, authorized.id);
+    await ctx.deps.customProviders.upsert(spec, apiKey, authorized.id, { stage: true });
   } catch (e) {
     const rollout = e instanceof CustomProviderRuntimeNotReadyError;
     return sendJson(ctx.res, rollout ? 409 : 400, {
@@ -164,7 +164,18 @@ export async function testCustomProvider(ctx: ApiCtx): Promise<void> {
   if (!ctx.body || typeof ctx.body !== "object" || Array.isArray(ctx.body)) {
     return sendJson(ctx.res, 400, { error: "bad_request", message: "a JSON object is required" });
   }
-  const body = ctx.body as { modelId?: unknown; harness?: unknown; requestId?: unknown };
+  const body = ctx.body as {
+    modelId?: unknown;
+    harness?: unknown;
+    requestId?: unknown;
+    draft?: {
+      name?: unknown;
+      protocol?: unknown;
+      baseUrl?: unknown;
+      models?: unknown;
+      apiKey?: unknown;
+    };
+  };
   if (typeof body.modelId !== "string" || !body.modelId.trim()) {
     return sendJson(ctx.res, 400, { error: "bad_request", message: "modelId is required" });
   }
@@ -186,7 +197,46 @@ export async function testCustomProvider(ctx: ApiCtx): Promise<void> {
   const sendTestJson = (status: number, response: Record<string, unknown>) =>
     sendJson(ctx.res, status, { ...response, requestId });
   const readRolloutFence = ctx.deps.customProviderHarnessTestFence ?? (async () => null);
-  const initialState = await ctx.deps.customProviders.harnessTestState(id, readRolloutFence).catch(() => null);
+  let draft: { provider: CustomProviderSpec; apiKey: string } | undefined;
+  let configurationFingerprint: string | undefined;
+  if (body.draft !== undefined) {
+    if (
+      !body.draft ||
+      typeof body.draft !== "object" ||
+      typeof body.draft.name !== "string" ||
+      typeof body.draft.protocol !== "string" ||
+      typeof body.draft.baseUrl !== "string" ||
+      typeof body.draft.apiKey !== "string" ||
+      !body.draft.apiKey.trim() ||
+      !(CUSTOM_PROVIDER_PROTOCOLS as readonly string[]).includes(body.draft.protocol)
+    ) {
+      return sendTestJson(400, { error: "bad_request", message: "a complete draft provider and API key are required" });
+    }
+    const submittedModels = Array.isArray(body.draft.models) ? (body.draft.models as CustomProviderSpec["models"]) : [];
+    const provider: CustomProviderSpec = {
+      id,
+      name: body.draft.name,
+      protocol: body.draft.protocol as CustomProviderProtocol,
+      baseUrl: body.draft.baseUrl.trim().replace(/\/+$/, ""),
+      models: submittedModels.map((model) =>
+        typeof model?.id === "string" && resolveStaticModel(model.id)
+          ? { ...model, id: `${id}/${model.id}`, upstreamId: model.upstreamId ?? model.id }
+          : model,
+      ),
+    };
+    try {
+      validateCustomProviderSpec(provider);
+    } catch (error) {
+      return sendTestJson(400, { error: "bad_request", message: (error as Error).message });
+    }
+    draft = { provider, apiKey: body.draft.apiKey.trim() };
+    configurationFingerprint = ctx.deps.customProviders.fingerprintSensitive(
+      JSON.stringify([provider, body.draft.apiKey.trim()]),
+    );
+  }
+  const initialState = draft
+    ? { active: { ...draft, revision: 0 }, rolloutFence: await readRolloutFence() }
+    : await ctx.deps.customProviders.testableHarnessState(id, readRolloutFence).catch(() => null);
   if (!initialState) {
     return sendTestJson(502, { error: "provider_test_failed", message: "the saved test state could not be read" });
   }
@@ -200,7 +250,8 @@ export async function testCustomProvider(ctx: ApiCtx): Promise<void> {
   const active = initialState.active;
   if (!active) return sendTestJson(404, { error: "not_found" });
   const { provider, apiKey, revision } = active;
-  if (!provider.models.some((model) => model.id === modelId)) {
+  const selectedModelId = draft && resolveStaticModel(modelId) ? `${id}/${modelId}` : modelId;
+  if (!provider.models.some((model) => model.id === selectedModelId)) {
     return sendTestJson(400, {
       error: "bad_request",
       message: `model "${modelId}" is not registered to ${id}`,
@@ -209,22 +260,9 @@ export async function testCustomProvider(ctx: ApiCtx): Promise<void> {
   if (!apiKey) {
     return sendTestJson(400, { error: "missing_api_key", message: "this provider has no active API key" });
   }
-  const model = runtimeModelForCustomProvider(provider, modelId);
+  const model = runtimeModelForCustomProvider(provider, selectedModelId);
   if (!model) return sendTestJson(409, { error: "provider_not_ready", message: "the saved model is not active" });
-  await ctx.deps.refreshCustomProviders?.();
-  const resolved = resolveModel(modelId);
-  if (
-    !resolved ||
-    resolved.provider !== model.provider ||
-    resolved.api !== model.api ||
-    resolved.baseUrl !== model.baseUrl
-  ) {
-    return sendTestJson(409, {
-      error: "provider_not_ready",
-      message: "the saved model is shadowed or the runtime has not activated this provider version",
-    });
-  }
-  if (!modelSupportedByHarness(modelId, harnessId)) {
+  if (harnessId === "codex" && provider.protocol !== "openai-responses") {
     return sendTestJson(400, {
       error: "harness_not_supported",
       message: `${harnessId} does not support this provider protocol`,
@@ -247,14 +285,15 @@ export async function testCustomProvider(ctx: ApiCtx): Promise<void> {
   const testIdentity = {
     scopeId: orgScope(ctx.deps),
     providerId: id,
-    modelId,
+    modelId: selectedModelId,
     harnessId: testHarness,
     providerRevision: revision,
     rolloutFence,
+    ...(configurationFingerprint ? { configurationFingerprint } : {}),
   };
   const requestIdHash = customProviderTestReceiptId(requestId);
   const requestFingerprint = customProviderTestRequestFingerprint(testIdentity);
-  const auditCorrelation = `requestIdHash=${requestIdHash} requestFingerprint=${requestFingerprint}`;
+  const auditCorrelation = `requestIdHash=${requestIdHash}`;
   let claim: CustomProviderTestRunClaim;
   try {
     claim = await ctx.deps.customProviderTestRuns.claim(testIdentity, requestId);
@@ -335,7 +374,10 @@ export async function testCustomProvider(ctx: ApiCtx): Promise<void> {
       cachedUntil: claim.expiresAt,
     });
   }
-  audit(ctx.deps, {
+  const auditRunId = createHash("sha256")
+    .update(JSON.stringify([requestFingerprint, requestIdHash, claim.owner]))
+    .digest("hex");
+  const attemptedAudit = await auditRequired(ctx.deps, `custom-provider-test:${auditRunId}:attempted`, {
     principalId: authorized.id,
     action: "custom-providers.test",
     resource: `${id}/${modelId}/${testHarness}`,
@@ -343,13 +385,27 @@ export async function testCustomProvider(ctx: ApiCtx): Promise<void> {
     status: "attempted",
     detail: `harness=${testHarness} upstreamModelId=${upstreamModelId} providerRevision=${revision} ${auditCorrelation}`,
   });
+  if (!attemptedAudit) {
+    const response = {
+      status: 503,
+      body: {
+        error: "harness_test_audit_unavailable",
+        message: "the paid test was not started because its durable audit record could not be written",
+        requestId,
+        providerRevision: revision,
+        testedAt: Date.now(),
+      },
+    };
+    await ctx.deps.customProviderTestRuns.complete(claim, response).catch(() => false);
+    return sendTestJson(response.status, response.body);
+  }
   const startedAt = Date.now();
   const recordResult = (
     status: "succeeded" | "failed",
     identity: { upstreamModelId: string; providerRevision: number } = { upstreamModelId, providerRevision: revision },
     metrics = "",
   ) =>
-    audit(ctx.deps, {
+    auditRequired(ctx.deps, `custom-provider-test:${auditRunId}:${status}`, {
       principalId: authorized.id,
       action: "custom-providers.test",
       resource: `${id}/${modelId}/${testHarness}`,
@@ -361,13 +417,16 @@ export async function testCustomProvider(ctx: ApiCtx): Promise<void> {
   try {
     const result = await ctx.deps.customProviderHarnessTest({
       providerId: id,
-      modelId,
+      modelId: selectedModelId,
       harnessId: testHarness,
       expectedRevision: revision,
       rolloutFence,
       signal: AbortSignal.timeout(60_000),
+      ...(draft ? { draft } : {}),
     });
-    const finalState = await ctx.deps.customProviders.harnessTestState(id, readRolloutFence);
+    const finalState = draft
+      ? { active: { ...draft, revision: 0 }, rolloutFence: await readRolloutFence() }
+      : await ctx.deps.customProviders.testableHarnessState(id, readRolloutFence);
     if (finalState.rolloutFence !== rolloutFence) {
       throw new CustomProviderHarnessTestRolloutIncompleteError(
         "custom provider harness testing became unavailable during the request",
@@ -390,43 +449,68 @@ export async function testCustomProvider(ctx: ApiCtx): Promise<void> {
       maxOutputTokens! > MODEL_TEST_MAX_OUTPUT_TOKENS ||
       !isValidModelTestProxyEvidence(evidence, result.upstreamModelId, maxOutputTokens!)
     ) {
-      recordResult("failed", identity);
-      response = {
-        status: 502,
-        body: { error: "provider_test_failed", message: "the model response could not be verified" },
-      };
+      const audited = await recordResult("failed", identity);
+      response = audited
+        ? {
+            status: 502,
+            body: { error: "provider_test_failed", message: "the model response could not be verified" },
+          }
+        : {
+            status: 503,
+            body: { error: "harness_test_audit_unavailable", message: "the paid result could not be durably audited" },
+          };
     } else {
-      recordResult(
+      const audited = await recordResult(
         "succeeded",
         identity,
         ` responseModel=${evidence.responseModel} firstTokenMs=${evidence.firstTokenMs} providerTotalMs=${evidence.totalMs} inputTokens=${evidence.usage.inputTokens} outputTokens=${evidence.usage.outputTokens} totalTokens=${evidence.usage.totalTokens} cachedInputTokens=${evidence.usage.cachedInputTokens} cacheCreationInputTokens=${evidence.usage.cacheCreationInputTokens} maxOutputTokens=${maxOutputTokens} streamed=${evidence.streamed} upstreamRequests=${evidence.upstreamRequests}`,
       );
-      response = {
-        status: 200,
-        body: {
-          ok: true,
-          providerId: id,
-          modelId,
-          upstreamModelId: result.upstreamModelId,
-          requestedModel: evidence.requestedModel,
-          endpointAlias: provider.name,
-          harness: testHarness,
-          reply: reply.trim(),
-          latencyMs: Date.now() - startedAt,
-          responseModel: evidence.responseModel,
-          firstTokenMs: evidence.firstTokenMs,
-          providerTotalMs: evidence.totalMs,
-          usage: evidence.usage,
-          streamed: evidence.streamed,
-          upstreamRequests: evidence.upstreamRequests,
-          noDefaultEgress: true,
-          maxOutputTokens,
-        },
-      };
+      if (audited && !draft) {
+        const verified = await ctx.deps.customProviders.recordVerification(
+          id,
+          revision,
+          selectedModelId,
+          testHarness,
+          Date.now(),
+        );
+        if (!verified) throw new CustomProviderTestConfigurationChangedError("custom provider changed during the test");
+      }
+      response = audited
+        ? {
+            status: 200,
+            body: {
+              ok: true,
+              providerId: id,
+              modelId,
+              upstreamModelId: result.upstreamModelId,
+              requestedModel: evidence.requestedModel,
+              endpointAlias: provider.name,
+              harness: testHarness,
+              reply: reply.trim(),
+              latencyMs: Date.now() - startedAt,
+              responseModel: evidence.responseModel,
+              firstTokenMs: evidence.firstTokenMs,
+              providerTotalMs: evidence.totalMs,
+              usage: evidence.usage,
+              streamed: evidence.streamed,
+              upstreamRequests: evidence.upstreamRequests,
+              noDefaultEgress: true,
+              maxOutputTokens,
+            },
+          }
+        : {
+            status: 503,
+            body: { error: "harness_test_audit_unavailable", message: "the paid result could not be durably audited" },
+          };
     }
   } catch (error) {
-    recordResult("failed");
-    if (error instanceof CustomProviderHarnessTestRolloutIncompleteError) {
+    const audited = await recordResult("failed");
+    if (!audited) {
+      response = {
+        status: 503,
+        body: { error: "harness_test_audit_unavailable", message: "the paid result could not be durably audited" },
+      };
+    } else if (error instanceof CustomProviderHarnessTestRolloutIncompleteError) {
       response = {
         status: 409,
         body: {
@@ -481,6 +565,44 @@ export async function testCustomProvider(ctx: ApiCtx): Promise<void> {
   return sendTestJson(response.status, response.body);
 }
 
+export async function publishCustomProvider(ctx: ApiCtx): Promise<void> {
+  const authorized = await actor(ctx);
+  if (!authorized) return;
+  if (!ctx.deps.customProviders) return sendJson(ctx.res, 404, { error: "not_found" });
+  const id = ctx.params.provider;
+  if (!id) return sendJson(ctx.res, 404, { error: "not_found" });
+  if (!ctx.body || typeof ctx.body !== "object" || Array.isArray(ctx.body)) {
+    return sendJson(ctx.res, 400, { error: "bad_request", message: "a JSON object is required" });
+  }
+  const revision = Number((ctx.body as { revision?: unknown }).revision);
+  if (!Number.isSafeInteger(revision) || revision < 1) {
+    return sendJson(ctx.res, 400, { error: "bad_request", message: "revision is required" });
+  }
+  const status = (await ctx.deps.customProviders.statuses()).find((provider) => provider.id === id);
+  if (!status || status.revision !== revision) {
+    return sendJson(ctx.res, 409, { error: "provider_changed", message: "the provider changed before publication" });
+  }
+  const harnesses = status.protocol === "openai-responses" ? ["pi", "opencode", "codex"] : ["pi", "opencode"];
+  const requiredTargets = status.models.flatMap((model) =>
+    harnesses.map((harnessId) => ({ modelId: model.id, harnessId })),
+  );
+  const published = await ctx.deps.customProviders.publish(id, revision, requiredTargets, authorized.id);
+  if (!published) {
+    return sendJson(ctx.res, 409, {
+      error: "provider_not_verified",
+      message: "every model must pass every supported Harness test for this revision before publication",
+    });
+  }
+  await ctx.deps.refreshCustomProviders?.();
+  audit(ctx.deps, {
+    principalId: authorized.id,
+    action: "custom-providers.publish",
+    resource: id,
+    scopeLabel: orgScope(ctx.deps),
+  });
+  return sendJson(ctx.res, 200, { ok: true });
+}
+
 export async function deleteCustomProvider(ctx: ApiCtx): Promise<void> {
   const authorized = await actor(ctx);
   if (!authorized) return;
@@ -498,3 +620,4 @@ export async function deleteCustomProvider(ctx: ApiCtx): Promise<void> {
   });
   return sendJson(ctx.res, 200, { ok: true });
 }
+import { createHash } from "node:crypto";

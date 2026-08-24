@@ -85,10 +85,20 @@ const BODY = {
 
 test("custom provider lifecycle: register, list, resolve, delete — admin only, no key leakage", async () => {
   const validated: string[] = [];
-  const srv = start(async (input) => {
-    validated.push(String(input));
-    return new Response(null, { status: 200 });
-  });
+  const srv = start(
+    async (input) => {
+      validated.push(String(input));
+      return new Response(null, { status: 200 });
+    },
+    undefined,
+    async (input) => ({
+      reply: "ready",
+      providerRevision: input.expectedRevision,
+      upstreamModelId: input.modelId,
+      evidence: modelTestEvidence(input.modelId),
+      maxOutputTokens: 128,
+    }),
+  );
   try {
     // Register (validates against the endpoint's /models).
     const put = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway`, {
@@ -102,7 +112,23 @@ test("custom provider lifecycle: register, list, resolve, delete — admin only,
     assert.equal(putBody.status.hasKey, true);
     assert.equal(JSON.stringify(putBody).includes("sk-acme-secret"), false);
 
-    // The runtime registry serves the model immediately.
+    assert.equal(resolveModel("acme-large"), undefined);
+    for (const harness of ["pi", "opencode"]) {
+      const tested = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/harness-test`, {
+        method: "POST",
+        headers: ADMIN,
+        body: JSON.stringify({ modelId: "acme-large", harness, requestId: `publish-${harness}` }),
+      });
+      assert.equal(tested.status, 200);
+    }
+    const status = (await srv.built.customProviders.statuses())[0]!;
+    const publish = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/publish`, {
+      method: "POST",
+      headers: ADMIN,
+      body: JSON.stringify({ revision: status.revision }),
+    });
+    assert.equal(publish.status, 200);
+
     assert.equal(String(resolveModel("acme-large")?.provider), "acme-gateway");
 
     // List never leaks the key.
@@ -154,6 +180,152 @@ test("generation self-test requires an active stored key", async () => {
       message: "this provider has no active API key",
       requestId: "request-missing-key",
     });
+  } finally {
+    await srv.close();
+  }
+});
+
+test("generation self-test can exercise the default built-in model id as an unsaved draft", async () => {
+  const calls: Array<{ draft: unknown; harnessId: string; modelId: string }> = [];
+  const srv = start(undefined, undefined, async (input) => {
+    calls.push({ draft: input.draft, harnessId: input.harnessId, modelId: input.modelId });
+    return {
+      reply: "draft ready",
+      providerRevision: input.expectedRevision,
+      upstreamModelId: "gpt-5.6-luna",
+      evidence: modelTestEvidence("gpt-5.6-luna"),
+      maxOutputTokens: 128,
+    };
+  });
+  try {
+    const tested = await fetch(`${srv.base}/v1/admin/custom-providers/draft-gateway/harness-test`, {
+      method: "POST",
+      headers: ADMIN,
+      body: JSON.stringify({
+        modelId: "gpt-5.6-luna",
+        harness: "pi",
+        requestId: "draft-before-save",
+        draft: {
+          name: "Draft Gateway",
+          protocol: "openai",
+          baseUrl: "https://draft.example/v1",
+          apiKey: "sk-draft-secret",
+          models: [{ id: "gpt-5.6-luna" }],
+        },
+      }),
+    });
+    assert.equal(tested.status, 200);
+    assert.equal(((await tested.clone().json()) as { modelId: string }).modelId, "gpt-5.6-luna");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.harnessId, "pi");
+    assert.equal(calls[0]?.modelId, "draft-gateway/gpt-5.6-luna");
+    assert.equal((calls[0]?.draft as { apiKey: string }).apiKey, "sk-draft-secret");
+    assert.deepEqual((calls[0]?.draft as { provider: { models: unknown } }).provider.models, [
+      { id: "draft-gateway/gpt-5.6-luna", upstreamId: "gpt-5.6-luna" },
+    ]);
+    assert.deepEqual(await srv.built.customProviders.statuses(), []);
+  } finally {
+    await srv.close();
+  }
+});
+
+test("generation self-test refuses to spend when durable audit admission fails", async () => {
+  let calls = 0;
+  const srv = start(undefined, undefined, async (input) => {
+    calls += 1;
+    return {
+      reply: "ready",
+      providerRevision: input.expectedRevision,
+      upstreamModelId: input.modelId,
+      evidence: modelTestEvidence(input.modelId),
+      maxOutputTokens: 128,
+    };
+  });
+  try {
+    const put = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify(BODY),
+    });
+    assert.equal(put.status, 200);
+    srv.built.auditLog.recordOnce = async () => {
+      throw new Error("audit unavailable");
+    };
+    const tested = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/harness-test`, {
+      method: "POST",
+      headers: ADMIN,
+      body: JSON.stringify({ modelId: "acme-large", harness: "pi", requestId: "audit-failure" }),
+    });
+    assert.equal(tested.status, 503);
+    assert.equal(((await tested.json()) as { error: string }).error, "harness_test_audit_unavailable");
+    assert.equal(calls, 0);
+  } finally {
+    await srv.close();
+  }
+});
+
+test("generation self-test audit keys isolate every paid claim across providers", async () => {
+  const srv = start(undefined, undefined, async (input) => ({
+    reply: "ready",
+    providerRevision: input.expectedRevision,
+    upstreamModelId: input.modelId,
+    evidence: modelTestEvidence(input.modelId),
+    maxOutputTokens: 128,
+  }));
+  try {
+    for (const [provider, model] of [
+      ["gateway-a", "model-a"],
+      ["gateway-b", "model-b"],
+    ]) {
+      const put = await fetch(`${srv.base}/v1/admin/custom-providers/${provider}`, {
+        method: "PUT",
+        headers: ADMIN,
+        body: JSON.stringify({ ...BODY, name: provider, models: [{ id: model }], validate: false }),
+      });
+      assert.equal(put.status, 200);
+    }
+    const auditKeys = new Set<string>();
+    srv.built.auditLog.recordOnce = async (key) => {
+      auditKeys.add(key);
+    };
+    for (const [provider, model] of [
+      ["gateway-a", "model-a"],
+      ["gateway-b", "model-b"],
+    ]) {
+      const tested = await fetch(`${srv.base}/v1/admin/custom-providers/${provider}/harness-test`, {
+        method: "POST",
+        headers: ADMIN,
+        body: JSON.stringify({ modelId: model, harness: "pi", requestId: "shared-request-id" }),
+      });
+      assert.equal(tested.status, 200);
+    }
+    assert.equal(auditKeys.size, 4);
+  } finally {
+    await srv.close();
+  }
+});
+
+test("generation self-test keeps the paid outcome unknown when terminal audit fails", async () => {
+  const srv = start(undefined, undefined, async () => {
+    throw new Error("upstream failed after admission");
+  });
+  try {
+    const put = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify({ ...BODY, validate: false }),
+    });
+    assert.equal(put.status, 200);
+    srv.built.auditLog.recordOnce = async (key) => {
+      if (key.endsWith(":failed")) throw new Error("terminal audit unavailable");
+    };
+    const tested = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/harness-test`, {
+      method: "POST",
+      headers: ADMIN,
+      body: JSON.stringify({ modelId: "acme-large", harness: "pi", requestId: "terminal-audit-failure" }),
+    });
+    assert.equal(tested.status, 503);
+    assert.equal(((await tested.json()) as { error: string }).error, "harness_test_audit_unavailable");
   } finally {
     await srv.close();
   }
@@ -219,7 +391,7 @@ test("generation self-test dispatches the selected real harness", async () => {
     ]);
     const audits = (await srv.built.auditLog.events()).filter((event) => event.action === "custom-providers.test");
     assert.ok(audits.every((event) => event.detail?.includes("requestIdHash=")));
-    assert.ok(audits.every((event) => event.detail?.includes("requestFingerprint=")));
+    assert.ok(audits.every((event) => !event.detail?.includes("requestFingerprint=")));
     assert.ok(audits.every((event) => !event.detail?.includes("request-pi")));
 
     const invalid = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/harness-test`, {

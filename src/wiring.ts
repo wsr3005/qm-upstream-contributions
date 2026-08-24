@@ -182,6 +182,8 @@ import {
   CUSTOM_PROVIDER_HARNESS_TEST_CAPABILITY,
   CUSTOM_PROVIDER_INPUT_MODALITIES_CAPABILITY,
   CUSTOM_PROVIDER_INPUT_MODALITIES_SCHEMA,
+  CUSTOM_PROVIDER_PUBLICATION_CAPABILITY,
+  CUSTOM_PROVIDER_PUBLICATION_SCHEMA,
   CUSTOM_PROVIDER_WIRE_ID_CAPABILITY,
   CUSTOM_PROVIDER_WIRE_ID_SCHEMA,
   type CustomProviderStore,
@@ -765,6 +767,7 @@ export function buildApp(
           capabilities: [
             CUSTOM_PROVIDER_WIRE_ID_CAPABILITY,
             CUSTOM_PROVIDER_INPUT_MODALITIES_CAPABILITY,
+            CUSTOM_PROVIDER_PUBLICATION_CAPABILITY,
             CUSTOM_PROVIDER_HARNESS_TEST_CAPABILITY,
           ],
         })
@@ -774,6 +777,7 @@ export function buildApp(
     const capabilitiesBySchema = new Map([
       [CUSTOM_PROVIDER_WIRE_ID_SCHEMA, CUSTOM_PROVIDER_WIRE_ID_CAPABILITY],
       [CUSTOM_PROVIDER_INPUT_MODALITIES_SCHEMA, CUSTOM_PROVIDER_INPUT_MODALITIES_CAPABILITY],
+      [CUSTOM_PROVIDER_PUBLICATION_SCHEMA, CUSTOM_PROVIDER_PUBLICATION_CAPABILITY],
     ]);
     const capability = capabilitiesBySchema.get(schema);
     if (!capability) return false;
@@ -921,8 +925,9 @@ export function buildApp(
     });
   });
   const customProviderHarnessTest: CustomProviderHarnessTestRunner = async (input) => {
-    await refreshCustomProviders();
-    const initialState = await customProviders.harnessTestState(input.providerId, customProviderHarnessTestFence);
+    const initialState = input.draft
+      ? { active: { ...input.draft, revision: 0 }, rolloutFence: await customProviderHarnessTestFence() }
+      : await customProviders.testableHarnessState(input.providerId, customProviderHarnessTestFence);
     if (initialState.rolloutFence !== input.rolloutFence) {
       throw new CustomProviderHarnessTestRolloutIncompleteError(
         "custom provider harness testing is unavailable during a mixed-version rollout",
@@ -955,7 +960,9 @@ export function buildApp(
       signal: input.signal,
       customProvider: { spec: active.provider, apiKey: active.apiKey },
     });
-    const finalState = await customProviders.harnessTestState(input.providerId, customProviderHarnessTestFence);
+    const finalState = input.draft
+      ? { active, rolloutFence: await customProviderHarnessTestFence() }
+      : await customProviders.testableHarnessState(input.providerId, customProviderHarnessTestFence);
     if (finalState.rolloutFence !== input.rolloutFence) {
       throw new CustomProviderHarnessTestRolloutIncompleteError(
         "custom provider harness testing became unavailable during the request",

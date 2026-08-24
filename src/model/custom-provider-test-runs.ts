@@ -9,6 +9,7 @@ export interface CustomProviderTestRunIdentity {
   harnessId: string;
   providerRevision: number;
   rolloutFence: string;
+  configurationFingerprint?: string;
 }
 
 export interface CustomProviderTestRunResponse {
@@ -102,6 +103,7 @@ export function customProviderTestRequestFingerprint(identity: CustomProviderTes
     identity.harnessId,
     identity.providerRevision,
     identity.rolloutFence,
+    identity.configurationFingerprint ?? null,
   ]);
 }
 

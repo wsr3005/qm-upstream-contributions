@@ -41,6 +41,7 @@ import { deleteModelProvider, getModelProviders, putModelProvider } from "./admi
 import {
   deleteCustomProvider,
   getCustomProviders,
+  publishCustomProvider,
   putCustomProvider,
   testCustomProvider,
 } from "./admin/custom-providers.ts";
@@ -82,6 +83,12 @@ const routes: ReadonlyArray<Route<ApiCtx>> = [
     path: "/v1/admin/custom-providers/:provider/harness-test",
     auth: "either",
     handle: testCustomProvider,
+  },
+  {
+    method: "POST",
+    path: "/v1/admin/custom-providers/:provider/publish",
+    auth: "either",
+    handle: publishCustomProvider,
   },
   { method: "DELETE", path: "/v1/admin/custom-providers/:provider", auth: "either", handle: deleteCustomProvider },
   { method: "PUT", path: "/v1/admin/scopes/:scope/:resource", auth: "either", handle: putScopeConfig },

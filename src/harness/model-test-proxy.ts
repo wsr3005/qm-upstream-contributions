@@ -87,7 +87,7 @@ function preparedBody(
   requestUrl: string | undefined,
   expectedModel: string,
   maxOutputTokens: number,
-): { body: Buffer; requestedModel: string | null } {
+): { body: string; requestedModel: string | null } {
   try {
     const payload = JSON.parse(body.toString("utf8")) as Record<string, unknown>;
     delete payload.tools;
@@ -115,11 +115,11 @@ function preparedBody(
       payload.max_tokens = outputLimit(payload.max_tokens, maxOutputTokens);
     }
     return {
-      body: Buffer.from(JSON.stringify(payload)),
+      body: JSON.stringify(payload),
       requestedModel: requestedModel === expectedModel ? requestedModel : null,
     };
   } catch {
-    return { body, requestedModel: null };
+    return { body: body.toString("utf8"), requestedModel: null };
   }
 }
 

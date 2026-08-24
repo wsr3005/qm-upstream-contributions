@@ -14,6 +14,7 @@ import { setCustomProviders } from "../src/model/custom-providers.ts";
 import {
   CUSTOM_PROVIDER_HARNESS_TEST_CAPABILITY,
   CUSTOM_PROVIDER_INPUT_MODALITIES_CAPABILITY,
+  CUSTOM_PROVIDER_PUBLICATION_CAPABILITY,
 } from "../src/model/custom-provider-store.ts";
 
 const ADMIN = { "content-type": "application/json", "x-admin-actor": "admin-alice@default-org" };
@@ -71,6 +72,31 @@ test("serverDeps wires the custom-provider store and resolves a custom boot defa
       }),
     });
     assert.equal(put.status, 200);
+
+    assert.notEqual(defaultModelForHarness("pi", deps.baseModelDefault), "acme-large");
+    const status = (await built.customProviders.statuses())[0]!;
+    assert.equal(status.published, false);
+    assert.equal(
+      await built.customProviders.recordVerification(status.id, status.revision, "acme-large", "pi", 1),
+      true,
+    );
+    assert.equal(
+      await built.customProviders.recordVerification(status.id, status.revision, "acme-large", "opencode", 2),
+      true,
+    );
+    assert.equal(
+      await built.customProviders.publish(
+        status.id,
+        status.revision,
+        [
+          { modelId: "acme-large", harnessId: "pi" },
+          { modelId: "acme-large", harnessId: "opencode" },
+        ],
+        "admin-alice@default-org",
+      ),
+      true,
+    );
+    await built.refreshCustomProviders();
 
     assert.equal(defaultModelForHarness("pi", deps.baseModelDefault), "acme-large");
 
@@ -168,6 +194,41 @@ test("production image provider writes use the input-modalities capability fence
 
   assert.deepEqual(checked, [CUSTOM_PROVIDER_INPUT_MODALITIES_CAPABILITY]);
   assert.equal((await built.customProviders.statuses())[0]?.disabled, false);
+});
+
+test("production staged provider writes require the publication capability fence", async () => {
+  const checked: string[] = [];
+  const built = buildApp(
+    testConfig({
+      dataDir: mkdtempSync(join(tmpdir(), "custom-provider-publication-capability-")),
+      production: true,
+    }),
+    {
+      instanceRegistry: {
+        beat: async () => false,
+        allLiveSupport: async (capability) => {
+          checked.push(capability);
+          return capability === CUSTOM_PROVIDER_PUBLICATION_CAPABILITY;
+        },
+      },
+    },
+  );
+
+  await built.customProviders.upsert(
+    {
+      id: "staged-gateway",
+      name: "Staged Gateway",
+      protocol: "openai",
+      baseUrl: "https://llm.example.com/v1",
+      models: [{ id: "staged-model" }],
+    },
+    "sk-staged",
+    "admin-alice@default-org",
+    { stage: true },
+  );
+
+  assert.deepEqual(checked, [CUSTOM_PROVIDER_PUBLICATION_CAPABILITY]);
+  assert.equal((await built.customProviders.statuses())[0]?.published, false);
 });
 
 test("web turns refresh durable custom providers before runtime validation", async () => {

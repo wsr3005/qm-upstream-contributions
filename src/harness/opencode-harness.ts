@@ -708,12 +708,13 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
             let npm = "@ai-sdk/openai-compatible";
             if (spec.protocol === "anthropic") npm = "@ai-sdk/anthropic";
             if (spec.protocol === "openai-responses") npm = "@ai-sdk/openai";
+            const baseURL = spec.protocol === "anthropic" ? `${spec.baseUrl}/v1` : spec.baseUrl;
             return [
               spec.id,
               {
                 npm,
                 name: spec.name,
-                options: { baseURL: spec.baseUrl, ...(apiKey ? { apiKey } : {}) },
+                options: { baseURL, ...(apiKey ? { apiKey } : {}) },
                 models: Object.fromEntries(
                   spec.models.map((m) => [
                     m.upstreamId?.trim() || m.id,

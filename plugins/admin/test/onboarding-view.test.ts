@@ -125,10 +125,12 @@ function fakeElement(tagName = "div"): FakeElement {
     get: () => textContent,
     set: (value: string) => {
       textContent = value;
-      if (tagName === "select" && value === "") {
-        element.options.length = 0;
+      if (value === "") {
         element.children.length = 0;
-        element.value = "";
+        if (tagName === "select") {
+          element.options.length = 0;
+          element.value = "";
+        }
       }
     },
   });
@@ -243,6 +245,16 @@ function createCustomProviderUi(
     modelSelect,
     harnessSelect,
     testButton: element("custom-provider-test"),
+    providerSave: element("custom-provider-save"),
+    providerInputs: [
+      element("custom-provider-id"),
+      element("custom-provider-name"),
+      element("custom-provider-protocol"),
+      element("custom-provider-url"),
+      element("custom-provider-key"),
+      element("custom-provider-models"),
+      element("custom-provider-validate"),
+    ],
     providerStatus: element("st-custom-provider"),
     testStatus: element("st-custom-provider-test"),
     providerRows: element("custom-provider-rows"),
@@ -253,11 +265,12 @@ function createCustomProviderUi(
       timers.clear();
       callbacks.forEach((callback) => callback());
     },
-    setProviderForm() {
+    setProviderForm(modelLine = "luna | Luna | 1000 | 128 | gpt-5.6-luna | text,image", apiKey = "") {
       element("custom-provider-id").value = "gateway";
       element("custom-provider-name").value = "Gateway";
       element("custom-provider-url").value = "https://models.example/v1";
-      element("custom-provider-models").value = "luna | Luna | 1000 | 128 | gpt-5.6-luna | text,image";
+      element("custom-provider-models").value = modelLine;
+      element("custom-provider-key").value = apiKey;
     },
     setApi(handler: ApiHandler) {
       apiHandler = handler;
@@ -316,7 +329,33 @@ test("custom provider setup exposes an explicit paid generation test", () => {
   assert.match(html, /modelId: target\.modelId,\s*harness,\s*requestId,/);
   assert.match(html, /id="st-custom-provider"\s+role="status"\s+aria-live="polite"\s+aria-atomic="true"/);
   assert.match(html, /id="st-custom-provider-test" role="status" aria-live="polite"/);
-  assert.match(html, /showCustomProviderTestStatus\(customProviderTestResultText\(tested\.data, target\), "ok"\);/);
+  assert.match(html, /const resultText = customProviderTestResultText\(tested\.data, target\);/);
+  assert.match(html, /await loadCustomProviders\(\);\s+showCustomProviderTestStatus\(resultText, "ok"\);/);
+  assert.match(html, /providerName:\s*name,/);
+  assert.match(html, /target\.draft \? " \(current form\)" : ""/);
+});
+
+test("custom provider current form tests the default gpt-5.6-luna model before save", async () => {
+  let posted: unknown;
+  const harness = createCustomProviderUi(async (method, _path, body) => {
+    if (method === "GET") return { ok: true, data: { providers: [] } };
+    posted = body;
+    return successfulHarnessResponse((body as { requestId: string }).requestId, {
+      modelId: "gpt-5.6-luna",
+      providerRevision: 0,
+    });
+  });
+  harness.setProviderForm("gpt-5.6-luna | GPT 5.6 Luna", "sk-draft-secret");
+  await harness.ui.loadCustomProviders();
+  await harness.ui.runTest();
+  assert.deepEqual(JSON.parse(JSON.stringify((posted as { draft: unknown }).draft)), {
+    name: "Gateway",
+    protocol: "openai-responses",
+    baseUrl: "https://models.example/v1",
+    apiKey: "sk-draft-secret",
+    models: [{ id: "gpt-5.6-luna", name: "GPT 5.6 Luna" }],
+  });
+  assert.match(harness.testStatus.textContent, /Gateway endpoint · pi · gpt-5\.6-luna/);
 });
 
 test("custom providers load once when an unrelated onboarding request fails", async () => {
@@ -336,13 +375,29 @@ test("custom providers load once when an unrelated onboarding request fails", as
 test("custom provider paid test stays locked across refresh and rejects a duplicate run", async () => {
   let postCalls = 0;
   let postRequestId = "";
+  let getCalls = 0;
   let resolvePost!: (response: ApiResponse) => void;
+  let resolveCompletionRefresh!: (response: ApiResponse) => void;
+  let markCompletionRefreshStarted!: () => void;
   const delayedPost = new Promise<ApiResponse>((resolve) => {
     resolvePost = resolve;
   });
+  const delayedCompletionRefresh = new Promise<ApiResponse>((resolve) => {
+    resolveCompletionRefresh = resolve;
+  });
+  const completionRefreshStarted = new Promise<void>((resolve) => {
+    markCompletionRefreshStarted = resolve;
+  });
   const listing = { ok: true, data: { providers: [customProvider(1)] } };
   const harness = createCustomProviderUi(async (method, _path, body) => {
-    if (method === "GET") return listing;
+    if (method === "GET") {
+      getCalls += 1;
+      if (getCalls === 3) {
+        markCompletionRefreshStarted();
+        return delayedCompletionRefresh;
+      }
+      return listing;
+    }
     postCalls += 1;
     postRequestId = (body as { requestId: string }).requestId;
     return delayedPost;
@@ -354,18 +409,36 @@ test("custom provider paid test stays locked across refresh and rejects a duplic
   assert.equal(harness.testButton.disabled, true);
   assert.equal(harness.modelSelect.disabled, true);
   assert.equal(harness.harnessSelect.disabled, true);
+  assert.equal(harness.providerSave.disabled, true);
+  assert.ok(harness.providerInputs.every((input) => input.disabled));
+  let actions = harness.providerRows.children[0]?.children.at(-1);
+  assert.ok(actions?.children.every((button) => button.disabled));
+  harness.providerInputs[1].value = "Keep this form";
+  await actions?.children[0]?.onclick?.();
+  assert.equal(harness.providerInputs[1].value, "Keep this form");
+  assert.equal(postCalls, 1);
   await harness.ui.loadCustomProviders();
   assert.equal(harness.testButton.disabled, true);
   assert.equal(harness.modelSelect.disabled, true);
   assert.equal(harness.harnessSelect.disabled, true);
+  actions = harness.providerRows.children[0]?.children.at(-1);
+  assert.ok(actions?.children.every((button) => button.disabled));
   await harness.ui.runTest();
   assert.equal(postCalls, 1);
 
   resolvePost(successfulHarnessResponse(postRequestId));
+  await completionRefreshStarted;
+  assert.equal(harness.testButton.disabled, true);
+  assert.equal(harness.providerSave.disabled, true);
+  assert.ok(harness.providerInputs.every((input) => input.disabled));
+  assert.ok(actions?.children.every((button) => button.disabled));
+  resolveCompletionRefresh(listing);
   await running;
   assert.equal(harness.testButton.disabled, false);
   assert.equal(harness.modelSelect.disabled, false);
   assert.equal(harness.harnessSelect.disabled, false);
+  assert.equal(harness.providerSave.disabled, false);
+  assert.ok(harness.providerInputs.every((input) => !input.disabled));
   assert.match(
     harness.testStatus.textContent,
     /Gateway endpoint · pi · luna · requested gpt-5\.6-luna · response gpt-5\.6-luna\nFirst token 12 ms · provider 40 ms · total 42 ms · stream verified · custom endpoint verified\nUsage 5 input \/ 3 output \/ 8 total · cache read 0 \/ cache write 0 · output cap 128 · generation verified$/,

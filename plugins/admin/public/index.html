@@ -3971,6 +3971,7 @@
                       <th>Endpoint</th>
                       <th>Models</th>
                       <th>Key</th>
+                      <th>Status</th>
                       <th></th>
                     </tr>
                   </thead>
@@ -4033,7 +4034,7 @@
               </div>
               <div class="body setup-form">
                 <label
-                  >Test a saved model
+                  >Test current form or staged model
                   <select id="custom-provider-test-model" disabled></select
                 ></label>
                 <label
@@ -7417,6 +7418,8 @@
       let customProviderTestBlockedRetry = null;
       let customProviderTestRetryTimer = null;
       let customProviderTestStorageAvailable = true;
+      let customProviderSaveActive = false;
+      let customProviderActionControls = [];
       let customProviderTestStatusOwner = null;
       const customProviderTestStorageStatusOwner = {};
       const CUSTOM_PROVIDER_TEST_RETRY_TTL_MS = 5 * 60_000;
@@ -7437,6 +7440,60 @@
       let customProvidersReady = false;
       let customProvidersLoad = 0;
       let customProviderLoadFailed = false;
+      function customProviderDraftTargets() {
+        const id = $("custom-provider-id").value.trim();
+        const name = $("custom-provider-name").value.trim();
+        const protocol = $("custom-provider-protocol").value;
+        const baseUrl = $("custom-provider-url").value.trim();
+        const apiKey = $("custom-provider-key").value.trim();
+        const models = parseCustomModels($("custom-provider-models").value);
+        if (!id || !name || !baseUrl || !apiKey || models.length === 0) return [];
+        const draft = { name, protocol, baseUrl, apiKey, models };
+        const providerUpdatedAt = JSON.stringify([name, protocol, baseUrl, models]);
+        return models.map((model) => ({
+          providerId: id,
+          providerName: name,
+          protocol,
+          providerUpdatedAt,
+          modelId: model.id,
+          upstreamModelId: model.upstreamId || model.id,
+          draft,
+        }));
+      }
+      function renderCustomProviderTestTargets() {
+        const selectedTarget = customProviderTestTargets[Number($("custom-provider-test-model").value)];
+        customProviderTestTargets = [
+          ...customProviderDraftTargets(),
+          ...customProvidersLoaded.flatMap((provider) =>
+            provider.models.map((model) => ({
+              providerId: provider.id,
+              providerName: provider.name,
+              protocol: provider.protocol,
+              providerUpdatedAt: provider.updatedAt,
+              modelId: model.id,
+              upstreamModelId: model.upstreamId || model.id,
+            })),
+          ),
+        ];
+        const testSelect = $("custom-provider-test-model");
+        testSelect.textContent = "";
+        customProviderTestTargets.forEach((target, index) => {
+          const option = document.createElement("option");
+          option.value = String(index);
+          option.textContent = target.providerName + (target.draft ? " (current form)" : "") + " · " + target.modelId;
+          testSelect.appendChild(option);
+        });
+        const selectedIndex = customProviderTestTargets.findIndex(
+          (target) =>
+            target.providerId === selectedTarget?.providerId &&
+            target.modelId === selectedTarget?.modelId &&
+            Boolean(target.draft) === Boolean(selectedTarget?.draft),
+        );
+        if (selectedIndex >= 0) testSelect.value = String(selectedIndex);
+        syncCustomProviderTestHarnesses();
+        restoreCustomProviderTestRetry();
+        syncCustomProviderTestControls();
+      }
       function showCustomProviderTestStatus(message, kind, owner = null) {
         customProviderTestStatusOwner = owner;
         setStatus("st-custom-provider-test", message, kind, true);
@@ -7622,6 +7679,21 @@
         $("custom-provider-test").disabled = unavailable || running || customProviderTestRetryBlocked();
         $("custom-provider-test-model").disabled = unavailable || running;
         $("custom-provider-test-harness").disabled = unavailable || running;
+        [
+          "custom-provider-id",
+          "custom-provider-name",
+          "custom-provider-protocol",
+          "custom-provider-url",
+          "custom-provider-key",
+          "custom-provider-models",
+          "custom-provider-validate",
+        ].forEach((id) => {
+          $(id).disabled = running || customProviderSaveActive;
+        });
+        $("custom-provider-save").disabled = running || customProviderSaveActive;
+        customProviderActionControls.forEach(({ button, blocked }) => {
+          button.disabled = running || customProviderSaveActive || blocked;
+        });
       }
       function parseCustomModels(text) {
         return text
@@ -7671,42 +7743,18 @@
           setStatus("st-custom-provider", "", "", true);
           customProviderLoadFailed = false;
         }
-        const nextProviders = (res.data?.providers || []).filter((provider) => !provider.disabled);
+        const nextProviders = (res.data?.providers || []).filter((provider) => provider.testable !== false);
         const nextFingerprint = JSON.stringify(nextProviders);
         if (customProviderTestFingerprint !== null && customProviderTestFingerprint !== nextFingerprint) {
           clearCustomProviderTestResult();
         }
         customProviderTestFingerprint = nextFingerprint;
-        const selectedTarget = customProviderTestTargets[Number($("custom-provider-test-model").value)];
         customProvidersLoaded = nextProviders;
-        customProviderTestTargets = customProvidersLoaded.flatMap((provider) =>
-          provider.models.map((model) => ({
-            providerId: provider.id,
-            providerName: provider.name,
-            protocol: provider.protocol,
-            providerUpdatedAt: provider.updatedAt,
-            modelId: model.id,
-            upstreamModelId: model.upstreamId || model.id,
-          })),
-        );
-        const testSelect = $("custom-provider-test-model");
-        testSelect.textContent = "";
-        customProviderTestTargets.forEach((target, index) => {
-          const option = document.createElement("option");
-          option.value = String(index);
-          option.textContent = target.providerName + " · " + target.modelId;
-          testSelect.appendChild(option);
-        });
-        const selectedIndex = customProviderTestTargets.findIndex(
-          (target) => target.providerId === selectedTarget?.providerId && target.modelId === selectedTarget?.modelId,
-        );
-        if (selectedIndex >= 0) testSelect.value = String(selectedIndex);
-        syncCustomProviderTestHarnesses();
         customProvidersReady = true;
-        restoreCustomProviderTestRetry();
-        syncCustomProviderTestControls();
+        renderCustomProviderTestTargets();
         const rows = $("custom-provider-rows");
         rows.textContent = "";
+        customProviderActionControls = [];
         $("custom-provider-empty").hidden = customProvidersLoaded.length > 0;
         customProvidersLoaded.forEach((provider) => {
           const tr = document.createElement("tr");
@@ -7722,6 +7770,7 @@
               .map((model) => (model.upstreamId ? model.id + " → " + model.upstreamId : model.id))
               .join(", "),
             provider.hasKey ? "set (write-only)" : "none",
+            provider.published ? "Open to employees" : "Staged for verification",
           ];
           cells.forEach((textContent) => {
             const td = document.createElement("td");
@@ -7732,6 +7781,7 @@
           const edit = document.createElement("button");
           edit.textContent = "Edit";
           edit.onclick = () => {
+            if (customProviderTestActiveRun !== null || customProviderSaveActive) return;
             $("custom-provider-id").value = provider.id;
             $("custom-provider-name").value = provider.name;
             $("custom-provider-protocol").value = provider.protocol;
@@ -7757,6 +7807,7 @@
           remove.className = "danger";
           remove.textContent = "Remove";
           remove.onclick = async () => {
+            if (customProviderTestActiveRun !== null || customProviderSaveActive) return;
             if (!confirm("Remove " + provider.name + "? Its models leave every model picker.")) return;
             const removed = await api("DELETE", "/api/custom-providers/" + encodeURIComponent(provider.id));
             if (!removed.ok) {
@@ -7769,10 +7820,44 @@
             }
           };
           actions.appendChild(edit);
+          const publish = document.createElement("button");
+          const requiredHarnesses =
+            provider.protocol === "openai-responses" ? ["pi", "opencode", "codex"] : ["pi", "opencode"];
+          const verified = new Set(
+            (provider.verifiedTargets || [])
+              .filter((target) => target.revision === provider.revision)
+              .map((target) => target.modelId + ":" + target.harnessId),
+          );
+          const required = provider.models.flatMap((model) =>
+            requiredHarnesses.map((harnessId) => model.id + ":" + harnessId),
+          );
+          publish.textContent = provider.published ? "Opened" : "Open to employees";
+          const publishBlocked = provider.published || required.some((target) => !verified.has(target));
+          publish.disabled = publishBlocked;
+          publish.onclick = async () => {
+            if (customProviderTestActiveRun !== null || customProviderSaveActive || publishBlocked) return;
+            const opened = await api("POST", "/api/custom-providers/" + encodeURIComponent(provider.id) + "/publish", {
+              revision: provider.revision,
+            });
+            if (!opened.ok) {
+              setStatus("st-custom-provider", opened.data?.message || "Could not open this provider.", "err");
+              return;
+            }
+            if (await loadCustomProviders()) {
+              setStatus("st-custom-provider", "Verified provider opened to employees.", "ok");
+            }
+          };
+          actions.appendChild(publish);
           actions.appendChild(remove);
           tr.appendChild(actions);
           rows.appendChild(tr);
+          customProviderActionControls.push(
+            { button: edit, blocked: false },
+            { button: publish, blocked: publishBlocked },
+            { button: remove, blocked: false },
+          );
         });
+        syncCustomProviderTestControls();
         return true;
       }
       function customProviderTestEvidenceText(data) {
@@ -7895,6 +7980,21 @@
         restoreCustomProviderTestRetry();
         syncCustomProviderTestControls();
       };
+      [
+        "custom-provider-id",
+        "custom-provider-name",
+        "custom-provider-protocol",
+        "custom-provider-url",
+        "custom-provider-key",
+        "custom-provider-models",
+      ].forEach((id) => {
+        const refresh = () => {
+          clearCustomProviderTestResult();
+          renderCustomProviderTestTargets();
+        };
+        if (id === "custom-provider-protocol") $(id).onchange = refresh;
+        else $(id).oninput = refresh;
+      });
       $("custom-provider-save").onclick = async () => {
         const id = $("custom-provider-id").value.trim();
         const name = $("custom-provider-name").value.trim();
@@ -7913,10 +8013,12 @@
           ...(apiKey ? { apiKey } : {}),
           ...($("custom-provider-validate").checked ? {} : { validate: false }),
         };
-        $("custom-provider-save").disabled = true;
+        customProviderSaveActive = true;
+        syncCustomProviderTestControls();
         setStatus("st-custom-provider", "Saving…", "saving", true);
         const saved = await api("PUT", "/api/custom-providers/" + encodeURIComponent(id), body);
-        $("custom-provider-save").disabled = false;
+        customProviderSaveActive = false;
+        syncCustomProviderTestControls();
         if (!saved.ok) {
           setStatus("st-custom-provider", saved.data?.message || "Could not save this provider.", "err", true);
           return;
@@ -7924,7 +8026,11 @@
         $("custom-provider-key").value = "";
         clearCustomProviderTestResult();
         if (await loadCustomProviders()) {
-          setStatus("st-custom-provider", "Provider saved. Its models are now in the picker.", "ok");
+          setStatus(
+            "st-custom-provider",
+            "Provider saved as staged. Verify every supported Harness, then open it to employees.",
+            "ok",
+          );
         }
       };
       $("custom-provider-test").onclick = async () => {
@@ -7958,117 +8064,122 @@
         customProviderTestActiveRun = run;
         syncCustomProviderTestControls();
         showCustomProviderTestStatus("Running a real paid " + harness + " test turn…", "saving");
-        let tested;
         try {
-          tested = await api(
-            "POST",
-            "/api/custom-providers/" + encodeURIComponent(target.providerId) + "/harness-test",
-            {
-              modelId: target.modelId,
-              harness,
-              requestId,
-            },
-          );
-        } catch {
-          customProviderTestRetry.retryAt = Math.min(customProviderTestRetry.expiresAt, Date.now() + 2_000);
-          if (!persistCustomProviderTestRetry(customProviderTestRetry)) {
-            syncCustomProviderTestControls();
+          let tested;
+          try {
+            tested = await api(
+              "POST",
+              "/api/custom-providers/" + encodeURIComponent(target.providerId) + "/harness-test",
+              {
+                modelId: target.modelId,
+                harness,
+                requestId,
+                ...(target.draft ? { draft: target.draft } : {}),
+              },
+            );
+          } catch {
+            customProviderTestRetry.retryAt = Math.min(customProviderTestRetry.expiresAt, Date.now() + 2_000);
+            if (!persistCustomProviderTestRetry(customProviderTestRetry)) {
+              syncCustomProviderTestControls();
+              showCustomProviderTestStatus(
+                "The paid outcome is unknown and its receipt could not be saved. Harness tests are disabled in this browser.",
+                "err",
+                customProviderTestStorageStatusOwner,
+              );
+              return;
+            }
+            const retryAt = blockCustomProviderTestRetry(retryIdentity, customProviderTestRetry.retryAt);
             showCustomProviderTestStatus(
-              "The paid outcome is unknown and its receipt could not be saved. Harness tests are disabled in this browser.",
+              "The generation test could not reach QM, so its paid outcome is unknown. Do not retry before " +
+                new Date(retryAt).toLocaleTimeString() +
+                ".",
+              "err",
+              customProviderTestBlockedRetry,
+            );
+            return;
+          }
+          const explicitlyUnresolved =
+            (tested.data?.error === "harness_test_in_progress" && tested.data?.replayExpected !== false) ||
+            tested.data?.error === "harness_test_result_unresolved" ||
+            tested.data?.error === "harness_test_result_not_durable" ||
+            tested.data?.error === "core_unreachable";
+          const outcomeUnknown =
+            explicitlyUnresolved || !customProviderTestResponseKnown(tested, requestId, target, harness);
+          const retryAfterMs = Number(tested.data?.retryAfterMs);
+          let retryAvailableAt = null;
+          if (outcomeUnknown) {
+            const requestExpiresInMs = Number(tested.data?.requestExpiresInMs);
+            customProviderTestRetry.expiresAt =
+              Number.isFinite(requestExpiresInMs) && requestExpiresInMs > 0
+                ? Date.now() + requestExpiresInMs
+                : customProviderTestRetry.expiresAt;
+            customProviderTestRetry.retryAt =
+              Number.isFinite(retryAfterMs) && retryAfterMs > 0
+                ? Math.min(customProviderTestRetry.expiresAt, Date.now() + retryAfterMs)
+                : Math.min(customProviderTestRetry.expiresAt, Date.now() + 2_000);
+            if (!persistCustomProviderTestRetry(customProviderTestRetry)) {
+              syncCustomProviderTestControls();
+              showCustomProviderTestStatus(
+                "The paid outcome is unknown and its receipt could not be saved. Harness tests are disabled in this browser.",
+                "err",
+                customProviderTestStorageStatusOwner,
+              );
+              return;
+            }
+            retryAvailableAt = blockCustomProviderTestRetry(retryIdentity, customProviderTestRetry.retryAt);
+          } else if (!tested.ok && Number.isFinite(retryAfterMs) && retryAfterMs > 0) {
+            retryAvailableAt = blockCustomProviderTestRetry(retryIdentity, Date.now() + retryAfterMs);
+          }
+          if (outcomeUnknown) {
+            showCustomProviderTestStatus(
+              (tested.data?.message ||
+                "QM returned an unverified response, so this paid test's outcome is still unknown.") +
+                (retryAvailableAt
+                  ? " Retry the same saved request after " + new Date(retryAvailableAt).toLocaleTimeString() + "."
+                  : ""),
+              "err",
+              customProviderTestBlockedRetry,
+            );
+            return;
+          }
+          const receiptCleared = clearCustomProviderTestRetry(true);
+          if (!receiptCleared) syncCustomProviderTestControls();
+          const evidence = customProviderTestEvidenceText(tested.data);
+          if (!tested.ok) {
+            showCustomProviderTestStatus(
+              (tested.data?.cached ? "Recent saved result · no new model charge · " : "") +
+                evidence +
+                (tested.data?.message ||
+                  (tested.data?.error === "signed_out"
+                    ? "You are signed out. No model request was sent."
+                    : "The generation test failed.")) +
+                (retryAvailableAt
+                  ? " Retry available after " + new Date(retryAvailableAt).toLocaleTimeString() + "."
+                  : "") +
+                (receiptCleared
+                  ? ""
+                  : " The result is known, but receipt cleanup could not be verified; further paid tests are disabled until browser storage recovers."),
+              "err",
+              receiptCleared ? customProviderTestBlockedRetry : customProviderTestStorageStatusOwner,
+            );
+            return;
+          }
+          if (!receiptCleared) {
+            showCustomProviderTestStatus(
+              customProviderTestResultText(tested.data, target) +
+                " Receipt cleanup could not be verified; further paid tests are disabled until browser storage recovers.",
               "err",
               customProviderTestStorageStatusOwner,
             );
             return;
           }
-          const retryAt = blockCustomProviderTestRetry(retryIdentity, customProviderTestRetry.retryAt);
-          showCustomProviderTestStatus(
-            "The generation test could not reach QM, so its paid outcome is unknown. Do not retry before " +
-              new Date(retryAt).toLocaleTimeString() +
-              ".",
-            "err",
-            customProviderTestBlockedRetry,
-          );
-          return;
+          const resultText = customProviderTestResultText(tested.data, target);
+          await loadCustomProviders();
+          showCustomProviderTestStatus(resultText, "ok");
         } finally {
           if (customProviderTestActiveRun === run) customProviderTestActiveRun = null;
           syncCustomProviderTestControls();
         }
-        const explicitlyUnresolved =
-          (tested.data?.error === "harness_test_in_progress" && tested.data?.replayExpected !== false) ||
-          tested.data?.error === "harness_test_result_unresolved" ||
-          tested.data?.error === "harness_test_result_not_durable" ||
-          tested.data?.error === "core_unreachable";
-        const outcomeUnknown =
-          explicitlyUnresolved || !customProviderTestResponseKnown(tested, requestId, target, harness);
-        const retryAfterMs = Number(tested.data?.retryAfterMs);
-        let retryAvailableAt = null;
-        if (outcomeUnknown) {
-          const requestExpiresInMs = Number(tested.data?.requestExpiresInMs);
-          customProviderTestRetry.expiresAt =
-            Number.isFinite(requestExpiresInMs) && requestExpiresInMs > 0
-              ? Date.now() + requestExpiresInMs
-              : customProviderTestRetry.expiresAt;
-          customProviderTestRetry.retryAt =
-            Number.isFinite(retryAfterMs) && retryAfterMs > 0
-              ? Math.min(customProviderTestRetry.expiresAt, Date.now() + retryAfterMs)
-              : Math.min(customProviderTestRetry.expiresAt, Date.now() + 2_000);
-          if (!persistCustomProviderTestRetry(customProviderTestRetry)) {
-            syncCustomProviderTestControls();
-            showCustomProviderTestStatus(
-              "The paid outcome is unknown and its receipt could not be saved. Harness tests are disabled in this browser.",
-              "err",
-              customProviderTestStorageStatusOwner,
-            );
-            return;
-          }
-          retryAvailableAt = blockCustomProviderTestRetry(retryIdentity, customProviderTestRetry.retryAt);
-        } else if (!tested.ok && Number.isFinite(retryAfterMs) && retryAfterMs > 0) {
-          retryAvailableAt = blockCustomProviderTestRetry(retryIdentity, Date.now() + retryAfterMs);
-        }
-        if (outcomeUnknown) {
-          showCustomProviderTestStatus(
-            (tested.data?.message ||
-              "QM returned an unverified response, so this paid test's outcome is still unknown.") +
-              (retryAvailableAt
-                ? " Retry the same saved request after " + new Date(retryAvailableAt).toLocaleTimeString() + "."
-                : ""),
-            "err",
-            customProviderTestBlockedRetry,
-          );
-          return;
-        }
-        const receiptCleared = clearCustomProviderTestRetry(true);
-        if (!receiptCleared) syncCustomProviderTestControls();
-        const evidence = customProviderTestEvidenceText(tested.data);
-        if (!tested.ok) {
-          showCustomProviderTestStatus(
-            (tested.data?.cached ? "Recent saved result · no new model charge · " : "") +
-              evidence +
-              (tested.data?.message ||
-                (tested.data?.error === "signed_out"
-                  ? "You are signed out. No model request was sent."
-                  : "The generation test failed.")) +
-              (retryAvailableAt
-                ? " Retry available after " + new Date(retryAvailableAt).toLocaleTimeString() + "."
-                : "") +
-              (receiptCleared
-                ? ""
-                : " The result is known, but receipt cleanup could not be verified; further paid tests are disabled until browser storage recovers."),
-            "err",
-            receiptCleared ? customProviderTestBlockedRetry : customProviderTestStorageStatusOwner,
-          );
-          return;
-        }
-        if (!receiptCleared) {
-          showCustomProviderTestStatus(
-            customProviderTestResultText(tested.data, target) +
-              " Receipt cleanup could not be verified; further paid tests are disabled until browser storage recovers.",
-            "err",
-            customProviderTestStorageStatusOwner,
-          );
-          return;
-        }
-        showCustomProviderTestStatus(customProviderTestResultText(tested.data, target), "ok");
       };
       function openOnboardingTarget(target) {
         setView("connectors");
