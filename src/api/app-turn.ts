@@ -296,9 +296,10 @@ export function createTurnMethods(
       }
 
       let dedupKey: string | undefined;
+      const stableWebQaKey = req.surface === "web" && req.idempotencyKey?.startsWith("web-qa:");
       if (req.idempotencyKey) {
-        dedupKey =
-          projectVersion === undefined ? req.idempotencyKey : `${req.idempotencyKey}:project-${projectVersion}`;
+        const projectScoped = projectVersion !== undefined && !stableWebQaKey;
+        dedupKey = projectScoped ? `${req.idempotencyKey}:project-${projectVersion}` : req.idempotencyKey;
       }
 
       if (origin.kind === "human" && !req.approval) deps.reaperPoke?.();
@@ -441,6 +442,16 @@ export function createTurnMethods(
       const enqueued = await withCurrentProjectRoster(enqueue);
       if (!enqueued) return { status: "refused", reason: "project membership changed; retry from the current project" };
       const { run, deduped } = enqueued;
+      if (
+        deduped &&
+        stableWebQaKey &&
+        (run.sessionId !== conversation.threadRef ||
+          run.request.actor.id !== actor.id ||
+          run.request.conversation.kind !== conversation.kind ||
+          run.request.conversation.channelRef !== conversation.channelRef)
+      ) {
+        return { status: "refused", reason: "that test reservation belongs to a different context" };
+      }
       if (!deduped) {
         deps.sessionStateBus?.emit({
           threadRef: conversation.threadRef,
