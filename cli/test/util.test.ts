@@ -1,9 +1,40 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { canonicalJson, flyBin, isInvalidSecret, readEnvFile, writeEnvValue } from "../src/util.ts";
+import { canonicalJson, flyBin, isInvalidSecret, readEnvFile, sourceBuildArgs, writeEnvValue } from "../src/util.ts";
+
+test("source builds stamp only core from Git provenance and fail closed without a commit", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "qm-source-build-"));
+  const dirtyRoot = mkdtempSync(join(tmpdir(), "qm-source-build-dirty-"));
+  const missing = mkdtempSync(join(tmpdir(), "qm-source-build-missing-"));
+  t.after(() => {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(dirtyRoot, { recursive: true, force: true });
+    rmSync(missing, { recursive: true, force: true });
+  });
+  const initialize = (directory: string): string => {
+    mkdirSync(join(directory, "deploy", "core"), { recursive: true });
+    writeFileSync(join(directory, "deploy", "core", "Dockerfile"), "FROM scratch\n");
+    execFileSync("git", ["init", "-q"], { cwd: directory });
+    execFileSync("git", ["add", "-A"], { cwd: directory });
+    execFileSync(
+      "git",
+      ["-c", "user.email=test@qm.invalid", "-c", "user.name=QM Test", "commit", "-q", "-m", "initial"],
+      { cwd: directory },
+    );
+    return execFileSync("git", ["rev-parse", "HEAD"], { cwd: directory, encoding: "utf8" }).trim();
+  };
+  const head = initialize(root);
+  assert.deepEqual(sourceBuildArgs(root, "core"), ["--build-arg", `GIT_SHA=${head}`]);
+  assert.deepEqual(sourceBuildArgs(root, "web-ui"), []);
+  const dirtyHead = initialize(dirtyRoot);
+  writeFileSync(join(dirtyRoot, "dirty.txt"), "dirty\n");
+  assert.deepEqual(sourceBuildArgs(dirtyRoot, "core"), ["--build-arg", `GIT_SHA=${dirtyHead}-dirty`]);
+  assert.throws(() => sourceBuildArgs(missing, "core"), /requires a Git checkout with a commit/);
+});
 
 test("managed credential encryption keys require strong material", () => {
   assert.equal(isInvalidSecret("CONNECTOR_SECRET_KEY", "short"), true);

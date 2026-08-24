@@ -1,6 +1,8 @@
 import type { ModelProviderAvailability } from "../model/pi-models.ts";
 import type { ModelCredentialStore } from "../model/model-credential-store.ts";
 import type { CustomProviderStore } from "../model/custom-provider-store.ts";
+import type { CustomProviderSpec } from "../model/custom-providers.ts";
+import type { CustomProviderTestRunStore } from "../model/custom-provider-test-runs.ts";
 import type { McpServerStore } from "../mcp/mcp-server-store.ts";
 import type { McpToolService } from "../mcp/mcp-tool-service.ts";
 import type { ReplayDedupe } from "../auth/replay-dedupe.ts";
@@ -52,9 +54,32 @@ import type { UiStateStore } from "../surfaces/ui-state.ts";
 import type { RateLimiter } from "../ratelimit/rate-limiter.ts";
 import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
 import type { SlackInstallationStore, SlackSocketAppIdReader } from "../surfaces/slack-installation.ts";
+import type { ModelTestProxyEvidence } from "../harness/model-test-proxy.ts";
+
+export type CustomProviderTestHarness = "pi" | "opencode" | "codex";
+
+export class CustomProviderTestConfigurationChangedError extends Error {}
+export class CustomProviderHarnessTestRolloutIncompleteError extends Error {}
+
+export type CustomProviderHarnessTestRunner = (input: {
+  providerId: string;
+  modelId: string;
+  harnessId: CustomProviderTestHarness;
+  expectedRevision: number;
+  rolloutFence: string;
+  signal: AbortSignal;
+  draft?: { provider: CustomProviderSpec; apiKey: string };
+}) => Promise<{
+  reply?: string;
+  maxOutputTokens?: number;
+  evidence?: ModelTestProxyEvidence;
+  providerRevision: number;
+  upstreamModelId: string;
+}>;
 
 export interface ServerDeps {
   production?: boolean;
+  readyForTraffic?: () => boolean;
   allowUnauthenticatedCore?: boolean;
   signingSecret?: string;
   capabilitySecret?: string;
@@ -92,6 +117,9 @@ export interface ServerDeps {
   modelCredentialFetch?: typeof fetch;
   customProviders?: CustomProviderStore;
   refreshCustomProviders?: () => Promise<void>;
+  customProviderHarnessTest?: CustomProviderHarnessTestRunner;
+  customProviderHarnessTestFence?: () => Promise<string | null>;
+  customProviderTestRuns?: CustomProviderTestRunStore;
   brandingDefault?: OrgBranding;
   harnessId?: string;
   admin?: AdminService;

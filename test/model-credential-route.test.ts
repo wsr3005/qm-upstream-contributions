@@ -139,7 +139,7 @@ test("OpenRouter validation uses an authenticated endpoint", async () => {
 test("OpenRouter catalog exposes runtime-supported tool models as selectable base models", async () => {
   let requested = "";
   let catalogRequests = 0;
-  const srv = start({ openrouterApiKey: "deployment-openrouter-key" }, async (input) => {
+  const srv = start({ harness: "pi", openrouterApiKey: "deployment-openrouter-key" }, async (input) => {
     requested = String(input);
     catalogRequests++;
     return Response.json({

@@ -130,6 +130,12 @@ else console.log("ok");
     assert.match(calls, /secrets unset --stage -a acme-core FLY_DEPLOY_API_TOKEN/);
     assert.ok(calls.indexOf("secrets unset") < calls.indexOf("deploy"));
     assert.ok(calls.indexOf("storage create") < calls.indexOf("deploy"));
+    const deploy = calls
+      .split("\n")
+      .find((line) => line.startsWith("deploy ") && line.includes("deploy/core/Dockerfile"));
+    assert.ok(deploy);
+    assert.equal(deploy.match(/--build-arg GIT_SHA=/g)?.length, 1);
+    assert.match(deploy, /--build-arg GIT_SHA=[0-9a-f]{40}(?:-dirty)?(?:\s|$)/);
     assert.equal(
       JSON.parse(readFileSync(configPath, "utf8")).imageOverrides.core,
       `registry.fly.io/acme-core@sha256:${"b".repeat(64)}`,

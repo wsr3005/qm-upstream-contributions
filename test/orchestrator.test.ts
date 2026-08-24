@@ -89,6 +89,19 @@ test("internal DM turn runs end-to-end and records the session", async () => {
   assert.deepEqual(types, ["user", "assistant"]);
 });
 
+test("rate and budget guard refusals carry structured kinds", async () => {
+  const rateLimited = freshApp({ rateLimitPerWindow: 1 });
+  assert.equal((await rateLimited.app.turn(dm("first"))).status, "ok");
+  const rateResult = await rateLimited.app.turn(dm("second"));
+  assert.equal(rateResult.status, "refused");
+  assert.equal(rateResult.refusalKind, "rate_limit");
+
+  const budgetLimited = freshApp({ budgetUsdPerWindow: 0 });
+  const budgetResult = await budgetLimited.app.turn(dm("first"));
+  assert.equal(budgetResult.status, "refused");
+  assert.equal(budgetResult.refusalKind, "budget_limit");
+});
+
 test("org turn wall-clock governance reaches the harness and a per-turn cap only tightens", async () => {
   const { app, config } = freshApp();
   await config.setTurnWallClockSec(scopeId("org", "default-org"), 120);

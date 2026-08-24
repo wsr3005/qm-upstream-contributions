@@ -2,9 +2,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { CONFIG_FILENAME, loadConfigAt } from "../src/config.ts";
 import { dockerUp } from "../src/backends/docker.ts";
+
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
 const SECRETS = {
   ANTHROPIC_API_KEY: "anthropic-supersecret",
@@ -137,9 +140,19 @@ test("docker up delivers secrets via a 0600 env-file, never on the docker argv",
     console.log = (...parts: unknown[]): void => void lines.push(parts.join(" "));
     console.warn = console.log;
     const { config } = loadConfigAt(join(dir, CONFIG_FILENAME));
-    await dockerUp(config, dir, {});
+    await dockerUp(config, dir, { buildFrom: true, buildFromPath: repoRoot });
 
     const argv = readFileSync(fake.argvLog, "utf8");
+    const build = argv
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as string[])
+      .find((args) => args[0] === "build" && args.includes("qm-core:local"));
+    assert.ok(build, "the core image is built from source");
+    const stampIndexes = build.flatMap((value, index) => (value === "--build-arg" ? [index] : []));
+    const stamps = stampIndexes.map((index) => build[index + 1]!).filter((value) => value.startsWith("GIT_SHA="));
+    assert.equal(stamps.length, 1);
+    assert.match(stamps[0]!, /^GIT_SHA=[0-9a-f]{40}(?:-dirty)?$/);
     for (const value of Object.values(SECRETS)) {
       assert.ok(!argv.includes(value), `secret value must not reach the docker argv: ${value}`);
     }

@@ -36,6 +36,7 @@ import {
   postWithVerify,
   processInboundFiles,
   refusalDelivery,
+  safeRefusalDetail,
   refusalNote,
   renderConversationView,
   resolveReactionTargets,
@@ -667,7 +668,7 @@ export function createTurnHandler(deps: {
       if (delivery === "silent") {
         if (queuedRunId && result.refusalKind === "security_quarantine") inFlightRuns.delete(queuedRunId);
         console.error(
-          `[slack-plugin] unprompted turn ${result.status} (staying quiet) ch=${inc.channel} ts=${inc.ts}: ${result.reason ?? "refused"}`,
+          `[slack-plugin] unprompted turn ${result.status} (staying quiet) ch=${inc.channel} ts=${inc.ts}: ${safeRefusalDetail(result)}`,
         );
         return;
       }
