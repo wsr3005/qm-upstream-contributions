@@ -2,7 +2,12 @@ import { mkdirSync } from "node:fs";
 import { randomBytes, randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import { baseModelProviders, configuredModelForHarness, providerKeysPresent, type Config } from "./config.ts";
-import type { ServerDeps } from "./api/deps.ts";
+import {
+  CustomProviderHarnessTestRolloutIncompleteError,
+  CustomProviderTestConfigurationChangedError,
+  type CustomProviderHarnessTestRunner,
+  type ServerDeps,
+} from "./api/deps.ts";
 import { createIdentityService, type DeactivationRecord, type IdentityService } from "./identity/identity-service.ts";
 import {
   createMemoryConfigStore,
@@ -171,8 +176,23 @@ import { createConsentLinkStore, type ConsentLinkStore, type ConsentLinkRecord }
 import { createModelGateway, type ModelGateway } from "./model/model-gateway.ts";
 import { createModelCredentialStore, type ModelCredentialStore } from "./model/model-credential-store.ts";
 import { setProviderBaseUrls } from "./model/provider-endpoints.ts";
-import { setCustomProviders } from "./model/custom-providers.ts";
-import { createCustomProviderStore, type CustomProviderStore } from "./model/custom-provider-store.ts";
+import { resolveCustomModel, runtimeModelForCustomProvider, setCustomProviders } from "./model/custom-providers.ts";
+import {
+  createCustomProviderStore,
+  CUSTOM_PROVIDER_HARNESS_TEST_CAPABILITY,
+  CUSTOM_PROVIDER_INPUT_MODALITIES_CAPABILITY,
+  CUSTOM_PROVIDER_INPUT_MODALITIES_SCHEMA,
+  CUSTOM_PROVIDER_PUBLICATION_CAPABILITY,
+  CUSTOM_PROVIDER_PUBLICATION_SCHEMA,
+  CUSTOM_PROVIDER_WIRE_ID_CAPABILITY,
+  CUSTOM_PROVIDER_WIRE_ID_SCHEMA,
+  type CustomProviderStore,
+} from "./model/custom-provider-store.ts";
+import {
+  createCustomProviderTestRunStore,
+  type CustomProviderTestRunStore,
+  type StoredCustomProviderTestRun,
+} from "./model/custom-provider-test-runs.ts";
 import { createMemorySessionStore } from "./sessions/memory-session-store.ts";
 import { createPostgresSessionStore } from "./sessions/postgres-session-store.ts";
 import type { SessionStore } from "./sessions/session-store.ts";
@@ -181,6 +201,7 @@ import { createOpenCodeHarness, openCodeHarnessConfigOptions } from "./harness/o
 import { createCodexHarness, codexHarnessConfigOptions } from "./harness/codex-harness.ts";
 import { createClaudeHarness, claudeHarnessConfigOptions } from "./harness/claude-harness.ts";
 import { createPiHarness, piHarnessConfigOptions } from "./harness/pi-harness.ts";
+import { MODEL_TEST_MAX_OUTPUT_TOKENS } from "./harness/model-test-proxy.ts";
 import { createHarnessRouter, resolveRuntimeChoiceDurable } from "./harness/harness-router.ts";
 import type { Harness } from "./harness/harness.ts";
 import { createSecurityScreenProxy, type SecurityScreener } from "./security/security-screener.ts";
@@ -252,8 +273,11 @@ import {
   auxiliaryModelForProvider,
   defaultModelForHarness,
   modelProviderAvailabilityFor,
+  resolveModel,
+  resolveStaticModel,
   type HarnessId,
 } from "./model/pi-models.ts";
+import { NonRetryableTurnError } from "./core/turn-error.ts";
 import { createAdminService, bootAdminGrantSeed, type AdminService } from "./admin/admin-service.ts";
 import { createAdminGrantStore, createMapAdminGrantPersistence, type AdminGrant } from "./admin/admin-grant-store.ts";
 import { createPostgresAdminGrantStore } from "./admin/postgres-admin-grant-store.ts";
@@ -282,6 +306,8 @@ import { sleep } from "./util/async.ts";
 import { createSlackInstallationStore, type SlackInstallationStore } from "./surfaces/slack-installation.ts";
 
 export interface Runtime {
+  ready(): Promise<void>;
+  readyForTraffic(): boolean;
   start(): void;
   stop(): Promise<void>;
   releaseInFlightRuns(): Promise<void>;
@@ -334,7 +360,10 @@ export interface BuiltApp {
   modelGateway: ModelGateway;
   modelCredentials: ModelCredentialStore;
   customProviders: CustomProviderStore;
+  customProviderTestRuns: CustomProviderTestRunStore;
   refreshCustomProviders: () => Promise<void>;
+  customProviderHarnessTest: CustomProviderHarnessTestRunner;
+  customProviderHarnessTestFence: () => Promise<string | null>;
   mcpServers: McpServerStore;
   mcpToolService: McpToolService;
   acl: AclStore;
@@ -388,8 +417,12 @@ export function buildApp(
     securityScreener?: SecurityScreener;
     credentialBrokers?: Record<string, AwsRoleBroker>;
     modelCredentialFetch?: typeof fetch;
+    instanceRegistry?: InstanceRegistry;
   } = {},
 ): BuiltApp {
+  if (config.production && config.databaseUrl && !overrides.instanceRegistry && !config.buildSha) {
+    throw new Error("GIT_SHA is required for production instances with durable storage");
+  }
   if (config.databaseUrl && !config.connectorSecretKey) {
     throw new Error("CONNECTOR_SECRET_KEY is required with durable storage");
   }
@@ -435,7 +468,7 @@ export function buildApp(
     ? createPostgresLeaderLease(pgArtifactMap.pool)
     : createNoopLeaderLease();
   const advisoryLock: AdvisoryLock = pgArtifactMap
-    ? createPostgresAdvisoryLock(pgArtifactMap.pool)
+    ? createPostgresAdvisoryLock(pgArtifactMap.advisoryPool)
     : createMemoryAdvisoryLock();
   const configStore = createMemoryConfigStore(config.orgId, {
     connectorClients: artifactMap<StoredConnectorClient>("connector_clients"),
@@ -595,6 +628,8 @@ export function buildApp(
   const buildLocal = (): Sandbox =>
     createLocalSandbox(workspace, {
       ...config.localSandbox,
+      orgId: config.orgId,
+      environment: config.production ? "production" : "dev",
       onError: sandboxOnError,
     });
   const buildSprites = (): Sandbox =>
@@ -724,44 +759,112 @@ export function buildApp(
       ? createPostgresRunSignalStore(requireDbUrl("RUN_STORE"))
       : createMemoryRunSignalStore();
   const tasks = config.databaseUrl ? createPostgresTaskStore(config.databaseUrl) : createMemoryTaskStore();
+  const instanceRegistry: InstanceRegistry =
+    overrides.instanceRegistry ??
+    (config.buildSha && pgArtifactMap
+      ? createPostgresInstanceRegistry(pgArtifactMap.pool, {
+          instanceId: randomUUID(),
+          buildSha: config.buildSha,
+          startedAt: Date.now(),
+          capabilities: [
+            CUSTOM_PROVIDER_WIRE_ID_CAPABILITY,
+            CUSTOM_PROVIDER_INPUT_MODALITIES_CAPABILITY,
+            CUSTOM_PROVIDER_PUBLICATION_CAPABILITY,
+            CUSTOM_PROVIDER_HARNESS_TEST_CAPABILITY,
+          ],
+        })
+      : createNoopInstanceRegistry());
+  const customProviderRuntimeSchemaReady = async (schema: number) => {
+    if (!config.production) return true;
+    const capabilitiesBySchema = new Map([
+      [CUSTOM_PROVIDER_WIRE_ID_SCHEMA, CUSTOM_PROVIDER_WIRE_ID_CAPABILITY],
+      [CUSTOM_PROVIDER_INPUT_MODALITIES_SCHEMA, CUSTOM_PROVIDER_INPUT_MODALITIES_CAPABILITY],
+      [CUSTOM_PROVIDER_PUBLICATION_SCHEMA, CUSTOM_PROVIDER_PUBLICATION_CAPABILITY],
+    ]);
+    const capability = capabilitiesBySchema.get(schema);
+    if (!capability) return false;
+    return (await instanceRegistry.allLiveSupport?.(capability)) ?? false;
+  };
+  const customProviderHarnessTestFence = async (): Promise<string | null> => {
+    if (!config.production) return "non-production";
+    const snapshot = await instanceRegistry.capabilitySnapshot?.(CUSTOM_PROVIDER_HARNESS_TEST_CAPABILITY);
+    return snapshot?.ready ? snapshot.epoch : null;
+  };
   const customProviders = createCustomProviderStore({
     backing: artifactMap("custom_model_providers"),
     keyMaterial: config.connectorSecretKey ?? randomBytes(32),
+    advisoryLock,
+    runtimeSchemaReady: customProviderRuntimeSchemaReady,
+    runtimeSchemaWritable: customProviderRuntimeSchemaReady,
+  });
+  const customProviderTestRuns = createCustomProviderTestRunStore({
+    backing: artifactMap<StoredCustomProviderTestRun>("custom_provider_test_runs"),
+    advisoryLock,
+    durable: pgArtifactMap !== null,
   });
   const refreshCustomProviders = async () => {
-    setCustomProviders(await customProviders.enabled());
+    const [enabled, knownIds] = await Promise.all([customProviders.enabled(), customProviders.knownModelIds()]);
+    setCustomProviders(enabled, knownIds);
   };
   void refreshCustomProviders().catch((e) =>
     console.error("[wiring] custom provider hydration failed:", errMessage(e)),
   );
-  const resolveModelProviderKeys = async () => {
-    const [anthropic, openai, openrouter, enabledCustom] = await Promise.all([
+  const resolveModelProviderRuntime = async () => {
+    const [anthropic, openai, openrouter, activeCustom] = await Promise.all([
       modelCredentials.resolve("anthropic"),
       modelCredentials.resolve("openai"),
       modelCredentials.resolve("openrouter"),
-      customProviders.enabled(),
+      customProviders.active(),
     ]);
+    const customProvidersSnapshot = activeCustom.map(({ provider }) => provider);
     const customKeys = Object.fromEntries(
-      (
-        await Promise.all(
-          enabledCustom.map(async (p) => {
-            try {
-              return [p.id, await customProviders.resolveKey(p.id)] as const;
-            } catch (e) {
-              // A corrupt/undecryptable custom key must degrade that one
-              // provider, never the whole turn (built-ins included).
-              console.error(`[model] custom provider ${p.id}: key unreadable: ${errMessage(e)}`);
-              return [p.id, null] as const;
-            }
-          }),
-        )
-      ).filter(([, key]) => key),
+      activeCustom.filter(({ apiKey }) => apiKey).map(({ provider, apiKey }) => [provider.id, apiKey]),
     );
     return {
-      ...(anthropic ? { anthropic } : {}),
-      ...(openai ? { openai } : {}),
-      ...(openrouter ? { openrouter } : {}),
-      ...customKeys,
+      keys: {
+        ...(anthropic ? { anthropic } : {}),
+        ...(openai ? { openai } : {}),
+        ...(openrouter ? { openrouter } : {}),
+        ...customKeys,
+      },
+      customProviders: customProvidersSnapshot,
+    };
+  };
+  const resolveCodexCustomProvider = async (modelId: string) => {
+    if (resolveStaticModel(modelId)) return null;
+    const knownCustom = await customProviders.knowsModel(modelId);
+    const custom = resolveCustomModel(modelId);
+    const model = resolveModel(modelId);
+    if (
+      !custom ||
+      !model ||
+      model.provider !== custom.provider ||
+      model.api !== custom.api ||
+      model.baseUrl !== custom.baseUrl
+    ) {
+      if (knownCustom) throw new NonRetryableTurnError(`custom model ${modelId} is not active`);
+      return null;
+    }
+    if (model.api !== "openai-responses") {
+      throw new NonRetryableTurnError(`custom model ${modelId} does not support the Codex Responses transport`);
+    }
+    const providerId = String(model.provider);
+    const active = await customProviders.resolveActive(providerId);
+    if (
+      !active ||
+      !active.apiKey ||
+      active.provider.protocol !== "openai-responses" ||
+      active.provider.baseUrl !== model.baseUrl ||
+      !active.provider.models.some((candidate) => candidate.id === modelId)
+    ) {
+      throw new NonRetryableTurnError(`custom model ${modelId} is not active with a usable Codex credential`);
+    }
+    return {
+      id: active.provider.id,
+      name: active.provider.name,
+      baseUrl: active.provider.baseUrl,
+      apiKey: active.apiKey,
+      modelId: active.provider.models.find((candidate) => candidate.id === modelId)?.upstreamId?.trim() || modelId,
     };
   };
   const runtimeOrgScope = scopeId("org", config.orgId);
@@ -773,7 +876,7 @@ export function buildApp(
       createPiHarness({
         ...piHarnessConfigOptions(config),
         resolveBaseModelId: orgBaseModelId,
-        resolveProviderKeys: resolveModelProviderKeys,
+        resolveProviderRuntime: resolveModelProviderRuntime,
         signals: runSignals,
         mcpTools,
       }),
@@ -786,25 +889,21 @@ export function buildApp(
         tasks,
         mcpTools,
         resolveCustomProviders: async () => {
-          const enabled = await customProviders.enabled();
-          return Promise.all(
-            enabled.map(async (spec) => {
-              try {
-                const apiKey = await customProviders.resolveKey(spec.id);
-                return { spec, ...(apiKey ? { apiKey } : {}) };
-              } catch (e) {
-                // An unreadable key must not prevent the opencode server from
-                // starting; the provider is configured keyless and its models
-                // fail individually instead.
-                console.error(`[model] custom provider ${spec.id}: key unreadable: ${errMessage(e)}`);
-                return { spec };
-              }
-            }),
-          );
+          const active = await customProviders.active();
+          return active.map(({ provider: spec, apiKey }) => ({ spec, ...(apiKey ? { apiKey } : {}) }));
         },
       }),
     ],
-    ["codex", createCodexHarness({ ...codexHarnessConfigOptions(config), signals: runSignals, tasks, mcpTools })],
+    [
+      "codex",
+      createCodexHarness({
+        ...codexHarnessConfigOptions(config),
+        signals: runSignals,
+        tasks,
+        mcpTools,
+        resolveCustomProvider: resolveCodexCustomProvider,
+      }),
+    ],
     ["claude", createClaudeHarness({ ...claudeHarnessConfigOptions(config), signals: runSignals, tasks, mcpTools })],
     ["mock", createMockHarness()],
   ]);
@@ -820,12 +919,66 @@ export function buildApp(
     },
   };
   const judgeModelId = (): string => config.judgeModelId ?? auxiliaryModelFor(orgBaseModelId() ?? fallback.modelId);
-  const harness = createHarnessRouter(adapters, adapters.get(fallbackHarness)!, (input) =>
-    resolveRuntimeChoiceDurable(configStore, runtimeOrgScope, input.scopeLabel, fallback, {
+  const harness = createHarnessRouter(adapters, adapters.get(fallbackHarness)!, async (input) => {
+    await refreshCustomProviders();
+    return resolveRuntimeChoiceDurable(configStore, runtimeOrgScope, input.scopeLabel, fallback, {
       ...(input.harness ? { harnessId: input.harness as HarnessId } : {}),
       ...(input.model ? { modelId: input.model } : {}),
-    }),
-  );
+    });
+  });
+  const customProviderHarnessTest: CustomProviderHarnessTestRunner = async (input) => {
+    const initialState = input.draft
+      ? { active: { ...input.draft, revision: 0 }, rolloutFence: await customProviderHarnessTestFence() }
+      : await customProviders.testableHarnessState(input.providerId, customProviderHarnessTestFence);
+    if (initialState.rolloutFence !== input.rolloutFence) {
+      throw new CustomProviderHarnessTestRolloutIncompleteError(
+        "custom provider harness testing is unavailable during a mixed-version rollout",
+      );
+    }
+    const active = initialState.active;
+    if (
+      !active?.apiKey ||
+      active.revision !== input.expectedRevision ||
+      !active.provider.models.some((model) => model.id === input.modelId)
+    ) {
+      if (active?.revision !== input.expectedRevision) {
+        throw new CustomProviderTestConfigurationChangedError("custom provider changed before the test started");
+      }
+      throw new Error("custom provider model is not active");
+    }
+    const runtimeModel = runtimeModelForCustomProvider(active.provider, input.modelId);
+    if (!runtimeModel) throw new Error("custom provider model is not active");
+    if (input.harnessId === "codex" && active.provider.protocol !== "openai-responses") {
+      throw new Error(`model ${input.modelId} is unavailable to ${input.harnessId}`);
+    }
+    const testModel = adapters.get(input.harnessId)?.models.testModel;
+    if (!testModel) throw new Error(`harness ${input.harnessId} cannot test a model`);
+    const result = await testModel({
+      model: input.modelId,
+      expectedUpstreamModel: runtimeModel.id,
+      maxOutputTokens: MODEL_TEST_MAX_OUTPUT_TOKENS,
+      systemPrompt: "You are testing a model connection for an organization administrator. Do not use tools.",
+      prompt: "Reply with a short confirmation that the model connection works.",
+      signal: input.signal,
+      customProvider: { spec: active.provider, apiKey: active.apiKey },
+    });
+    const finalState = input.draft
+      ? { active, rolloutFence: await customProviderHarnessTestFence() }
+      : await customProviders.testableHarnessState(input.providerId, customProviderHarnessTestFence);
+    if (finalState.rolloutFence !== input.rolloutFence) {
+      throw new CustomProviderHarnessTestRolloutIncompleteError(
+        "custom provider harness testing became unavailable during the request",
+      );
+    }
+    if (finalState.active?.revision !== active.revision) {
+      throw new CustomProviderTestConfigurationChangedError("custom provider changed during the test");
+    }
+    return {
+      ...result,
+      providerRevision: active.revision,
+      upstreamModelId: runtimeModel.id,
+    };
+  };
 
   const leaseTtlMs = config.leaseTtlMs;
   const maxAttempts = config.maxAttempts;
@@ -1382,14 +1535,6 @@ export function buildApp(
         },
       })
     : undefined;
-  const instanceRegistry: InstanceRegistry =
-    config.buildSha && pgArtifactMap
-      ? createPostgresInstanceRegistry(pgArtifactMap.pool, {
-          instanceId: randomUUID(),
-          buildSha: config.buildSha,
-          startedAt: Date.now(),
-        })
-      : createNoopInstanceRegistry();
   const taskProtection: TaskProtection | null =
     config.ecsTaskProtection && config.ecsAgentUri ? createEcsTaskProtection(config.ecsAgentUri) : null;
   const drain: DrainController = createDrainController({
@@ -1419,6 +1564,9 @@ export function buildApp(
   const deployIdleTtlMs = deployProvider.profile.managedScaleToZero ? undefined : config.deployIdleTtlMs;
   const BLOB_TTL_MS = 6 * 60 * 60_000;
   const blobSweeper = createSweeper(() => blobTransfer.sweep(BLOB_TTL_MS), 30 * 60_000);
+  const customProviderTestRunSweeper = createSweeper(() => customProviderTestRuns.sweep(), 5 * 60_000, {
+    label: "custom-provider-test-runs",
+  });
   const BLOB_TRANSFER_EXPIRY_DAYS = 1;
   void blobTransfer
     .ensureExpiry?.(BLOB_TRANSFER_EXPIRY_DAYS)
@@ -1446,7 +1594,10 @@ export function buildApp(
       )
     : null;
   const runtime: Runtime = {
+    ready: () => drain.ready(),
+    readyForTraffic: () => drain.readyForTraffic(),
     start() {
+      drain.start();
       if (!config.backgroundWorkEnabled) return;
       for (const w of workers) w.start();
       reaper.start();
@@ -1454,12 +1605,12 @@ export function buildApp(
       monitorPoller?.start(config.monitorPollMs);
       if (config.skillSyncPollMs > 0) skillSyncEngine.start(config.skillSyncPollMs);
       blobSweeper.start();
+      customProviderTestRunSweeper.start();
       idleSweeper?.start();
       deepIdleSweeper?.start();
       reachDeniedNotifier?.start(config.insightsIntervalMs);
       wakeSweep.start();
       orphanedSignalSweeper.start();
-      drain.start();
     },
     async releaseInFlightRuns() {
       await Promise.all(workers.map((w) => w.releaseInFlight()));
@@ -1473,6 +1624,7 @@ export function buildApp(
       deepIdleSweeper?.stop();
       reachDeniedNotifier?.stop();
       blobSweeper.stop();
+      customProviderTestRunSweeper.stop();
       wakeSweep.stop();
       orphanedSignalSweeper.stop();
       await Promise.all(workers.map((w) => w.stop(config.shutdownDrainMs))).catch(
@@ -1511,7 +1663,10 @@ export function buildApp(
     modelGateway,
     modelCredentials,
     customProviders,
+    customProviderTestRuns,
     refreshCustomProviders,
+    customProviderHarnessTest,
+    customProviderHarnessTestFence,
     mcpServers,
     mcpToolService,
     acl,
@@ -1569,6 +1724,7 @@ export function serverDeps(
   const configuredModel = configuredModelForHarness(config, config.harness);
   return {
     production: config.production,
+    ...(config.production ? { readyForTraffic: built.runtime.readyForTraffic } : {}),
     allowUnauthenticatedCore: config.allowUnauthenticatedCore,
     ...(config.signingSecret ? { signingSecret: config.signingSecret } : {}),
     ...(config.capabilitySecret ? { capabilitySecret: config.capabilitySecret } : {}),
@@ -1581,7 +1737,10 @@ export function serverDeps(
     providerKeys: providerKeysPresent(config),
     modelCredentials: built.modelCredentials,
     customProviders: built.customProviders,
+    customProviderTestRuns: built.customProviderTestRuns,
     refreshCustomProviders: built.refreshCustomProviders,
+    customProviderHarnessTest: built.customProviderHarnessTest,
+    customProviderHarnessTestFence: built.customProviderHarnessTestFence,
     mcpServers: built.mcpServers,
     mcpToolService: built.mcpToolService,
     ...(config.brandingDefault ? { brandingDefault: config.brandingDefault } : {}),

@@ -1,28 +1,15 @@
-/**
- * Custom model providers.
- *
- * An org admin can register additional model providers that speak one of
- * the two wire protocols we already run — OpenAI-compatible or
- * Anthropic-compatible — by giving a base URL, an API key, and the model
- * ids to expose. Registered models resolve like built-ins (the pi
- * harness reaches them through the same request path), surface in the
- * catalog, and are gated to harnesses that route through pi-ai.
- *
- * Secrets never live here: this module holds the runtime registry
- * (everything except the key). Keys stay in the encrypted store and are
- * resolved per-call by wiring alongside the built-in provider keys.
- */
-
 import { parseProviderBaseUrl, PROVIDER_IDS } from "./provider-endpoints.ts";
 
-export const CUSTOM_PROVIDER_PROTOCOLS = ["openai", "anthropic"] as const;
+export const CUSTOM_PROVIDER_PROTOCOLS = ["openai", "openai-responses", "anthropic"] as const;
 export type CustomProviderProtocol = (typeof CUSTOM_PROVIDER_PROTOCOLS)[number];
 
-interface CustomModelSpec {
+export interface CustomModelSpec {
   id: string;
+  upstreamId?: string;
   name?: string;
   contextWindow?: number;
   maxTokens?: number;
+  inputModalities?: ("text" | "image")[];
   /** USD per million input tokens. Defaults to 0 (unknown / not metered). */
   input?: number;
   /** USD per million output tokens. Defaults to 0. */
@@ -57,15 +44,46 @@ export function validateCustomProviderSpec(spec: CustomProviderSpec): void {
   }
   if (spec.models.length > 200) throw new Error("at most 200 models per provider");
   const seen = new Set<string>();
+  const upstreamSeen = new Set<string>();
   for (const m of spec.models) {
-    if (!m.id?.trim() || m.id.length > 200) throw new Error("every model needs an id (<=200 chars)");
+    if (!m || typeof m !== "object" || typeof m.id !== "string" || !m.id.trim() || m.id.length > 200) {
+      throw new Error("every model needs an id (<=200 chars)");
+    }
     if (m.name !== undefined && (typeof m.name !== "string" || m.name.length > 200))
       throw new Error(`model "${m.id}": name must be a string of 200 chars or fewer`);
     if (seen.has(m.id)) throw new Error(`duplicate model id "${m.id}"`);
     seen.add(m.id);
+    if (
+      m.upstreamId !== undefined &&
+      (typeof m.upstreamId !== "string" ||
+        !m.upstreamId.trim() ||
+        m.upstreamId.length > 200 ||
+        m.upstreamId !== m.upstreamId.trim())
+    ) {
+      throw new Error(`model "${m.id}": upstreamId must be a non-empty string of 200 chars or fewer`);
+    }
+    const upstreamId = m.upstreamId?.trim() || m.id;
+    if (upstreamSeen.has(upstreamId)) throw new Error(`duplicate upstream model id "${upstreamId}"`);
+    upstreamSeen.add(upstreamId);
     for (const [field, v] of [
       ["contextWindow", m.contextWindow],
       ["maxTokens", m.maxTokens],
+    ] as const) {
+      if (v !== undefined && (!Number.isInteger(v) || v <= 0)) {
+        throw new Error(`model "${m.id}": ${field} must be a positive integer`);
+      }
+    }
+    if (
+      m.inputModalities !== undefined &&
+      (!Array.isArray(m.inputModalities) ||
+        m.inputModalities.length === 0 ||
+        !m.inputModalities.includes("text") ||
+        m.inputModalities.some((modality) => modality !== "text" && modality !== "image") ||
+        new Set(m.inputModalities).size !== m.inputModalities.length)
+    ) {
+      throw new Error(`model "${m.id}": inputModalities must be text or text,image`);
+    }
+    for (const [field, v] of [
       ["input", m.input],
       ["output", m.output],
     ] as const) {
@@ -83,9 +101,10 @@ export function validateCustomProviderSpec(spec: CustomProviderSpec): void {
  */
 export interface CustomRuntimeModel {
   id: string;
+  wireId: string;
   name: string;
   provider: string;
-  api: "openai-completions" | "anthropic-messages";
+  api: "openai-completions" | "openai-responses" | "anthropic-messages";
   baseUrl: string;
   reasoning: boolean;
   input: ("text" | "image")[];
@@ -97,23 +116,41 @@ export interface CustomRuntimeModel {
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 const DEFAULT_MAX_TOKENS = 8_192;
 
+function runtimeApi(protocol: CustomProviderProtocol): CustomRuntimeModel["api"] {
+  if (protocol === "anthropic") return "anthropic-messages";
+  if (protocol === "openai-responses") return "openai-responses";
+  return "openai-completions";
+}
+
 function toRuntimeModel(provider: CustomProviderSpec, m: CustomModelSpec): CustomRuntimeModel {
   return {
     id: m.id,
+    wireId: m.upstreamId?.trim() || m.id,
     name: m.name?.trim() || m.id,
     provider: provider.id,
-    api: provider.protocol === "anthropic" ? "anthropic-messages" : "openai-completions",
+    api: runtimeApi(provider.protocol),
     baseUrl: provider.baseUrl,
     reasoning: false,
-    input: ["text"],
+    input: m.inputModalities ? [...m.inputModalities] : ["text"],
     cost: { input: m.input ?? 0, output: m.output ?? 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: m.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
     maxTokens: m.maxTokens ?? DEFAULT_MAX_TOKENS,
   };
 }
 
+export function runtimeModelForCustomProvider(
+  provider: CustomProviderSpec,
+  modelId: string,
+): CustomRuntimeModel | undefined {
+  const model = provider.models.find((candidate) => candidate.id === modelId);
+  if (!model) return undefined;
+  const runtime = toRuntimeModel(provider, model);
+  return { ...runtime, id: runtime.wireId };
+}
+
 let registry = new Map<string, CustomRuntimeModel>();
 let providers: CustomProviderSpec[] = [];
+let knownModelIds = new Set<string>();
 let version = 0;
 
 /**
@@ -122,15 +159,27 @@ let version = 0;
  * ids shadow custom ones at resolution, so a collision can't hijack a
  * built-in.
  */
-export function setCustomProviders(specs: CustomProviderSpec[]): void {
+export function setCustomProviders(specs: CustomProviderSpec[], knownIds?: readonly string[]): void {
+  const snapshot = specs.map((spec) => ({ ...spec, models: [...spec.models] }));
   const next = new Map<string, CustomRuntimeModel>();
-  for (const spec of specs) {
+  for (const spec of snapshot) {
     for (const m of spec.models) {
+      if (next.has(m.id)) throw new Error(`custom model id "${m.id}" is registered by more than one provider`);
       next.set(m.id, toRuntimeModel(spec, m));
     }
   }
+  const nextKnown = new Set((knownIds ?? [...knownModelIds]).filter((id) => typeof id === "string" && id.length > 0));
+  for (const id of next.keys()) nextKnown.add(id);
+  if (
+    JSON.stringify(snapshot) === JSON.stringify(providers) &&
+    nextKnown.size === knownModelIds.size &&
+    [...nextKnown].every((id) => knownModelIds.has(id))
+  ) {
+    return;
+  }
   registry = next;
-  providers = specs.map((s) => ({ ...s, models: [...s.models] }));
+  providers = snapshot;
+  knownModelIds = nextKnown;
   version += 1;
 }
 
@@ -147,6 +196,10 @@ export function isCustomModelId(id: string): boolean {
   return registry.has(id);
 }
 
+export function isKnownCustomModelId(id: string): boolean {
+  return knownModelIds.has(id);
+}
+
 export function customModelCatalog(): Array<{ id: string; name: string; provider: string }> {
   return [...registry.values()].map((m) => ({ id: m.id, name: m.name, provider: m.provider }));
 }
@@ -158,25 +211,32 @@ export function customModelCatalog(): Array<{ id: string; name: string; provider
  * a runtime API key alone is not enough (availability checks only cover
  * providers the ModelsStore knows).
  */
-export function customModelsJson(): { providers: Record<string, unknown> } | undefined {
-  if (providers.length === 0) return undefined;
+export function customModelsJsonForProviders(
+  specs: CustomProviderSpec[],
+): { providers: Record<string, unknown> } | undefined {
+  if (specs.length === 0) return undefined;
   return {
     providers: Object.fromEntries(
-      providers.map((spec) => [
+      specs.map((spec) => [
         spec.id,
         {
           name: spec.name,
           baseUrl: spec.baseUrl,
-          api: spec.protocol === "anthropic" ? "anthropic-messages" : "openai-completions",
+          api: runtimeApi(spec.protocol),
           models: spec.models.map((m) => ({
-            id: m.id,
+            id: m.upstreamId?.trim() || m.id,
             name: m.name ?? m.id,
             contextWindow: m.contextWindow ?? 128_000,
             maxTokens: m.maxTokens ?? 8_192,
+            input: m.inputModalities ? [...m.inputModalities] : ["text"],
             cost: { input: m.input ?? 0, output: m.output ?? 0, cacheRead: 0, cacheWrite: 0 },
           })),
         },
       ]),
     ),
   };
+}
+
+export function customModelsJson(): { providers: Record<string, unknown> } | undefined {
+  return customModelsJsonForProviders(providers);
 }

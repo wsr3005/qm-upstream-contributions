@@ -103,6 +103,13 @@ export function standInCheckout(services: readonly string[]): string {
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, "Dockerfile"), STANDIN_DOCKERFILE);
   }
+  execFileSync("git", ["init", "-q"], { cwd: root });
+  execFileSync("git", ["add", "-A"], { cwd: root });
+  execFileSync(
+    "git",
+    ["-c", "user.email=test@qm.invalid", "-c", "user.name=QM Test", "commit", "-q", "-m", "stand-in"],
+    { cwd: root },
+  );
   return root;
 }
 
@@ -137,21 +144,23 @@ export function deploymentContainers(orgId: string): string[] {
   }
 }
 
-const existingDockerNames = (kind: "volume" | "network", candidates: string[]): string[] => {
+const existingDockerNames = (kind: "volume" | "network", orgId: string, candidates: string[]): string[] => {
   try {
-    const present = new Set(
-      execFileSync("docker", [kind, "ls", "--format", "{{.Name}}"], { encoding: "utf8" })
+    const lines = (args: string[]): string[] =>
+      execFileSync("docker", args, { encoding: "utf8" })
         .split("\n")
-        .map((s) => s.trim()),
-    );
-    return candidates.filter((c) => present.has(c));
+        .map((s) => s.trim())
+        .filter(Boolean);
+    const present = new Set(lines([kind, "ls", "--format", "{{.Name}}"]));
+    const labeled = lines([kind, "ls", "--filter", `label=qm.org=${orgId}`, "--format", "{{.Name}}"]);
+    return [...new Set([...candidates.filter((candidate) => present.has(candidate)), ...labeled])];
   } catch {
     return [];
   }
 };
 export const deploymentVolumes = (orgId: string): string[] =>
-  existingDockerNames("volume", [`qm-${orgId}-pgdata`, `qm-${orgId}-coredata`]);
-export const deploymentNetworks = (orgId: string): string[] => existingDockerNames("network", [`qm-${orgId}`]);
+  existingDockerNames("volume", orgId, [`qm-${orgId}-pgdata`, `qm-${orgId}-coredata`]);
+export const deploymentNetworks = (orgId: string): string[] => existingDockerNames("network", orgId, [`qm-${orgId}`]);
 
 export function preexistingServiceImages(services: readonly string[]): string[] {
   try {

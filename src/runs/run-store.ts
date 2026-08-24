@@ -45,6 +45,7 @@ export interface EnqueueInput {
 export interface EnqueueResult {
   run: Run;
   deduped: boolean;
+  conflict: boolean;
 }
 
 export interface RunStore {

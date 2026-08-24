@@ -89,6 +89,19 @@ test("internal DM turn runs end-to-end and records the session", async () => {
   assert.deepEqual(types, ["user", "assistant"]);
 });
 
+test("rate and budget guard refusals carry structured kinds", async () => {
+  const rateLimited = freshApp({ rateLimitPerWindow: 1 });
+  assert.equal((await rateLimited.app.turn(dm("first"))).status, "ok");
+  const rateResult = await rateLimited.app.turn(dm("second"));
+  assert.equal(rateResult.status, "refused");
+  assert.equal(rateResult.refusalKind, "rate_limit");
+
+  const budgetLimited = freshApp({ budgetUsdPerWindow: 0 });
+  const budgetResult = await budgetLimited.app.turn(dm("first"));
+  assert.equal(budgetResult.status, "refused");
+  assert.equal(budgetResult.refusalKind, "budget_limit");
+});
+
 test("org turn wall-clock governance reaches the harness and a per-turn cap only tightens", async () => {
   const { app, config } = freshApp();
   await config.setTurnWallClockSec(scopeId("org", "default-org"), 120);
@@ -295,6 +308,28 @@ test("a setup-phase failure after the lease is acquired does NOT wedge the threa
   const res = await app.turn(dm("hi again"));
   assert.equal(res.status, "ok", res.reason);
   assert.doesNotMatch(res.reason ?? "", /session busy/);
+});
+
+test("an idempotency key replays only an exact request fingerprint", async () => {
+  const { app } = freshApp();
+  const original = dm("run once", { idempotencyKey: "exact-request-1", async: true });
+  const first = await app.turn(original);
+  const replay = await app.turn(original);
+  assert.equal(first.status, "queued");
+  assert.equal(replay.runId, first.runId);
+
+  const changedText = await app.turn({ ...original, text: "different body" });
+  assert.equal(changedText.status, "refused");
+  assert.match(changedText.reason ?? "", /idempotency key conflicts/);
+
+  const changedThread = await app.turn({
+    ...original,
+    conversation: { kind: "dm", threadRef: "dm:U1:t2" },
+  });
+  assert.equal(changedThread.status, "refused");
+
+  const changedModel = await app.turn({ ...original, model: "different-model" });
+  assert.equal(changedModel.status, "refused");
 });
 
 test("a retried run RESUMES the interrupted turn from the durable ledger instead of restarting it", async () => {

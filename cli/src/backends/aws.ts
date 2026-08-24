@@ -47,6 +47,8 @@ import {
   resolveBuildRepoRoot,
   runInherit,
   sleep,
+  sourceBuildArgs,
+  sourceBuildInfo,
   streamLabeled,
 } from "../util.ts";
 import { doctorCommon } from "./doctor.ts";
@@ -471,22 +473,6 @@ function workloadImageProvenance(
   return { kind: "configured", source };
 }
 
-const sourceBuildInfoByRoot = new Map<string, { gitCommit?: string; dirty?: boolean }>();
-
-function sourceBuildInfo(root: string): { gitCommit?: string; dirty?: boolean } {
-  const cached = sourceBuildInfoByRoot.get(root);
-  if (cached) return cached;
-  const info: { gitCommit?: string; dirty?: boolean } = {};
-  try {
-    info.gitCommit = capture("git", ["-C", root, "rev-parse", "HEAD"]).trim();
-    info.dirty = capture("git", ["-C", root, "status", "--porcelain"]).trim().length > 0;
-  } catch {
-    void 0;
-  }
-  sourceBuildInfoByRoot.set(root, info);
-  return info;
-}
-
 function sourceImageDigest(source: string): string {
   const pinned = source.match(/@(?<digest>sha256:[0-9a-f]{64})$/)?.groups?.digest;
   if (pinned) return pinned;
@@ -556,10 +542,12 @@ function publishWorkloadImage(
       "-t",
       tagged,
     ];
-    const info = sourceBuildInfo(root);
-    if (info.gitCommit) args.push("--build-arg", `GIT_SHA=${info.gitCommit}${info.dirty ? "-dirty" : ""}`);
-    for (const [name, value] of Object.entries(workloadBuildArgs(config, workload)))
-      args.push("--build-arg", `${name}=${value}`);
+    const configuredBuildArgs = workloadBuildArgs(config, workload);
+    if (workload === "core" && Object.hasOwn(configuredBuildArgs, "GIT_SHA")) {
+      throw new CliError("aws.services.core.buildArgs.GIT_SHA is reserved for source-build provenance");
+    }
+    for (const [name, value] of Object.entries(configuredBuildArgs)) args.push("--build-arg", `${name}=${value}`);
+    args.push(...sourceBuildArgs(root, workload));
     args.push(root);
     runInherit("docker", args);
   } else {

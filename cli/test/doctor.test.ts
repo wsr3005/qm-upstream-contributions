@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
   doctorCommon,
   localDoctorSecrets,
+  manifestIncludesLinuxAmd64,
   requiredSlackScopes,
   slackManifestBotScopes,
 } from "../src/backends/doctor.ts";
@@ -488,6 +489,54 @@ test("doctor treats a missing sandbox block as info (no Fly checks), not a failu
     if (priorFly === undefined) delete process.env.FLY_BIN;
     else process.env.FLY_BIN = priorFly;
   }
+});
+
+test("Docker local doctor accepts a registry digest on a fresh engine without Fly", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-doctor-local-"));
+  const priorPath = process.env.PATH;
+  const priorFly = process.env.FLY_BIN;
+  const priorLocalPlatform = process.env.FAKE_LOCAL_IMAGE_PLATFORM;
+  const localConfig = {
+    ...config,
+    sandbox: {
+      app: "local-sandboxes",
+      backend: "local" as const,
+      image: `registry.example.test/sandbox@sha256:${"a".repeat(64)}`,
+    },
+  };
+  const bin = join(dir, "docker");
+  writeFileSync(
+    bin,
+    `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === "context") { console.log("unix:///var/run/docker.sock"); process.exit(0); }
+if (args[0] === "image" && args[1] === "inspect" && process.env.FAKE_LOCAL_IMAGE_PLATFORM) { console.log(JSON.stringify({ Os: "linux", Architecture: process.env.FAKE_LOCAL_IMAGE_PLATFORM })); process.exit(0); }
+if (args[0] === "manifest" && args[1] === "inspect") { console.log(JSON.stringify({ Descriptor: { platform: { os: "linux", architecture: "amd64" } } })); process.exit(0); }
+if (args[0] === "version") process.exit(0);
+process.exit(2);
+`,
+  );
+  chmodSync(bin, 0o755);
+  process.env.PATH = `${dir}:${priorPath}`;
+  process.env.FLY_BIN = "/nonexistent/fly-should-never-run";
+  try {
+    await assert.doesNotReject(doctorCommon(localConfig, new Map()));
+    process.env.FAKE_LOCAL_IMAGE_PLATFORM = "arm64";
+    await assert.rejects(doctorCommon(localConfig, new Map()), /local image .* does not include linux\/amd64/);
+  } finally {
+    process.env.PATH = priorPath;
+    if (priorFly === undefined) delete process.env.FLY_BIN;
+    else process.env.FLY_BIN = priorFly;
+    if (priorLocalPlatform === undefined) delete process.env.FAKE_LOCAL_IMAGE_PLATFORM;
+    else process.env.FAKE_LOCAL_IMAGE_PLATFORM = priorLocalPlatform;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("registry manifest platform inspection rejects an arm64-only sandbox", () => {
+  assert.equal(manifestIncludesLinuxAmd64({ platform: { os: "linux", architecture: "arm64" } }), false);
+  assert.equal(manifestIncludesLinuxAmd64({ manifests: [{ platform: { os: "linux", architecture: "amd64" } }] }), true);
+  assert.equal(manifestIncludesLinuxAmd64({ Os: "linux", Architecture: "amd64" }), true);
 });
 
 test("an explicitly named --env-file that does not exist is a bad-path error, not 'secrets missing'", () => {

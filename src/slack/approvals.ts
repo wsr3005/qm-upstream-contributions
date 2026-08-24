@@ -19,6 +19,7 @@ import {
   isBoundaryRefusal,
   recoveredApprovalContext,
   resolveReactionTargets,
+  safeRefusalDetail,
   slackReplyArgs,
   stripAckPrefix,
   toSlackMrkdwn,
@@ -347,7 +348,7 @@ export function createApprovals(deps: {
     await failAgentRequest(
       client,
       ctx,
-      result.reason ?? result.status,
+      safeRefusalDetail(result, result.status),
       opts.handoffMessageTs ?? opts.approvalMessageTs,
     );
   }
@@ -708,13 +709,16 @@ export function createApprovals(deps: {
         return;
       }
 
-      const failLink = isBoundaryRefusal(result.reason) ? null : (result.adminUrl ?? null);
+      const failLink =
+        result.refusalKind === "security_quarantine" || isBoundaryRefusal(result.reason)
+          ? null
+          : (result.adminUrl ?? null);
       const failDetail = failLink ? ` Full error: ${failLink}` : "";
       await updateSlackMessage(
         client,
         cardChannel,
         messageTs,
-        `I can't continue — ${result.reason ?? "refused"}.${failDetail}`,
+        `I can't continue — ${safeRefusalDetail(result)}.${failDetail}`,
       );
     } catch (err) {
       const msg = (err as Error).message;

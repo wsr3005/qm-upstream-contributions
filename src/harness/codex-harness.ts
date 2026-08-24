@@ -14,10 +14,18 @@ import { swallow } from "../util/errors.ts";
 import { countTokens } from "../util/tokens.ts";
 import { parseSecurityScreenVerdict, SECURITY_SCREEN_SYSTEM_PROMPT } from "../security/security-posture.ts";
 import { CodexAppServer, CodexRpcError } from "./codex-app-server.ts";
-import { defineHarness, type Harness, type HarnessTurnInput, type HarnessTurnResult } from "./harness.ts";
+import {
+  defineHarness,
+  type Harness,
+  type HarnessModelTestInput,
+  type HarnessTurnInput,
+  type HarnessTurnResult,
+} from "./harness.ts";
 import { coreToolOptions, createPiTools, type PiToolsOptions, type ToolContextRef } from "./pi-tools.ts";
 import type { McpToolDescriptor } from "../mcp/mcp-tool-service.ts";
 import { reconstructMessagesFromHistory, seedPriorTurns, type PiReplayMessage } from "./replay.ts";
+import { createModelTestProxy } from "./model-test-proxy.ts";
+import { createCodexProviderProxy } from "./codex-provider-proxy.ts";
 
 export interface CodexHarnessOptions {
   modelId?: string | ((scope?: ScopeId) => string | undefined);
@@ -38,6 +46,15 @@ export interface CodexHarnessOptions {
   appServerStartTimeoutMs?: number;
   signals?: RunSignalStore;
   tasks?: TaskStore;
+  resolveCustomProvider?: (modelId: string) => Promise<CodexCustomProviderBinding | null>;
+}
+
+export interface CodexCustomProviderBinding {
+  id: string;
+  name: string;
+  baseUrl: string;
+  apiKey: string;
+  modelId?: string;
 }
 
 export function codexHarnessConfigOptions(config: Config): CodexHarnessOptions {
@@ -100,9 +117,18 @@ type ActiveTurn = {
   tapeWriteFailed: boolean;
   interrupt?: () => Promise<void>;
   stopped: boolean;
+  runtime: Runtime;
 };
 
-type Runtime = { server: CodexAppServer; jail: string };
+type Runtime = {
+  server: CodexAppServer;
+  providerProxy?: Awaited<ReturnType<typeof createCodexProviderProxy>>;
+  jail: string;
+  key: string;
+  family: string;
+  retired: boolean;
+  closing: boolean;
+};
 const CODEX_START_TIMEOUT_MS = 30_000;
 
 const CODEX_NON_RETRYABLE_PATTERN =
@@ -182,9 +208,11 @@ const CODEX_ENV_PASSTHROUGH = [
   "HTTPS_PROXY",
   "NO_PROXY",
   "ALL_PROXY",
+  "no_proxy",
   "OPENAI_API_KEY",
   "OPENAI_BASE_URL",
   "CODEX_ACCESS_TOKEN",
+  "QM_CODEX_PROVIDER_KEY",
 ] as const;
 
 export function codexChildEnv(source: NodeJS.ProcessEnv, jail: string): NodeJS.ProcessEnv {
@@ -209,6 +237,55 @@ export function prepareCodexHome(source: NodeJS.ProcessEnv, jail: string): strin
     );
   }
   return target;
+}
+
+export function codexCustomRuntimeSpec(
+  source: NodeJS.ProcessEnv,
+  binding: CodexCustomProviderBinding | null,
+  disableRetries = false,
+): { key: string; family: string; env: NodeJS.ProcessEnv; config: Record<string, unknown> } {
+  if (!binding) return { key: "default", family: "default", env: source, config: {} };
+  const noProxy = [
+    ...new Set([
+      ...(source.NO_PROXY ?? "").split(","),
+      ...(source.no_proxy ?? "").split(","),
+      "127.0.0.1",
+      "localhost",
+      "::1",
+    ]),
+  ]
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .join(",");
+  const env: NodeJS.ProcessEnv = {
+    ...source,
+    QM_CODEX_PROVIDER_KEY: binding.apiKey,
+    NO_PROXY: noProxy,
+    no_proxy: noProxy,
+  };
+  delete env.OPENAI_API_KEY;
+  delete env.OPENAI_BASE_URL;
+  delete env.CODEX_ACCESS_TOKEN;
+  const key = createHash("sha256")
+    .update(JSON.stringify([binding.id, binding.baseUrl, binding.apiKey]))
+    .digest("hex");
+  return {
+    key: `custom:${binding.id}:${key}`,
+    family: `custom:${binding.id}`,
+    env,
+    config: {
+      model_provider: binding.id,
+      model_providers: {
+        [binding.id]: {
+          name: binding.name,
+          base_url: binding.baseUrl,
+          env_key: "QM_CODEX_PROVIDER_KEY",
+          wire_api: "responses",
+          ...(disableRetries ? { request_max_retries: 0, stream_max_retries: 0 } : {}),
+        },
+      },
+    },
+  };
 }
 
 async function transitionTask(
@@ -356,9 +433,32 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
       DEFAULT_CODEX_MODEL_ID,
     ].find((id): id is string => modelSupportedByHarness(id, "codex"))!;
   const defaultTurnWallClockMs = opts.turnWallClockMs ?? CONFIG_DEFAULTS.turnWallClockSec * 1000;
-  let runtime: Runtime | null = null;
-  let starting: Promise<Runtime> | null = null;
-  let startingServer: CodexAppServer | null = null;
+  const runtimes = new Map<string, Runtime>();
+  const starting = new Map<string, Promise<Runtime>>();
+  const startingServers = new Set<CodexAppServer>();
+  const reservations = new Map<string, number>();
+  const desiredRuntimeByFamily = new Map<string, string>();
+
+  const closeRuntime = async (runtime: Runtime): Promise<void> => {
+    if (runtime.closing) return;
+    runtime.closing = true;
+    if (runtimes.get(runtime.key) === runtime) runtimes.delete(runtime.key);
+    try {
+      await runtime.server.close();
+    } finally {
+      await runtime.providerProxy?.close();
+      rmSync(runtime.jail, { recursive: true, force: true });
+    }
+  };
+  const runtimeInUse = (runtime: Runtime) =>
+    Boolean(reservations.get(runtime.key)) || [...active.values()].some((state) => state.runtime === runtime);
+  const releaseReservation = async (key: string) => {
+    const remaining = (reservations.get(key) ?? 1) - 1;
+    if (remaining > 0) reservations.set(key, remaining);
+    else reservations.delete(key);
+    const runtime = runtimes.get(key);
+    if (runtime?.retired && !runtimeInUse(runtime)) await closeRuntime(runtime).catch(() => undefined);
+  };
 
   const processCollabItem = async (state: ActiveTurn, item: CodexItem): Promise<void> => {
     if (item.type !== "collabAgentToolCall") return;
@@ -421,14 +521,28 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
     }
   };
 
-  const ensureRuntime = async (): Promise<Runtime> => {
-    if (runtime && runtime.server.process.exitCode === null) return runtime;
-    if (starting) return await starting;
-    starting = (async () => {
+  const ensureRuntime = async (spec: {
+    key: string;
+    family: string;
+    env: NodeJS.ProcessEnv;
+    providerBaseUrl?: string;
+  }): Promise<Runtime> => {
+    desiredRuntimeByFamily.set(spec.family, spec.key);
+    const current = runtimes.get(spec.key);
+    if (current && !current.closing && current.server.process.exitCode === null) return current;
+    const pending = starting.get(spec.key);
+    if (pending) {
+      const joined = await pending;
+      if (!joined.closing && joined.server.process.exitCode === null) return joined;
+      if (starting.get(spec.key) === pending) starting.delete(spec.key);
+      return ensureRuntime(spec);
+    }
+    const operation = (async () => {
       const jail = mkdtempSync(join(tmpdir(), "qm-codex-"));
-      const sourceEnv = opts.env ?? {};
+      const sourceEnv = spec.env;
       prepareCodexHome(sourceEnv, jail);
       const binaryPath = opts.binaryPath ?? resolve("node_modules/.bin/codex");
+      const providerProxy = spec.providerBaseUrl ? await createCodexProviderProxy(spec.providerBaseUrl) : undefined;
       const server = new CodexAppServer({
         binaryPath,
         cwd: jail,
@@ -519,7 +633,7 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
           }
         },
       });
-      startingServer = server;
+      startingServers.add(server);
       let startTimer: NodeJS.Timeout | undefined;
       try {
         await Promise.race([
@@ -533,32 +647,63 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
         ]);
       } catch (error) {
         await server.close().catch(() => undefined);
+        await providerProxy?.close().catch(() => undefined);
         rmSync(jail, { recursive: true, force: true });
         throw error;
       } finally {
         if (startTimer) clearTimeout(startTimer);
-        if (startingServer === server) startingServer = null;
+        startingServers.delete(server);
       }
-      runtime = { server, jail };
+      const runtime = {
+        server,
+        ...(providerProxy ? { providerProxy } : {}),
+        jail,
+        key: spec.key,
+        family: spec.family,
+        retired: spec.family.startsWith("custom:") || desiredRuntimeByFamily.get(spec.family) !== spec.key,
+        closing: false,
+      };
+      runtimes.set(spec.key, runtime);
       server.process.once("close", () => {
-        if (runtime?.server !== server) return;
+        if (runtimes.get(spec.key)?.server !== server) return;
         for (const state of active.values())
-          state.reject(server.error() ?? new Error("Codex app-server exited during a turn"));
-        active.clear();
-        runtime = null;
+          if (state.runtime.server === server)
+            state.reject(server.error() ?? new Error("Codex app-server exited during a turn"));
+        for (const [threadId, state] of active) if (state.runtime.server === server) active.delete(threadId);
+        runtimes.delete(spec.key);
+        void providerProxy?.close();
         rmSync(jail, { recursive: true, force: true });
       });
+      const idlePriorVersions: Runtime[] = [];
+      if (!runtime.retired) {
+        for (const [key, prior] of runtimes) {
+          if (key === spec.key || prior.family !== spec.family) continue;
+          prior.retired = true;
+          if (!runtimeInUse(prior)) idlePriorVersions.push(prior);
+        }
+      }
+      if (runtime.retired && !runtimeInUse(runtime)) idlePriorVersions.push(runtime);
+      await Promise.all(idlePriorVersions.map((prior) => closeRuntime(prior).catch(() => undefined)));
       return runtime;
     })();
+    starting.set(spec.key, operation);
     try {
-      return await starting;
+      return await operation;
     } finally {
-      starting = null;
+      if (starting.get(spec.key) === operation) starting.delete(spec.key);
     }
   };
 
-  const runPrompt = async (turn: HarnessTurnInput, toolsEnabled = true): Promise<HarnessTurnResult> => {
+  const runPrompt = async (
+    turn: HarnessTurnInput,
+    toolsEnabled = true,
+    disableProviderRetries = false,
+    customProvider?: HarnessModelTestInput["customProvider"],
+  ): Promise<HarnessTurnResult> => {
     if (turn.cancel?.aborted) return { reply: "", stopped: true };
+    if (turn.model && !customProvider && !modelSupportedByHarness(turn.model, "codex")) {
+      throw new NonRetryableTurnError(`Codex does not support requested model ${turn.model}`);
+    }
     const wallMs = turn.turnWallClockMs ?? defaultTurnWallClockMs;
     const deadline = wallMs > 0 ? Date.now() + wallMs : 0;
     const setupCancelled = new Error("Codex setup cancelled");
@@ -577,10 +722,48 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
     turn.cancel?.addEventListener("abort", onSetupCancel, { once: true });
     const setupTimer = wallMs > 0 ? setTimeout(() => stopSetup(setupTimedOut), wallMs) : undefined;
     const awaitSetup = <T>(operation: Promise<T>): Promise<T> => Promise.race([operation, setupStop]);
+    const model = turn.model ?? resolveModelId(turn.scopeLabel);
+    let runtimeModel: string;
     let rt: Runtime;
+    let runtimeConfig: Record<string, unknown>;
+    let reservedRuntimeKey: string | null = null;
     try {
-      rt = await awaitSetup(ensureRuntime());
+      const customModel = customProvider?.spec.models.find((candidate) => candidate.id === model);
+      if (customProvider?.spec.protocol !== undefined && customProvider.spec.protocol !== "openai-responses")
+        throw new NonRetryableTurnError(`Codex requires an OpenAI Responses custom provider`);
+      if (customProvider && !customModel)
+        throw new NonRetryableTurnError(`Codex custom provider snapshot does not contain model ${model}`);
+      let binding: CodexCustomProviderBinding | null = null;
+      if (customProvider) {
+        binding = {
+          id: customProvider.spec.id,
+          name: customProvider.spec.name,
+          baseUrl: customProvider.spec.baseUrl,
+          apiKey: customProvider.apiKey,
+          modelId: customModel!.upstreamId?.trim() || customModel!.id,
+        };
+      } else if (opts.resolveCustomProvider) {
+        binding = await awaitSetup(opts.resolveCustomProvider(model));
+      }
+      runtimeModel = binding?.modelId ?? model;
+      const spec = codexCustomRuntimeSpec(opts.env ?? {}, binding, disableProviderRetries);
+      reservedRuntimeKey = spec.key;
+      reservations.set(spec.key, (reservations.get(spec.key) ?? 0) + 1);
+      rt = await awaitSetup(ensureRuntime({ ...spec, ...(binding ? { providerBaseUrl: binding.baseUrl } : {}) }));
+      runtimeConfig = binding
+        ? {
+            ...spec.config,
+            model_providers: {
+              [binding.id]: {
+                ...(spec.config.model_providers as Record<string, Record<string, unknown>>)[binding.id],
+                base_url: rt.providerProxy?.baseUrl ?? binding.baseUrl,
+              },
+            },
+          }
+        : spec.config;
+      if (spec.family.startsWith("custom:")) rt.retired = true;
     } catch (error) {
+      if (reservedRuntimeKey) await releaseReservation(reservedRuntimeKey);
       setupSettled = true;
       if (setupTimer) clearTimeout(setupTimer);
       turn.cancel?.removeEventListener("abort", onSetupCancel);
@@ -590,16 +773,24 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
     const ref = codexToolContext(turn);
     const toolAbort = new AbortController();
     ref.abortSignal = toolAbort.signal;
-    const tools = toolsEnabled ? asTools(ref, toolOptions(opts, turn)) : [];
+    let tools: ReturnType<typeof asTools>;
+    try {
+      tools = toolsEnabled ? asTools(ref, toolOptions(opts, turn)) : [];
+    } catch (error) {
+      if (reservedRuntimeKey) await releaseReservation(reservedRuntimeKey);
+      setupSettled = true;
+      if (setupTimer) clearTimeout(setupTimer);
+      turn.cancel?.removeEventListener("abort", onSetupCancel);
+      throw error;
+    }
     const dynamicTools = tools.map((tool) => ({
       type: "function",
       name: tool.name,
       description: tool.description,
       inputSchema: tool.parameters,
     }));
-    const model = modelSupportedByHarness(turn.model, "codex") ? turn.model! : resolveModelId(turn.scopeLabel);
     const threadStartRequest = {
-      ...(model ? { model } : {}),
+      ...(runtimeModel ? { model: runtimeModel } : {}),
       cwd: rt.jail,
       approvalPolicy: "never",
       sandbox: "read-only",
@@ -611,6 +802,7 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
       experimentalRawEvents: true,
       environments: [],
       config: {
+        ...runtimeConfig,
         web_search: "disabled",
         ...(codexReasoningEffort(turn.thinkingLevel)
           ? { model_reasoning_effort: codexReasoningEffort(turn.thinkingLevel) }
@@ -636,6 +828,7 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
     try {
       started = await awaitSetup(rt.server.request("thread/start", threadStartRequest));
     } catch (error) {
+      if (reservedRuntimeKey) await releaseReservation(reservedRuntimeKey);
       setupSettled = true;
       if (setupTimer) clearTimeout(setupTimer);
       turn.cancel?.removeEventListener("abort", onSetupCancel);
@@ -659,6 +852,7 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
         }),
       );
     } catch (error) {
+      if (reservedRuntimeKey) await releaseReservation(reservedRuntimeKey);
       setupSettled = true;
       if (setupTimer) clearTimeout(setupTimer);
       turn.cancel?.removeEventListener("abort", onSetupCancel);
@@ -702,8 +896,10 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
       fallbackInputTokens: countTokens(JSON.stringify({ replay, input })),
       tapeWriteFailed: false,
       stopped: false,
+      runtime: rt,
     };
     active.set(threadId, state);
+    if (reservedRuntimeKey) await releaseReservation(reservedRuntimeKey);
     const promptEnvelope = {
       threadStart: {
         ...threadStartRequest,
@@ -720,7 +916,7 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
           model: selectedModel,
           promptEnvelope,
           truncated: Boolean(turn.images?.length),
-          transport: { modelId: selectedModel },
+          transport: { modelId: runtimeModel },
           ttftMs: state.firstOutputAt ? state.firstOutputAt - startedAt : null,
           durationMs: Date.now() - startedAt,
           usage: sumUsage(state.usageByThread),
@@ -794,7 +990,11 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
     let timer: NodeJS.Timeout | undefined;
     try {
       const response = await rt.server
-        .request<{ turn: CodexTurn }>("turn/start", { threadId, input, ...(model ? { model } : {}) })
+        .request<{ turn: CodexTurn }>("turn/start", {
+          threadId,
+          input,
+          ...(runtimeModel ? { model: runtimeModel } : {}),
+        })
         .catch((error: unknown) => {
           throw error instanceof CodexRpcError ? codexProviderFailure(error.message) : error;
         });
@@ -854,6 +1054,7 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
       for (const [activeThreadId, activeState] of active) {
         if (activeState === state) active.delete(activeThreadId);
       }
+      if (rt.retired && !runtimeInUse(rt)) await closeRuntime(rt).catch(() => undefined);
     }
   };
 
@@ -863,6 +1064,8 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
     signal?: AbortSignal,
     observe?: Pick<HarnessTurnInput, "recordModelCall" | "recordLlmRequest">,
     modelOverride?: string,
+    disableProviderRetries = false,
+    customProvider?: HarnessModelTestInput["customProvider"],
   ): Promise<string | undefined> => {
     const session = { id: `oneshot-${randomBytes(8).toString("hex")}` } as HarnessTurnInput["session"];
     const scope = { kind: "org", id: "oneshot" } as unknown as ScopeId;
@@ -893,6 +1096,8 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
         ...(observe?.recordLlmRequest ? { recordLlmRequest: observe.recordLlmRequest } : {}),
       },
       false,
+      disableProviderRetries,
+      customProvider,
     );
     return result.reply || undefined;
   };
@@ -908,19 +1113,48 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
     {
       runTurn: runPrompt,
       close: async () => {
-        await startingServer?.close().catch(() => undefined);
-        await starting?.catch(() => undefined);
-        const current = runtime;
-        if (current) {
-          for (const state of active.values()) state.reject(new Error("Codex harness closed during a turn"));
-          active.clear();
-          await current.server.close();
-          rmSync(current.jail, { recursive: true, force: true });
-          if (runtime === current) runtime = null;
-        }
+        await Promise.all([...startingServers].map((server) => server.close().catch(() => undefined)));
+        await Promise.all([...starting.values()].map((operation) => operation.catch(() => undefined)));
+        for (const state of active.values()) state.reject(new Error("Codex harness closed during a turn"));
+        active.clear();
+        const current = [...runtimes.values()];
+        runtimes.clear();
+        await Promise.all(current.map((runtime) => closeRuntime(runtime)));
+        for (const runtime of current) rmSync(runtime.jail, { recursive: true, force: true });
       },
       resetSession: () => {},
       oneShot: (system, prompt) => single(system, prompt),
+      testModel: async (input) => {
+        if (!input.customProvider)
+          throw new NonRetryableTurnError("Codex model test requires a custom provider snapshot");
+        const proxy = await createModelTestProxy(input.customProvider.spec.baseUrl, {
+          ...(input.signal ? { signal: input.signal } : {}),
+          expectedModel: input.expectedUpstreamModel,
+          maxOutputTokens: input.maxOutputTokens,
+        });
+        try {
+          const customProvider = {
+            ...input.customProvider,
+            spec: { ...input.customProvider.spec, baseUrl: proxy.baseUrl },
+          };
+          const reply = await single(
+            input.systemPrompt,
+            input.prompt,
+            input.signal,
+            undefined,
+            input.model,
+            true,
+            customProvider,
+          );
+          return {
+            ...(reply ? { reply } : {}),
+            maxOutputTokens: input.maxOutputTokens,
+            evidence: proxy.evidence(),
+          };
+        } finally {
+          await proxy.close();
+        }
+      },
       judge: (system, prompt) => single(system, prompt, undefined, undefined, judgeModelId),
       screenSecurity: async ({ payload, signal, recordModelCall, recordLlmRequest }) =>
         parseSecurityScreenVerdict(

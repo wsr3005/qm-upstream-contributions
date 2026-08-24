@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import type { Pool, PoolClient } from "pg";
 import { swallowAs } from "../util/errors.ts";
 import { errMessage } from "../util/errors.ts";
+import { sleep } from "../util/async.ts";
 
 export type { Pool, PoolClient };
 
@@ -45,26 +46,78 @@ export function concurrentIndexName(stmt: string): string | undefined {
   return /^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+CONCURRENTLY\s+IF\s+NOT\s+EXISTS\s+([a-z_][a-z0-9_$]*)\b/i.exec(stmt)?.[1];
 }
 
+function retryableDdlConflict(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  return code === "40P01" || code === "55P03";
+}
+
 async function applyDdl(pool: Pool, statements: string[]): Promise<void> {
-  const ddl = await pool.connect();
-  try {
-    await ddl.query("SELECT pg_advisory_lock(hashtext('agent-platform:schema-init'))");
-    for (const stmt of statements) {
-      const indexName = concurrentIndexName(stmt);
-      if (indexName) {
-        const existing = await ddl.query(
-          "SELECT NOT indisvalid OR NOT indisready AS invalid FROM pg_index WHERE indexrelid = to_regclass($1)",
-          [indexName],
-        );
-        if (existing.rows[0]?.invalid) await ddl.query(`DROP INDEX CONCURRENTLY ${indexName}`);
-      }
-      await ddl.query(stmt);
-    }
-  } finally {
-    await ddl
-      .query("SELECT pg_advisory_unlock(hashtext('agent-platform:schema-init'))")
-      .catch(swallowAs("pg-pool: schema-init unlock", undefined));
+  if (statements.length === 0) {
+    const ddl = await pool.connect();
     ddl.release();
+    return;
+  }
+  const deadline = Date.now() + 5 * 60_000;
+  let lastConflict: unknown;
+  for (;;) {
+    const ddl = await pool.connect();
+    let locked = false;
+    try {
+      const acquired = await ddl.query<{ locked: boolean }>(
+        "SELECT pg_try_advisory_lock(hashtext('agent-platform:schema-init')) AS locked",
+      );
+      locked = acquired.rows[0]?.locked === true;
+      if (locked) {
+        try {
+          for (const stmt of statements) {
+            const indexName = concurrentIndexName(stmt);
+            if (indexName) {
+              const previousLockTimeout = await ddl.query<{ value: string }>(
+                "SELECT current_setting('lock_timeout') AS value",
+              );
+              const timeout = await ddl.query<{ ms: number }>(
+                `SELECT GREATEST(
+                   1,
+                   LEAST(
+                     250,
+                     FLOOR(EXTRACT(EPOCH FROM current_setting('deadlock_timeout')::interval) * 400)
+                   )
+                 )::int AS ms`,
+              );
+              await ddl.query("SELECT set_config('lock_timeout', $1, false)", [`${timeout.rows[0]?.ms ?? 250}ms`]);
+              try {
+                const existing = await ddl.query(
+                  "SELECT NOT indisvalid OR NOT indisready AS invalid FROM pg_index WHERE indexrelid = to_regclass($1)",
+                  [indexName],
+                );
+                if (existing.rows[0]?.invalid) await ddl.query(`DROP INDEX CONCURRENTLY ${indexName}`);
+                await ddl.query(stmt);
+              } finally {
+                await ddl
+                  .query("SELECT set_config('lock_timeout', $1, false)", [previousLockTimeout.rows[0]?.value ?? "0"])
+                  .catch(swallowAs("pg-pool: reset schema lock timeout", undefined));
+              }
+            } else {
+              await ddl.query(stmt);
+            }
+          }
+          return;
+        } catch (error) {
+          if (!retryableDdlConflict(error)) throw error;
+          lastConflict = error;
+        }
+      }
+    } finally {
+      if (locked) {
+        await ddl
+          .query("SELECT pg_advisory_unlock(hashtext('agent-platform:schema-init'))")
+          .catch(swallowAs("pg-pool: schema-init unlock", undefined));
+      }
+      ddl.release();
+    }
+    if (Date.now() >= deadline)
+      throw new Error("timeout applying schema under the schema-init advisory lock", { cause: lastConflict });
+    await sleep(300);
   }
 }
 

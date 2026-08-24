@@ -4,7 +4,7 @@
 // model call leaving QM and hitting the endpoint, edit-without-key, delete.
 import "./support/auto-fake-sprites.ts";
 import assert from "node:assert/strict";
-import { createServer } from "node:http";
+import { createServer, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -13,18 +13,85 @@ import { test } from "node:test";
 import { createInsecureTestServer } from "../src/api/server.ts";
 import { buildApp } from "../src/wiring.ts";
 import { testConfig } from "./support/test-config.ts";
-import { oneShot } from "../src/harness/pi-harness.ts";
 import { resolveModel, modelSupportedByHarness, modelServiceable } from "../src/model/pi-models.ts";
 import { setCustomProviders } from "../src/model/custom-providers.ts";
 import { createCustomProviderStore } from "../src/model/custom-provider-store.ts";
 import { createMemoryMap } from "../src/persistence/durable-map.ts";
-import type { Api, Model } from "@earendil-works/pi-ai";
 
 const ADMIN = { "content-type": "application/json", "x-admin-actor": "admin-alice@default-org" };
 
+function responsesReply(res: ServerResponse, model: string, text: string): void {
+  const item = {
+    id: "msg_responses_qa",
+    type: "message",
+    role: "assistant",
+    status: "completed",
+    content: [{ type: "output_text", text, annotations: [] }],
+  };
+  const response = {
+    id: "resp_qa",
+    object: "response",
+    created_at: Math.floor(Date.now() / 1000),
+    status: "completed",
+    model,
+    output: [item],
+    usage: {
+      input_tokens: 5,
+      input_tokens_details: { cached_tokens: 0 },
+      output_tokens: 3,
+      output_tokens_details: { reasoning_tokens: 0 },
+      total_tokens: 8,
+    },
+  };
+  const events = [
+    { type: "response.created", response: { ...response, status: "in_progress", output: [] } },
+    {
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { ...item, status: "in_progress", content: [] },
+    },
+    {
+      type: "response.content_part.added",
+      output_index: 0,
+      item_id: item.id,
+      content_index: 0,
+      part: { type: "output_text", text: "", annotations: [] },
+    },
+    {
+      type: "response.output_text.delta",
+      output_index: 0,
+      item_id: item.id,
+      content_index: 0,
+      delta: text,
+    },
+    {
+      type: "response.output_text.done",
+      output_index: 0,
+      item_id: item.id,
+      content_index: 0,
+      text,
+    },
+    {
+      type: "response.content_part.done",
+      output_index: 0,
+      item_id: item.id,
+      content_index: 0,
+      part: item.content[0],
+    },
+    { type: "response.output_item.done", output_index: 0, item },
+    { type: "response.completed", response },
+  ];
+  res.writeHead(200, { "content-type": "text/event-stream" });
+  events.forEach((event, sequence_number) =>
+    res.write(`event: ${event.type}\ndata: ${JSON.stringify({ ...event, sequence_number })}\n\n`),
+  );
+  res.end();
+}
+
 test("QA: full custom-provider lifecycle against a live fake upstream", async () => {
   // --- fake OpenAI-compatible upstream ---
-  const seen: Array<{ path: string; auth: string | undefined; model?: string }> = [];
+  const seen: Array<{ path: string; auth: string | undefined; model?: string; maxTokens?: number }> = [];
+  let failCompletions = false;
   const upstream = createServer((req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
@@ -40,11 +107,17 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
         return res.end(JSON.stringify({ data: [{ id: "qa-chat" }] }));
       }
       if (req.url?.endsWith("/chat/completions")) {
-        record.model = (JSON.parse(body) as { model?: string }).model;
+        const payload = JSON.parse(body) as { model?: string; max_tokens?: number; max_completion_tokens?: number };
+        record.model = payload.model;
+        record.maxTokens = payload.max_completion_tokens ?? payload.max_tokens;
         seen.push(record);
+        if (failCompletions) {
+          res.writeHead(500, { "content-type": "application/json" });
+          return res.end(JSON.stringify({ error: { message: "retryable failure" } }));
+        }
         res.writeHead(200, { "content-type": "text/event-stream" });
         const chunk = (delta: object, finish: string | null) =>
-          `data: ${JSON.stringify({ id: "cmpl-qa", object: "chat.completion.chunk", model: "qa-chat", choices: [{ index: 0, delta, finish_reason: finish }], usage: finish ? { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 } : undefined })}\n\n`;
+          `data: ${JSON.stringify({ id: "cmpl-qa", object: "chat.completion.chunk", model: payload.model, choices: [{ index: 0, delta, finish_reason: finish }], usage: finish ? { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 } : undefined })}\n\n`;
         res.write(chunk({ role: "assistant", content: "QA UPSTREAM REPLY" }, null));
         res.write(chunk({}, "stop"));
         res.write("data: [DONE]\n\n");
@@ -57,13 +130,24 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
   });
   await new Promise<void>((r) => upstream.listen(0, "127.0.0.1", r));
   const upstreamUrl = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}/v1`;
+  const staleSeen: string[] = [];
+  const staleUpstream = createServer((req, res) => {
+    staleSeen.push(req.url ?? "");
+    res.writeHead(500, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { message: "stale endpoint must not be called" } }));
+  });
+  await new Promise<void>((r) => staleUpstream.listen(0, "127.0.0.1", r));
+  const staleUpstreamUrl = `http://127.0.0.1:${(staleUpstream.address() as AddressInfo).port}/v1`;
 
   const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "qa-custom-")) }));
   const server = createInsecureTestServer(built.app, {
     config: built.config,
     modelCredentials: built.modelCredentials,
     customProviders: built.customProviders,
+    customProviderTestRuns: built.customProviderTestRuns,
     refreshCustomProviders: built.refreshCustomProviders,
+    customProviderHarnessTest: built.customProviderHarnessTest,
+    customProviderHarnessTestFence: built.customProviderHarnessTestFence,
     admin: built.admin,
     auditLog: built.auditLog,
     harnessId: "pi",
@@ -131,6 +215,8 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
       }),
     });
     assert.equal(r.status, 200);
+    const saved = (await r.json()) as { status: { revision: number; published: boolean } };
+    assert.equal(saved.status.published, false);
     assert.ok(
       seen.some((s) => s.path.endsWith("/models") && s.auth === "Bearer sk-qa-good"),
       "validation actually reached the upstream",
@@ -141,6 +227,19 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
     const listing = JSON.stringify(await r.json());
     assert.ok(listing.includes('"hasKey":true'));
     assert.ok(!listing.includes("sk-qa-good"), "key never readable");
+
+    for (const harness of ["pi", "opencode"]) {
+      r = await api("/v1/admin/custom-providers/qa/harness-test", {
+        method: "POST",
+        body: JSON.stringify({ modelId: "qa-chat", harness, requestId: `qa-publish-${harness}` }),
+      });
+      assert.equal(r.status, 200);
+    }
+    r = await api("/v1/admin/custom-providers/qa/publish", {
+      method: "POST",
+      body: JSON.stringify({ revision: saved.status.revision }),
+    });
+    assert.equal(r.status, 200);
 
     // 5. model resolves like a built-in and is catalog-visible
     const model = resolveModel("qa-chat");
@@ -153,18 +252,149 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
     assert.equal(modelServiceable("qa-chat", { anthropic: false, openai: false, openrouter: false }), true);
 
     // 6. REAL model call through QM's pi path → fake upstream answers
-    const reply = await oneShot(
-      "qa",
-      model as unknown as Model<Api>,
-      { qa: "sk-qa-good" },
-      "you are terse",
-      "say anything",
-    );
-    assert.equal(reply, "QA UPSTREAM REPLY");
+    setCustomProviders([
+      {
+        id: "qa",
+        name: "Stale QA Provider",
+        protocol: "openai",
+        baseUrl: staleUpstreamUrl,
+        models: [{ id: "qa-chat" }],
+      },
+    ]);
+    r = await api("/v1/admin/custom-providers/qa/harness-test", {
+      method: "POST",
+      body: JSON.stringify({ modelId: "not-registered", requestId: "request-not-registered" }),
+    });
+    assert.equal(r.status, 400);
+    r = await api("/v1/admin/custom-providers/qa/harness-test", {
+      method: "POST",
+      body: JSON.stringify({ modelId: "qa-chat", requestId: "request-qa-success" }),
+    });
+    assert.equal(r.status, 200);
+    const testResult = (await r.json()) as {
+      ok: boolean;
+      providerId: string;
+      modelId: string;
+      upstreamModelId: string;
+      harness: string;
+      reply: string;
+      latencyMs: number;
+      maxOutputTokens: number;
+      requestedModel: string;
+      endpointAlias: string;
+      responseModel: string;
+      firstTokenMs: number;
+      providerTotalMs: number;
+      usage: {
+        inputTokens: number;
+        outputTokens: number;
+        totalTokens: number;
+        cachedInputTokens: number;
+        cacheCreationInputTokens: number;
+      };
+      streamed: boolean;
+      upstreamRequests: number;
+      noDefaultEgress: boolean;
+    };
+    assert.equal(testResult.ok, true);
+    assert.equal(testResult.providerId, "qa");
+    assert.equal(testResult.modelId, "qa-chat");
+    assert.equal(testResult.upstreamModelId, "qa-chat");
+    assert.equal(testResult.harness, "pi");
+    assert.equal(testResult.reply, "QA UPSTREAM REPLY");
+    assert.ok(testResult.latencyMs >= 0);
+    assert.equal(testResult.maxOutputTokens, 128);
+    assert.equal(testResult.requestedModel, "qa-chat");
+    assert.equal(testResult.endpointAlias, "QA Provider");
+    assert.equal(testResult.responseModel, "qa-chat");
+    assert.ok(testResult.firstTokenMs >= 1);
+    assert.ok(testResult.providerTotalMs >= testResult.firstTokenMs);
+    assert.deepEqual(testResult.usage, {
+      inputTokens: 5,
+      outputTokens: 3,
+      totalTokens: 8,
+      cachedInputTokens: 0,
+      cacheCreationInputTokens: 0,
+    });
+    assert.equal(testResult.streamed, true);
+    assert.equal(testResult.upstreamRequests, 1);
+    assert.equal(testResult.noDefaultEgress, true);
+    assert.ok(!JSON.stringify(testResult).includes("sk-qa-good"));
+    assert.deepEqual(staleSeen, []);
     const call = seen.find((s) => s.path.endsWith("/chat/completions"));
     assert.ok(call, "completion request reached the upstream");
     assert.equal(call!.model, "qa-chat");
     assert.equal(call!.auth, "Bearer sk-qa-good", "stored key was sent to the custom endpoint");
+    assert.equal(call!.maxTokens, 128, "the outbound generation request is capped at 128 output tokens");
+
+    const callsBeforeFailure = seen.filter((s) => s.path.endsWith("/chat/completions")).length;
+    failCompletions = true;
+    r = await api("/v1/admin/custom-providers/qa/harness-test", {
+      method: "POST",
+      body: JSON.stringify({ modelId: "qa-chat", requestId: "request-qa-failure" }),
+    });
+    assert.equal(r.status, 502);
+    assert.equal(seen.filter((s) => s.path.endsWith("/chat/completions")).length, callsBeforeFailure + 1);
+    const testAudits = (await built.auditLog.events()).filter((event) => event.action === "custom-providers.test");
+    assert.deepEqual(
+      testAudits.map((event) => event.status),
+      ["attempted", "succeeded", "attempted", "succeeded", "attempted", "succeeded", "attempted", "failed"],
+    );
+    assert.ok(testAudits.every((event) => !JSON.stringify(event).includes("sk-qa-good")));
+    const succeededAudit = testAudits.find((event) => event.status === "succeeded");
+    assert.match(
+      succeededAudit?.detail ?? "",
+      /^harness=pi upstreamModelId=qa-chat providerRevision=\d+ latencyMs=\d+ responseModel=qa-chat firstTokenMs=\d+ providerTotalMs=\d+ inputTokens=5 outputTokens=3 totalTokens=8 cachedInputTokens=0 cacheCreationInputTokens=0 maxOutputTokens=128 streamed=true upstreamRequests=1 requestIdHash=/,
+    );
+    const failedAudit = testAudits.find((event) => event.status === "failed");
+    assert.match(
+      failedAudit?.detail ?? "",
+      /^harness=pi upstreamModelId=qa-chat providerRevision=\d+ latencyMs=\d+ requestIdHash=/,
+    );
+    failCompletions = false;
+
+    r = await api("/v1/admin/custom-providers/collision", {
+      method: "PUT",
+      body: JSON.stringify({
+        name: "Built-in Collision",
+        protocol: "openai",
+        baseUrl: upstreamUrl,
+        apiKey: "sk-qa-good",
+        models: [{ id: "gpt-5.6-luna", upstreamId: "gpt-5.6-luna" }],
+        validate: false,
+      }),
+    });
+    assert.equal(r.status, 200);
+    const collisionStatus = (await r.json()) as {
+      status: { models: Array<{ id: string; upstreamId?: string }> };
+    };
+    assert.deepEqual(collisionStatus.status.models, [{ id: "collision/gpt-5.6-luna", upstreamId: "gpt-5.6-luna" }]);
+    const callsBeforeBuiltInCollision = seen.filter((s) => s.path.endsWith("/chat/completions")).length;
+    r = await api("/v1/admin/custom-providers/collision/harness-test", {
+      method: "POST",
+      body: JSON.stringify({ modelId: "collision/gpt-5.6-luna", requestId: "request-collision" }),
+    });
+    assert.equal(r.status, 200);
+    const builtInCollisionCalls = seen.filter((s) => s.path.endsWith("/chat/completions"));
+    assert.equal(builtInCollisionCalls.length, callsBeforeBuiltInCollision + 1);
+    assert.equal(builtInCollisionCalls.at(-1)?.model, "gpt-5.6-luna");
+    assert.equal((await api("/v1/admin/custom-providers/collision", { method: "DELETE" })).status, 200);
+
+    const callsBeforeCustomCollision = seen.filter((s) => s.path.endsWith("/chat/completions")).length;
+    r = await api("/v1/admin/custom-providers/z-shadow", {
+      method: "PUT",
+      body: JSON.stringify({
+        name: "Custom Collision",
+        protocol: "openai",
+        baseUrl: upstreamUrl,
+        apiKey: "sk-qa-good",
+        models: [{ id: "qa-chat" }],
+        validate: false,
+      }),
+    });
+    assert.equal(r.status, 400);
+    assert.equal(seen.filter((s) => s.path.endsWith("/chat/completions")).length, callsBeforeCustomCollision);
+    assert.equal((await api("/v1/admin/custom-providers/z-shadow", { method: "DELETE" })).status, 404);
 
     // 7. edit WITHOUT key keeps the stored key
     r = await api("/v1/admin/custom-providers/qa", {
@@ -193,11 +423,461 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
   } finally {
     server.close();
     upstream.close();
+    staleUpstream.close();
+  }
+});
+
+test("QA: OpenAI Responses custom provider serves the Admin self-test path", async () => {
+  const seen: Array<{ path: string; auth?: string; model?: string; maxTokens?: number }> = [];
+  let failResponses = false;
+  const upstream = createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      const record = { path: req.url ?? "", auth: req.headers.authorization };
+      if (req.url?.endsWith("/models")) {
+        seen.push(record);
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ data: [{ id: "gpt-5.6-luna" }] }));
+      }
+      if (req.url?.endsWith("/responses")) {
+        const payload = JSON.parse(body) as { model?: string; max_output_tokens?: number };
+        seen.push({ ...record, model: payload.model, maxTokens: payload.max_output_tokens });
+        if (failResponses) {
+          res.writeHead(429, { "content-type": "application/json", "retry-after": "0" });
+          return res.end(JSON.stringify({ error: { message: "retryable failure" } }));
+        }
+        const item = {
+          id: "msg_responses_qa",
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [{ type: "output_text", text: "RESPONSES QA REPLY", annotations: [] }],
+        };
+        const response = {
+          id: "resp_qa",
+          object: "response",
+          created_at: Math.floor(Date.now() / 1000),
+          status: "completed",
+          model: "gpt-5.6-luna",
+          output: [item],
+          usage: {
+            input_tokens: 5,
+            input_tokens_details: { cached_tokens: 0 },
+            output_tokens: 3,
+            output_tokens_details: { reasoning_tokens: 0 },
+            total_tokens: 8,
+          },
+        };
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        const events = [
+          { type: "response.created", response: { ...response, status: "in_progress", output: [] } },
+          {
+            type: "response.output_item.added",
+            output_index: 0,
+            item: { ...item, status: "in_progress", content: [] },
+          },
+          {
+            type: "response.content_part.added",
+            output_index: 0,
+            item_id: item.id,
+            content_index: 0,
+            part: { type: "output_text", text: "", annotations: [] },
+          },
+          {
+            type: "response.output_text.delta",
+            output_index: 0,
+            item_id: item.id,
+            content_index: 0,
+            delta: "RESPONSES QA REPLY",
+          },
+          {
+            type: "response.output_text.done",
+            output_index: 0,
+            item_id: item.id,
+            content_index: 0,
+            text: "RESPONSES QA REPLY",
+          },
+          {
+            type: "response.content_part.done",
+            output_index: 0,
+            item_id: item.id,
+            content_index: 0,
+            part: item.content[0],
+          },
+          { type: "response.output_item.done", output_index: 0, item },
+          { type: "response.completed", response },
+        ];
+        events.forEach((event, sequence_number) =>
+          res.write(`event: ${event.type}\ndata: ${JSON.stringify({ ...event, sequence_number })}\n\n`),
+        );
+        return res.end();
+      }
+      seen.push(record);
+      res.writeHead(404);
+      res.end();
+    });
+  });
+  await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  const upstreamUrl = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}/v1`;
+  const built = buildApp(
+    testConfig({
+      dataDir: mkdtempSync(join(tmpdir(), "qa-responses-")),
+      codexProcessEnv: { PATH: process.env.PATH },
+    }),
+  );
+  const server = createInsecureTestServer(built.app, {
+    config: built.config,
+    modelCredentials: built.modelCredentials,
+    customProviders: built.customProviders,
+    customProviderTestRuns: built.customProviderTestRuns,
+    refreshCustomProviders: built.refreshCustomProviders,
+    customProviderHarnessTest: built.customProviderHarnessTest,
+    customProviderHarnessTestFence: built.customProviderHarnessTestFence,
+    admin: built.admin,
+    auditLog: built.auditLog,
+    harnessId: "pi",
+  });
+  server.listen(0);
+  const base = `http://localhost:${(server.address() as AddressInfo).port}`;
+  try {
+    let result = await fetch(`${base}/v1/admin/custom-providers/responses`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify({
+        name: "Responses",
+        protocol: "openai-responses",
+        baseUrl: upstreamUrl,
+        apiKey: "sk-responses",
+        models: [{ id: "gpt-5.6-luna", upstreamId: "gpt-5.6-luna" }],
+      }),
+    });
+    assert.equal(result.status, 200);
+    const saved = (await result.json()) as { status: { models: Array<{ id: string; upstreamId?: string }> } };
+    assert.deepEqual(saved.status.models, [{ id: "responses/gpt-5.6-luna", upstreamId: "gpt-5.6-luna" }]);
+
+    for (const harness of ["pi", "opencode", "codex"]) {
+      result = await fetch(`${base}/v1/admin/custom-providers/responses/harness-test`, {
+        method: "POST",
+        headers: ADMIN,
+        body: JSON.stringify({
+          modelId: "responses/gpt-5.6-luna",
+          harness,
+          requestId: `request-responses-${harness}-success`,
+        }),
+      });
+      const responseText = await result.text();
+      assert.equal(result.status, 200, `${harness} self-test succeeds: ${responseText}; calls=${JSON.stringify(seen)}`);
+      const body = JSON.parse(responseText) as {
+        reply: string;
+        modelId: string;
+        upstreamModelId: string;
+        harness: string;
+        maxOutputTokens: number;
+        requestedModel: string;
+        endpointAlias: string;
+        responseModel: string;
+        firstTokenMs: number;
+        providerTotalMs: number;
+        usage: {
+          inputTokens: number;
+          outputTokens: number;
+          totalTokens: number;
+          cachedInputTokens: number;
+          cacheCreationInputTokens: number;
+        };
+        streamed: boolean;
+        upstreamRequests: number;
+        noDefaultEgress: boolean;
+      };
+      assert.equal(body.reply, "RESPONSES QA REPLY");
+      assert.equal(body.modelId, "responses/gpt-5.6-luna");
+      assert.equal(body.upstreamModelId, "gpt-5.6-luna");
+      assert.equal(body.harness, harness);
+      assert.equal(body.maxOutputTokens, 128);
+      assert.equal(body.requestedModel, "gpt-5.6-luna");
+      assert.equal(body.endpointAlias, "Responses");
+      assert.equal(body.responseModel, "gpt-5.6-luna");
+      assert.ok(body.firstTokenMs >= 1);
+      assert.ok(body.providerTotalMs >= body.firstTokenMs);
+      assert.deepEqual(body.usage, {
+        inputTokens: 5,
+        outputTokens: 3,
+        totalTokens: 8,
+        cachedInputTokens: 0,
+        cacheCreationInputTokens: 0,
+      });
+      assert.equal(body.streamed, true);
+      assert.equal(body.upstreamRequests, 1);
+      assert.equal(body.noDefaultEgress, true);
+    }
+    const calls = seen.filter((request) => request.path.endsWith("/responses"));
+    assert.equal(calls.length, 3);
+    assert.ok(calls.every((call) => call.auth === "Bearer sk-responses"));
+    assert.ok(calls.every((call) => call.model === "gpt-5.6-luna"));
+    assert.ok(calls.every((call) => call.maxTokens === 128));
+    const audits = (await built.auditLog.events()).filter((event) => event.action === "custom-providers.test");
+    assert.deepEqual(
+      audits.map((event) => [event.status, event.resource]),
+      ["pi", "opencode", "codex"].flatMap((harness) => [
+        ["attempted", `responses/responses/gpt-5.6-luna/${harness}`],
+        ["succeeded", `responses/responses/gpt-5.6-luna/${harness}`],
+      ]),
+    );
+    assert.ok(audits.every((event) => event.detail?.includes(`upstreamModelId=gpt-5.6-luna`)));
+    assert.ok(audits.every((event) => !JSON.stringify(event).includes("sk-responses")));
+    failResponses = true;
+    for (const harness of ["pi", "opencode", "codex"]) {
+      const callsBeforeFailure = seen.filter((request) => request.path.endsWith("/responses")).length;
+      result = await fetch(`${base}/v1/admin/custom-providers/responses/harness-test`, {
+        method: "POST",
+        headers: ADMIN,
+        body: JSON.stringify({
+          modelId: "responses/gpt-5.6-luna",
+          harness,
+          requestId: `request-responses-${harness}-failure`,
+        }),
+      });
+      assert.equal(result.status, 502, `${harness} reports the failed single-attempt test`);
+      assert.equal(
+        seen.filter((request) => request.path.endsWith("/responses")).length,
+        callsBeforeFailure + 1,
+        `${harness} sends exactly one upstream request after a retryable failure`,
+      );
+    }
+    const allAudits = (await built.auditLog.events()).filter((event) => event.action === "custom-providers.test");
+    assert.deepEqual(
+      allAudits.slice(-6).map((event) => event.status),
+      ["attempted", "failed", "attempted", "failed", "attempted", "failed"],
+    );
+  } finally {
+    await built.runtime.stop();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
+  }
+});
+
+test("QA: every harness rejects redirects, sends one tool-free request, and preserves the upstream host", async () => {
+  const targetSeen: string[] = [];
+  const target = createServer((req, res) => {
+    targetSeen.push(req.url ?? "");
+    responsesReply(res, "gpt-5.6-luna", "REDIRECT TARGET MUST NOT RUN");
+  });
+  await new Promise<void>((resolve) => target.listen(0, "127.0.0.1", resolve));
+  const targetUrl = `http://127.0.0.1:${(target.address() as AddressInfo).port}/v1/responses`;
+  const originSeen: Array<{
+    path: string;
+    auth?: string;
+    host?: string;
+    tools?: unknown;
+    toolChoice?: unknown;
+    parallelToolCalls?: unknown;
+  }> = [];
+  const origin = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (chunk) => (raw += chunk));
+    req.on("end", () => {
+      const payload = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+      originSeen.push({
+        path: req.url ?? "",
+        auth: req.headers.authorization,
+        host: req.headers.host,
+        tools: payload.tools,
+        toolChoice: payload.tool_choice,
+        parallelToolCalls: payload.parallel_tool_calls,
+      });
+      res.writeHead(307, { location: targetUrl });
+      res.end();
+    });
+  });
+  await new Promise<void>((resolve) => origin.listen(0, "127.0.0.1", resolve));
+  const originBase = `http://127.0.0.1:${(origin.address() as AddressInfo).port}/v1`;
+  const built = buildApp(
+    testConfig({
+      dataDir: mkdtempSync(join(tmpdir(), "qa-redirect-")),
+      codexProcessEnv: { PATH: process.env.PATH },
+    }),
+  );
+  const server = createInsecureTestServer(built.app, {
+    config: built.config,
+    modelCredentials: built.modelCredentials,
+    customProviders: built.customProviders,
+    customProviderTestRuns: built.customProviderTestRuns,
+    refreshCustomProviders: built.refreshCustomProviders,
+    customProviderHarnessTest: built.customProviderHarnessTest,
+    customProviderHarnessTestFence: built.customProviderHarnessTestFence,
+    admin: built.admin,
+    auditLog: built.auditLog,
+    harnessId: "pi",
+  });
+  server.listen(0);
+  const base = `http://localhost:${(server.address() as AddressInfo).port}`;
+  try {
+    let result = await fetch(`${base}/v1/admin/custom-providers/redirect`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify({
+        name: "Redirect",
+        protocol: "openai-responses",
+        baseUrl: originBase,
+        apiKey: "sk-redirect",
+        models: [{ id: "gpt-5.6-luna", upstreamId: "gpt-5.6-luna" }],
+        validate: false,
+      }),
+    });
+    assert.equal(result.status, 200);
+    for (const harness of ["pi", "opencode", "codex"]) {
+      const before = originSeen.length;
+      result = await fetch(`${base}/v1/admin/custom-providers/redirect/harness-test`, {
+        method: "POST",
+        headers: ADMIN,
+        body: JSON.stringify({
+          modelId: "redirect/gpt-5.6-luna",
+          harness,
+          requestId: `request-redirect-${harness}`,
+        }),
+      });
+      const responseText = await result.text();
+      assert.equal(result.status, 502, `${harness} rejects the redirect: ${responseText}`);
+      assert.equal(originSeen.length, before + 1, `${harness} sends one request to the configured endpoint`);
+      assert.equal(targetSeen.length, 0, `${harness} never follows the redirect target`);
+    }
+    assert.ok(originSeen.every((request) => request.path === "/v1/responses"));
+    assert.ok(originSeen.every((request) => request.auth === "Bearer sk-redirect"));
+    assert.ok(originSeen.every((request) => request.host === new URL(originBase).host));
+    assert.ok(
+      originSeen.every(
+        (request) => request.tools === undefined || (Array.isArray(request.tools) && request.tools.length === 0),
+      ),
+    );
+    assert.ok(originSeen.every((request) => request.toolChoice === undefined));
+    assert.ok(originSeen.every((request) => request.parallelToolCalls === undefined));
+  } finally {
+    await built.runtime.stop();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await new Promise<void>((resolve) => origin.close(() => resolve()));
+    await new Promise<void>((resolve) => target.close(() => resolve()));
+  }
+});
+
+test("QA: every harness keeps the captured provider snapshot during an in-flight edit", async () => {
+  const seen: Array<{ path: string; auth?: string; model?: string }> = [];
+  let activeGate:
+    | {
+        seen: Promise<void>;
+        notifySeen(): void;
+        released: Promise<void>;
+        release(): void;
+      }
+    | undefined;
+  const newGate = () => {
+    let notifySeen!: () => void;
+    let release!: () => void;
+    const gate = {
+      seen: new Promise<void>((resolve) => {
+        notifySeen = resolve;
+      }),
+      notifySeen: () => notifySeen(),
+      released: new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+      release: () => release(),
+    };
+    activeGate = gate;
+    return gate;
+  };
+  const upstream = createServer((req, res) => {
+    let requestBody = "";
+    req.on("data", (chunk) => (requestBody += chunk));
+    req.on("end", async () => {
+      if (!req.url?.endsWith("/responses")) {
+        res.writeHead(404);
+        return res.end();
+      }
+      const payload = JSON.parse(requestBody) as { model?: string };
+      seen.push({ path: req.url, auth: req.headers.authorization, model: payload.model });
+      const gate = activeGate;
+      if (req.url.startsWith("/old/") && gate) {
+        gate.notifySeen();
+        await gate.released;
+      }
+      responsesReply(res, payload.model ?? "unknown", "SNAPSHOT QA REPLY");
+    });
+  });
+  await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  const upstreamBase = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
+  const built = buildApp(
+    testConfig({
+      dataDir: mkdtempSync(join(tmpdir(), "qa-snapshot-")),
+      codexProcessEnv: { PATH: process.env.PATH },
+    }),
+  );
+  const server = createInsecureTestServer(built.app, {
+    config: built.config,
+    modelCredentials: built.modelCredentials,
+    customProviders: built.customProviders,
+    customProviderTestRuns: built.customProviderTestRuns,
+    refreshCustomProviders: built.refreshCustomProviders,
+    customProviderHarnessTest: built.customProviderHarnessTest,
+    customProviderHarnessTestFence: built.customProviderHarnessTestFence,
+    admin: built.admin,
+    auditLog: built.auditLog,
+    harnessId: "pi",
+  });
+  server.listen(0);
+  const base = `http://localhost:${(server.address() as AddressInfo).port}`;
+  const save = (baseUrl: string, apiKey: string, upstreamId: string) =>
+    fetch(`${base}/v1/admin/custom-providers/snapshot`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify({
+        name: "Snapshot",
+        protocol: "openai-responses",
+        baseUrl,
+        apiKey,
+        models: [{ id: "snapshot-model", upstreamId }],
+        validate: false,
+      }),
+    });
+  try {
+    for (const harness of ["pi", "opencode", "codex"]) {
+      let saved = await save(`${upstreamBase}/old/v1`, "sk-old", "wire-old");
+      assert.equal(saved.status, 200);
+      const gate = newGate();
+      const pending = fetch(`${base}/v1/admin/custom-providers/snapshot/harness-test`, {
+        method: "POST",
+        headers: ADMIN,
+        body: JSON.stringify({ modelId: "snapshot-model", harness, requestId: `request-snapshot-${harness}` }),
+      });
+      try {
+        await gate.seen;
+        saved = await save(`${upstreamBase}/new/v1`, "sk-new", "wire-new");
+        assert.equal(saved.status, 200);
+      } finally {
+        gate.release();
+      }
+      const result = await pending;
+      assert.equal(result.status, 409, `${harness} rejects success for the replaced provider revision`);
+      assert.equal(((await result.json()) as { error: string }).error, "provider_changed_during_test");
+    }
+    const calls = seen.filter((request) => request.path.endsWith("/responses"));
+    assert.equal(calls.length, 3);
+    assert.ok(calls.every((request) => request.path === "/old/v1/responses"));
+    assert.ok(calls.every((request) => request.auth === "Bearer sk-old"));
+    assert.ok(calls.every((request) => request.model === "wire-old"));
+    const audits = (await built.auditLog.events()).filter((event) => event.action === "custom-providers.test");
+    assert.equal(audits.length, 6);
+    assert.ok(audits.every((event) => event.detail?.includes("upstreamModelId=wire-old")));
+  } finally {
+    activeGate?.release();
+    await built.runtime.stop();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
   }
 });
 
 test("QA: anthropic-protocol custom provider serves a real turn (correct wire shape + headers)", async () => {
-  const seen: Array<{ path: string; apiKeyHeader?: string; version?: string; model?: string }> = [];
+  const seen: Array<{ path: string; apiKeyHeader?: string; version?: string; model?: string; maxTokens?: number }> = [];
   const upstream = createServer((req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
@@ -213,7 +893,9 @@ test("QA: anthropic-protocol custom provider serves a real turn (correct wire sh
         return res.end(JSON.stringify({ data: [] }));
       }
       if (req.url?.endsWith("/v1/messages")) {
-        record.model = (JSON.parse(body) as { model?: string }).model;
+        const payload = JSON.parse(body) as { model?: string; max_tokens?: number };
+        record.model = payload.model;
+        record.maxTokens = payload.max_tokens;
         seen.push(record);
         res.writeHead(200, { "content-type": "text/event-stream" });
         res.write(
@@ -245,7 +927,10 @@ test("QA: anthropic-protocol custom provider serves a real turn (correct wire sh
     config: built.config,
     modelCredentials: built.modelCredentials,
     customProviders: built.customProviders,
+    customProviderTestRuns: built.customProviderTestRuns,
     refreshCustomProviders: built.refreshCustomProviders,
+    customProviderHarnessTest: built.customProviderHarnessTest,
+    customProviderHarnessTestFence: built.customProviderHarnessTestFence,
     admin: built.admin,
     auditLog: built.auditLog,
     harnessId: "pi",
@@ -253,7 +938,7 @@ test("QA: anthropic-protocol custom provider serves a real turn (correct wire sh
   server.listen(0);
   const base = `http://localhost:${(server.address() as AddressInfo).port}`;
   try {
-    const r = await fetch(`${base}/v1/admin/custom-providers/antcompat`, {
+    let r = await fetch(`${base}/v1/admin/custom-providers/antcompat`, {
       method: "PUT",
       headers: ADMIN,
       body: JSON.stringify({
@@ -265,15 +950,37 @@ test("QA: anthropic-protocol custom provider serves a real turn (correct wire sh
       }),
     });
     assert.equal(r.status, 200, "anthropic-protocol registration validates against /v1/models with x-api-key");
+    const saved = (await r.json()) as { status: { revision: number } };
+    for (const harness of ["pi", "opencode"]) {
+      r = await fetch(`${base}/v1/admin/custom-providers/antcompat/harness-test`, {
+        method: "POST",
+        headers: ADMIN,
+        body: JSON.stringify({ modelId: "claude-compat", harness, requestId: `publish-anthropic-${harness}` }),
+      });
+      const testBody = await r.text();
+      assert.equal(r.status, 200, `${harness}: ${testBody}; seen=${JSON.stringify(seen)}`);
+    }
+    r = await fetch(`${base}/v1/admin/custom-providers/antcompat/publish`, {
+      method: "POST",
+      headers: ADMIN,
+      body: JSON.stringify({ revision: saved.status.revision }),
+    });
+    assert.equal(r.status, 200);
     const model = resolveModel("claude-compat");
     assert.ok(model);
     assert.equal((model as { api?: string }).api, "anthropic-messages");
-    const reply = await oneShot("qa-ant", model as unknown as Model<Api>, { antcompat: "sk-ant-qa" }, "terse", "go");
-    assert.equal(reply, "ANTHROPIC QA REPLY");
+    r = await fetch(`${base}/v1/admin/custom-providers/antcompat/harness-test`, {
+      method: "POST",
+      headers: ADMIN,
+      body: JSON.stringify({ modelId: "claude-compat", requestId: "request-anthropic" }),
+    });
+    assert.equal(r.status, 200);
+    assert.equal(((await r.json()) as { reply: string }).reply, "ANTHROPIC QA REPLY");
     const call = seen.find((s) => s.path.endsWith("/v1/messages"));
     assert.ok(call, "messages request reached the anthropic-compatible upstream");
     assert.equal(call!.model, "claude-compat");
     assert.equal(call!.apiKeyHeader, "sk-ant-qa", "anthropic wire auth uses x-api-key");
+    assert.equal(call!.maxTokens, 128);
   } finally {
     server.close();
     upstream.close();
@@ -306,7 +1013,7 @@ test("QA: registrations survive a restart (shared durable backing + same secret)
   // and the hydration path wires it into the runtime registry
   setCustomProviders(enabled);
   assert.ok(resolveModel("survivor-model"), "hydrated model resolves");
-  setCustomProviders([]);
+  setCustomProviders([], []);
 });
 
 test("QA: a corrupt stored key degrades that provider only — admin surface stays intact", async () => {

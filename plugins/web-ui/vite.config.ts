@@ -1,5 +1,6 @@
 import { defineConfig } from "vite";
 import { fileURLToPath } from "node:url";
+import { cpSync } from "node:fs";
 
 const SERVER = process.env.WEB_UI_SERVER_URL ?? "http://localhost:8096";
 
@@ -7,6 +8,14 @@ const here = (rel: string): string => fileURLToPath(new URL(rel, import.meta.url
 
 export default defineConfig({
   base: process.env.WEB_UI_BASE ?? "/",
+  plugins: [
+    {
+      name: "katex-fonts",
+      closeBundle() {
+        cpSync(here("node_modules/katex/dist/fonts"), here("dist-web/fonts"), { recursive: true });
+      },
+    },
+  ],
   resolve: {
     alias: [
       { find: /^katex$/, replacement: here("src/lazy-katex.ts") },

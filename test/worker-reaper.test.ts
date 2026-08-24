@@ -502,6 +502,7 @@ test("a worker pool drains a queued run end-to-end", async () => {
 });
 
 test("runtime.start() leaves queued runs idle when background work is disabled", async () => {
+  let capabilityBeats = 0;
   const built = buildApp(
     testConfig({
       dataDir: mkdtempSync(join(tmpdir(), "wr-")),
@@ -510,6 +511,14 @@ test("runtime.start() leaves queued runs idle when background work is disabled",
       leaseTtlMs: 5_000,
       reaperIntervalMs: 60_000,
     }),
+    {
+      instanceRegistry: {
+        beat: async () => {
+          capabilityBeats += 1;
+          return false;
+        },
+      },
+    },
   );
   built.runtime.start();
   try {
@@ -524,6 +533,7 @@ test("runtime.start() leaves queued runs idle when background work is disabled",
     assert.ok(ack.runId);
     await sleep(50);
     assert.equal((await built.runs.get(ack.runId!))?.status, "pending");
+    assert.ok(capabilityBeats > 0, "a web-only runtime still advertises its deployment capability heartbeat");
   } finally {
     await built.runtime.stop();
   }

@@ -457,6 +457,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       if (!rl.allowed) {
         return {
           status: "refused",
+          refusalKind: "rate_limit",
           reason: `rate limit exceeded — try again in ${Math.ceil((rl.retryAfterMs ?? 0) / 1000)}s`,
         };
       }
@@ -466,6 +467,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         if (!b.allowed) {
           return {
             status: "refused",
+            refusalKind: "budget_limit",
             reason: `budget exceeded ($${b.spentUsd.toFixed(2)} of $${b.limitUsd}); try again later`,
           };
         }

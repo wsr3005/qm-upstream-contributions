@@ -121,3 +121,49 @@ test("pg mutex: waiting beyond timeoutMs throws a clear error", { skip }, async 
     await pgWaiter.close();
   }
 });
+
+test("pg mutex: pool saturation still honors withLock and tryWithLock deadlines", { skip }, async () => {
+  const pg = createPgPool(URL!, []);
+  try {
+    const lock = createPostgresAdvisoryLock(pg, { pollMs: 50, timeoutMs: 150 });
+    let entered = 0;
+    let ready!: () => void;
+    let release!: () => void;
+    const allEntered = new Promise<void>((resolve) => {
+      ready = resolve;
+    });
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const holders = Array.from({ length: 10 }, (_, index) =>
+      lock.withLock(`deploy:saturated:${index}`, async () => {
+        entered += 1;
+        if (entered === 10) ready();
+        await held;
+      }),
+    );
+    await allEntered;
+
+    const started = Date.now();
+    await assert.rejects(
+      lock.withLock("deploy:saturated:waiter", async () => "never"),
+      /timeout acquiring advisory lock for deploy:saturated:waiter/,
+    );
+    assert.ok(Date.now() - started < 1_000);
+    const tries = await Promise.all(
+      Array.from({ length: 500 }, (_, index) =>
+        lock.tryWithLock!(`deploy:saturated:try:${index}`, async () => "never"),
+      ),
+    );
+    assert.ok(tries.every((result) => result === null));
+    const pool = await pg.pool();
+    assert.equal(pool.waitingCount, 0);
+
+    release();
+    await Promise.all(holders);
+    await sleep(50);
+    assert.equal(pool.waitingCount, 0);
+  } finally {
+    await pg.close();
+  }
+});

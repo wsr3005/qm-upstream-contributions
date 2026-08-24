@@ -147,7 +147,7 @@ describe("fireDropResolution", () => {
       deliveries,
       idempotency: createIdempotencyStore(createMemoryMap<IdempotencyRecord>()),
       identity: createIdentityService(createMemoryMap()),
-      run: async () => ({ status: "pending_approval" }) as TurnResult,
+      run: async () => ({ status: "refused", refusalKind: "rate_limit", reason: "rate limit exceeded" }) as TurnResult,
     };
     const destination = { type: "slack", target: "C1", audienceScopeId: scopeId("channel", "C1") } as const;
     await fireDropResolution(deps, {
@@ -160,7 +160,9 @@ describe("fireDropResolution", () => {
       grantId: "g1",
       granted: true,
     });
-    const fb = (await deliveries.pending("slack")).filter((d) => d.idempotencyKey === "drop:dropF:fallback");
+    const pending = await deliveries.pending("slack");
+    assert.equal(pending.length, 1, "the caller-owned fallback is the only delivery");
+    const fb = pending.filter((d) => d.idempotencyKey === "drop:dropF:fallback");
     assert.equal(fb.length, 1, "the conversation hears the key arrived even when the resume turn didn't run");
     assert.match(fb[0]!.text, /saved to the keychain/);
   });
