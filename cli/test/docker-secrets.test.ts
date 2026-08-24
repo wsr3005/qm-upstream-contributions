@@ -36,6 +36,7 @@ const fs = require("node:fs");
 const args = process.argv.slice(2);
 fs.appendFileSync(${JSON.stringify(argvLog)}, JSON.stringify(args) + "\\n");
 if (args[0] === "version") { console.log("25.0"); process.exit(0); }
+if (args[0] === "context") { console.log(process.env.FAKE_DOCKER_ENDPOINT || "unix:///var/run/docker.sock"); process.exit(0); }
 if (args[0] === "run") {
   const i = args.indexOf("--env-file");
   if (i !== -1) {
@@ -231,6 +232,117 @@ test("docker up delivers secrets via a 0600 env-file, never on the docker argv",
       if (value === undefined) delete process.env[name];
       else process.env[name] = value;
     }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("docker local binds the final Core runtime to its sandbox contract", { timeout: 60_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-docker-local-contract-"));
+  const priorPath = process.env.PATH;
+  const priorDb = process.env.DATABASE_URL;
+  const priorDockerEndpoint = process.env.FAKE_DOCKER_ENDPOINT;
+  const priorDockerHost = process.env.DOCKER_HOST;
+  const log = console.log,
+    warn = console.warn;
+  const image = `registry.example.test/sandbox@sha256:${"a".repeat(64)}`;
+  try {
+    writeFileSync(
+      join(dir, CONFIG_FILENAME),
+      JSON.stringify({
+        contract: 1,
+        orgId: "local-contract",
+        publicUrl: "http://localhost:8080",
+        target: "docker",
+        services: ["core"],
+        sandbox: { app: "local-sandboxes", backend: "local", image },
+        env: {
+          core: {
+            SANDBOX_BACKEND: "local",
+          },
+        },
+      }),
+    );
+    writeFileSync(
+      join(dir, ".env"),
+      [
+        "CAPABILITY_SECRET=capability",
+        `CONNECTOR_SECRET_KEY=${"connector".repeat(4)}`,
+        `CORE_SIGNING_SECRET=${"core-sign".repeat(4)}`,
+        "PORTAL_IDENTITY_SECRET=identity",
+        `SKILL_SIGNING_SECRET=${"skill-sign".repeat(4)}`,
+        "SPRITES_TOKEN=sprites-secondary-token",
+      ].join("\n"),
+    );
+    const fake = fakeDocker(dir);
+    process.env.PATH = `${dir}:${priorPath}`;
+    process.env.DATABASE_URL = "postgres://external/db";
+    console.log = (): void => {};
+    console.warn = console.log;
+    const { config } = loadConfigAt(join(dir, CONFIG_FILENAME));
+    process.env.DOCKER_HOST = "tcp://ambient.example:2375";
+    await assert.rejects(
+      dockerUp(config, dir, {}),
+      /requires a local Unix socket context; got tcp:\/\/ambient\.example:2375/,
+    );
+    delete process.env.DOCKER_HOST;
+    process.env.FAKE_DOCKER_ENDPOINT = "tcp://remote.example:2375";
+    await assert.rejects(
+      dockerUp(config, dir, {}),
+      /requires a local Unix socket context; got tcp:\/\/remote\.example:2375/,
+    );
+    const refusedCalls = readFileSync(fake.argvLog, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as string[]);
+    assert.equal(
+      refusedCalls.some((args) => ["network", "volume", "run", "rm", "pull"].includes(args[0]!)),
+      false,
+    );
+    writeFileSync(fake.argvLog, "");
+    delete process.env.FAKE_DOCKER_ENDPOINT;
+    await dockerUp(config, dir, {});
+    const calls = readFileSync(fake.argvLog, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as string[]);
+    const core = calls.find((args) => args[0] === "run" && args.includes("qm-local-contract-core"));
+    assert.ok(core);
+    assert.equal(core.includes("/var/run/docker.sock:/var/run/docker.sock"), true);
+    assert.equal(core.includes("--group-add"), true);
+    assert.equal(core.includes("--add-host"), false);
+    assert.equal(core.includes("LOCAL_SANDBOX_CONTROLLER_CONTAINER=qm-local-contract-core"), true);
+    const envFiles = readFileSync(fake.envCopy, "utf8");
+    assert.doesNotMatch(envFiles, /^SPRITES_/m);
+    assert.equal(core.includes("SANDBOX_BACKEND=local"), true);
+    assert.equal(core.includes(`LOCAL_SANDBOX_IMAGE=${image}`), true);
+    assert.equal(
+      calls.some((args) => args[0] === "pull" && args[1] === image),
+      true,
+    );
+    writeFileSync(fake.argvLog, "");
+    writeFileSync(fake.envCopy, "");
+    config.env.core!.SANDBOX_SECONDARY_BACKEND = "sprites";
+    config.env.core!.SPRITES_EGRESS_PROXY_URL = "https://sprites-egress.example.test";
+    await dockerUp(config, dir, {});
+    const secondaryCalls = readFileSync(fake.argvLog, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as string[]);
+    const secondaryCore = secondaryCalls.find((args) => args[0] === "run" && args.includes("qm-local-contract-core"));
+    assert.ok(secondaryCore);
+    assert.equal(secondaryCore.includes("SANDBOX_SECONDARY_BACKEND=sprites"), true);
+    assert.equal(secondaryCore.includes("SPRITES_EGRESS_PROXY_URL=https://sprites-egress.example.test"), true);
+    assert.match(readFileSync(fake.envCopy, "utf8"), /^SPRITES_TOKEN=sprites-secondary-token$/m);
+  } finally {
+    console.log = log;
+    console.warn = warn;
+    process.env.PATH = priorPath;
+    if (priorDb === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = priorDb;
+    if (priorDockerEndpoint === undefined) delete process.env.FAKE_DOCKER_ENDPOINT;
+    else process.env.FAKE_DOCKER_ENDPOINT = priorDockerEndpoint;
+    if (priorDockerHost === undefined) delete process.env.DOCKER_HOST;
+    else process.env.DOCKER_HOST = priorDockerHost;
     rmSync(dir, { recursive: true, force: true });
   }
 });
