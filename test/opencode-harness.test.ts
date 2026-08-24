@@ -350,7 +350,13 @@ test("custom providers materialize into the opencode config (enabled + provider 
           name: "Responses Gateway",
           protocol: "openai-responses" as const,
           baseUrl: "http://responses.internal/v1",
-          models: [{ id: "responses-gateway/gpt-luna", upstreamId: "gpt-5.6-luna" }],
+          models: [
+            {
+              id: "responses-gateway/gpt-luna",
+              upstreamId: "gpt-5.6-luna",
+              inputModalities: ["text", "image"],
+            },
+          ],
         },
         apiKey: "sk-responses",
       },
@@ -366,13 +372,20 @@ test("custom providers materialize into the opencode config (enabled + provider 
     assert.equal(litellm.npm, "@ai-sdk/openai-compatible");
     assert.equal(litellm.options.baseURL, "http://litellm.internal:4000/v1");
     assert.equal(litellm.options.apiKey, "sk-lite");
-    assert.deepEqual(litellm.models["deepseek-chat"], { name: "DeepSeek", limit: { context: 128000, output: 8192 } });
+    assert.deepEqual(litellm.models["deepseek-chat"], {
+      name: "DeepSeek",
+      attachment: false,
+      modalities: { input: ["text"], output: ["text"] },
+      limit: { context: 128000, output: 8192 },
+    });
     assert.equal(config.provider["responses-gateway"].npm, "@ai-sdk/openai");
     assert.equal(config.provider["responses-gateway"].options.baseURL, "http://responses.internal/v1");
     assert.deepEqual(config.provider["responses-gateway"].models["gpt-5.6-luna"].limit, {
       context: 128000,
       output: 8192,
     });
+    assert.equal(config.provider["responses-gateway"].models["gpt-5.6-luna"].attachment, true);
+    assert.deepEqual(config.provider["responses-gateway"].models["gpt-5.6-luna"].modalities.input, ["text", "image"]);
   } finally {
     await harness.turns.close?.();
     rmSync(dir, { recursive: true, force: true });
@@ -383,7 +396,8 @@ test(
   "the installed OpenCode sidecar completes a turn through a saved Responses provider",
   { skip: existsSync(realOpenCodeBinary) ? false : "opencode-ai is not installed" },
   async (t) => {
-    const requests: Array<{ path: string; auth?: string; model?: string; maxOutputTokens?: number }> = [];
+    const requests: Array<{ path: string; auth?: string; model?: string; maxOutputTokens?: number; image?: boolean }> =
+      [];
     const upstream = createServer((req, res) => {
       let body = "";
       req.on("data", (chunk) => (body += chunk));
@@ -394,6 +408,7 @@ test(
           auth: req.headers.authorization,
           model: payload.model,
           maxOutputTokens: payload.max_output_tokens,
+          image: body.includes("iVBORw0KGgo"),
         });
         if (!req.url?.endsWith("/responses")) {
           res.writeHead(404);
@@ -474,7 +489,13 @@ test(
         name: "Responses Gateway",
         protocol: "openai-responses",
         baseUrl,
-        models: [{ id: "responses-gateway/gpt-luna", upstreamId: "gpt-5.6-luna" }],
+        models: [
+          {
+            id: "responses-gateway/gpt-luna",
+            upstreamId: "gpt-5.6-luna",
+            inputModalities: ["text", "image"],
+          },
+        ],
       },
     ]);
     const harness = createOpenCodeHarness({
@@ -487,7 +508,13 @@ test(
             name: "Responses Gateway",
             protocol: "openai-responses",
             baseUrl,
-            models: [{ id: "responses-gateway/gpt-luna", upstreamId: "gpt-5.6-luna" }],
+            models: [
+              {
+                id: "responses-gateway/gpt-luna",
+                upstreamId: "gpt-5.6-luna",
+                inputModalities: ["text", "image"],
+              },
+            ],
           },
           apiKey: "sk-opencode-qa",
         },
@@ -504,6 +531,14 @@ test(
     input.session = { id: "real-opencode-responses" } as Session;
     input.model = "responses-gateway/gpt-luna";
     input.readOnly = true;
+    input.images = [
+      {
+        mimeType: "image/png",
+        dataBase64: readFileSync(resolve(import.meta.dirname, "live-slack/fixtures/taylor-selfie.png")).toString(
+          "base64",
+        ),
+      },
+    ];
     input.recordModelCall = (record) => modelCalls.push(record);
     const result = await harness.turns.runTurn(input);
     assert.equal(result.reply, "OPENCODE RESPONSES OK");
@@ -513,6 +548,7 @@ test(
         auth: "Bearer sk-opencode-qa",
         model: "gpt-5.6-luna",
         maxOutputTokens: 8192,
+        image: true,
       },
     ]);
     assert.equal(modelCalls[0]?.model, "responses-gateway/gpt-luna");

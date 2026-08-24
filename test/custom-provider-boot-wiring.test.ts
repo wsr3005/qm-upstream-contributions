@@ -11,7 +11,10 @@ import { buildApp, serverDeps } from "../src/wiring.ts";
 import { testConfig } from "./support/test-config.ts";
 import { defaultModelForHarness } from "../src/model/pi-models.ts";
 import { setCustomProviders } from "../src/model/custom-providers.ts";
-import { CUSTOM_PROVIDER_HARNESS_TEST_CAPABILITY } from "../src/model/custom-provider-store.ts";
+import {
+  CUSTOM_PROVIDER_HARNESS_TEST_CAPABILITY,
+  CUSTOM_PROVIDER_INPUT_MODALITIES_CAPABILITY,
+} from "../src/model/custom-provider-store.ts";
 
 const ADMIN = { "content-type": "application/json", "x-admin-actor": "admin-alice@default-org" };
 
@@ -131,6 +134,40 @@ test("production harness testing returns a stable fence only when every live run
   allCapable = true;
   assert.equal(await built.customProviderHarnessTestFence(), "epoch-7");
   assert.equal(checked.filter((capability) => capability === CUSTOM_PROVIDER_HARNESS_TEST_CAPABILITY).length, 2);
+});
+
+test("production image provider writes use the input-modalities capability fence", async () => {
+  const checked: string[] = [];
+  const built = buildApp(
+    testConfig({
+      dataDir: mkdtempSync(join(tmpdir(), "custom-provider-image-capability-")),
+      production: true,
+    }),
+    {
+      instanceRegistry: {
+        beat: async () => false,
+        allLiveSupport: async (capability) => {
+          checked.push(capability);
+          return capability === CUSTOM_PROVIDER_INPUT_MODALITIES_CAPABILITY;
+        },
+      },
+    },
+  );
+
+  await built.customProviders.upsert(
+    {
+      id: "image-gateway",
+      name: "Image Gateway",
+      protocol: "openai-responses",
+      baseUrl: "https://llm.example.com/v1",
+      models: [{ id: "image-model", inputModalities: ["text", "image"] }],
+    },
+    "sk-image",
+    "admin-alice@default-org",
+  );
+
+  assert.deepEqual(checked, [CUSTOM_PROVIDER_INPUT_MODALITIES_CAPABILITY]);
+  assert.equal((await built.customProviders.statuses())[0]?.disabled, false);
 });
 
 test("web turns refresh durable custom providers before runtime validation", async () => {

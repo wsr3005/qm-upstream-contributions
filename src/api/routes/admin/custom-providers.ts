@@ -6,8 +6,8 @@ import {
   type CustomProviderProtocol,
 } from "../../../model/custom-providers.ts";
 import {
-  CUSTOM_PROVIDER_WIRE_ID_SCHEMA,
   CustomProviderRuntimeNotReadyError,
+  requiredCustomProviderRuntimeSchema,
 } from "../../../model/custom-provider-store.ts";
 import { modelSupportedByHarness, resolveModel, resolveStaticModel } from "../../../model/pi-models.ts";
 import { sendJson } from "../../http.ts";
@@ -117,13 +117,14 @@ export async function putCustomProvider(ctx: ApiCtx): Promise<void> {
   } catch (e) {
     return sendJson(ctx.res, 400, { error: "bad_request", message: (e as Error).message });
   }
+  const requiredRuntimeSchema = requiredCustomProviderRuntimeSchema(spec);
   if (
-    spec.models.some((model) => model.upstreamId !== undefined) &&
-    !(await ctx.deps.customProviders.runtimeSchemaWritable(CUSTOM_PROVIDER_WIRE_ID_SCHEMA))
+    requiredRuntimeSchema !== undefined &&
+    !(await ctx.deps.customProviders.runtimeSchemaWritable(requiredRuntimeSchema))
   ) {
     return sendJson(ctx.res, 409, {
       error: "runtime_rollout_incomplete",
-      message: "custom model aliases are unavailable until the compatibility rollout is complete",
+      message: "custom model configuration is unavailable until the compatibility rollout is complete",
     });
   }
   const apiKey = typeof body.apiKey === "string" && body.apiKey.trim() ? body.apiKey.trim() : undefined;

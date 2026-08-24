@@ -5,11 +5,16 @@ import {
   resolveCustomModel,
   isCustomModelId,
   customModelCatalog,
+  customModelsJsonForProviders,
   customProvidersVersion,
   validateCustomProviderSpec,
 } from "../src/model/custom-providers.ts";
 import { builtInModelCatalog } from "../src/model/model-catalog.ts";
-import { createCustomProviderStore } from "../src/model/custom-provider-store.ts";
+import {
+  createCustomProviderStore,
+  CUSTOM_PROVIDER_INPUT_MODALITIES_SCHEMA,
+  CUSTOM_PROVIDER_WIRE_ID_SCHEMA,
+} from "../src/model/custom-provider-store.ts";
 import {
   modelSupportedByHarness,
   modelServiceable,
@@ -40,6 +45,34 @@ test("a registered custom model resolves with the provider's protocol and base U
   assert.equal(model.baseUrl, "https://llm.acme.internal/v1");
   assert.equal(model.contextWindow, 200_000);
   assert.equal(model.cost.input, 2);
+});
+
+test("custom image input capability reaches Pi runtime and models JSON", () => {
+  const provider = {
+    ...GATEWAY,
+    models: [{ id: "vision-model", inputModalities: ["text", "image"] as ("text" | "image")[] }],
+  };
+  setCustomProviders([provider]);
+  assert.deepEqual(resolveCustomModel("vision-model")?.input, ["text", "image"]);
+  assert.deepEqual(customModelsJsonForProviders([provider]), {
+    providers: {
+      "acme-gateway": {
+        name: "Acme Gateway",
+        baseUrl: "https://llm.acme.internal/v1",
+        api: "openai-completions",
+        models: [
+          {
+            id: "vision-model",
+            name: "vision-model",
+            contextWindow: 128_000,
+            maxTokens: 8_192,
+            input: ["text", "image"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          },
+        ],
+      },
+    },
+  });
 });
 
 test("anthropic-protocol providers produce anthropic-messages models with defaults", () => {
@@ -167,6 +200,13 @@ test("spec validation rejects reserved ids, bad slugs, bad URLs, and empty model
     /positive integer/,
   );
   assert.doesNotThrow(() => validateCustomProviderSpec({ ...GATEWAY, models: [{ id: "a", input: 0, output: 0.5 }] }));
+  assert.doesNotThrow(() =>
+    validateCustomProviderSpec({ ...GATEWAY, models: [{ id: "a", inputModalities: ["text", "image"] }] }),
+  );
+  assert.throws(
+    () => validateCustomProviderSpec({ ...GATEWAY, models: [{ id: "a", inputModalities: ["image"] }] }),
+    /inputModalities/,
+  );
 });
 
 test("spec validation rejects malformed model entries and upstream ids", () => {
@@ -303,6 +343,112 @@ test("compatibility runtime reads wire-id records while production writes stay c
     /compatibility rollout/,
   );
   assert.deepEqual(await backing.get(GATEWAY.id), before);
+});
+
+test("image-capable providers wait for schema 2 and cannot be rewritten by an older runtime", async () => {
+  const backing = createMemoryMap<StoredCustomProvider>();
+  const writableSchemas = new Set<number>([CUSTOM_PROVIDER_WIRE_ID_SCHEMA]);
+  const store = createCustomProviderStore({
+    backing,
+    keyMaterial: "input-modalities-release-key",
+    runtimeSchemaReady: async (schema) => writableSchemas.has(schema),
+    runtimeSchemaWritable: async (schema) => writableSchemas.has(schema),
+  });
+  const imageProvider = {
+    ...GATEWAY,
+    protocol: "openai-responses" as const,
+    models: [
+      {
+        id: "acme/gpt-luna",
+        upstreamId: "gpt-5.6-luna",
+        inputModalities: ["text", "image"] as ("text" | "image")[],
+      },
+    ],
+  };
+
+  await assert.rejects(store.upsert(imageProvider, "sk-image", "admin@example.com"), /compatibility rollout/);
+  assert.equal(await backing.get(GATEWAY.id), null);
+
+  writableSchemas.add(CUSTOM_PROVIDER_INPUT_MODALITIES_SCHEMA);
+  await store.upsert(imageProvider, "sk-image", "admin@example.com");
+  assert.equal((await backing.get(GATEWAY.id))?.runtimeSchema, CUSTOM_PROVIDER_INPUT_MODALITIES_SCHEMA);
+  assert.deepEqual(await store.enabled(), [imageProvider]);
+
+  writableSchemas.delete(CUSTOM_PROVIDER_INPUT_MODALITIES_SCHEMA);
+  const before = await backing.get(GATEWAY.id);
+  await assert.rejects(
+    store.upsert(
+      { ...GATEWAY, protocol: "openai-responses", models: [{ id: "acme/gpt-luna" }] },
+      undefined,
+      "older-admin@example.com",
+    ),
+    /compatibility rollout/,
+  );
+  assert.deepEqual(await backing.get(GATEWAY.id), before);
+  assert.deepEqual(await store.enabled(), []);
+});
+
+test("schema 2 remains protected after image capability is intentionally removed", async () => {
+  const backing = createMemoryMap<StoredCustomProvider>();
+  const store = createCustomProviderStore({ backing, keyMaterial: "schema-downgrade-key" });
+  const imageProvider = {
+    ...GATEWAY,
+    models: [{ id: "acme/gpt-luna", inputModalities: ["text", "image"] as ("text" | "image")[] }],
+  };
+
+  await store.upsert(imageProvider, "sk-image", "admin@example.com");
+  await store.upsert({ ...GATEWAY, models: [{ id: "acme/gpt-luna" }] }, undefined, "admin@example.com");
+
+  const raw = await backing.get(GATEWAY.id);
+  assert.equal(raw?.runtimeSchema, CUSTOM_PROVIDER_INPUT_MODALITIES_SCHEMA);
+  assert.equal(raw?.compatibilityDisabled, true);
+});
+
+test("historical image fields cannot bypass schema 2 through schema 1 or schema-less records", async () => {
+  const backing = createMemoryMap<StoredCustomProvider>();
+  const store = createCustomProviderStore({
+    backing,
+    keyMaterial: "historical-image-field-key",
+    runtimeSchemaReady: async (schema) => schema === CUSTOM_PROVIDER_WIRE_ID_SCHEMA,
+  });
+  const historicalModel = {
+    id: "historical-model",
+    upstreamId: "gpt-5.6-luna",
+    inputModalities: ["text", "image"] as ("text" | "image")[],
+  };
+  await backing.put("schema-one", {
+    ...GATEWAY,
+    id: "schema-one",
+    models: [historicalModel],
+    runtimeSchema: CUSTOM_PROVIDER_WIRE_ID_SCHEMA,
+    compatibilityDisabled: true,
+    disabled: true,
+    updatedAt: Date.now(),
+    updatedBy: "older-release",
+  });
+  await backing.put("schema-less", {
+    ...GATEWAY,
+    id: "schema-less",
+    models: [{ ...historicalModel, id: "historical-schema-less" }],
+    updatedAt: Date.now(),
+    updatedBy: "older-release",
+  });
+
+  const enabled = await store.enabled();
+  assert.deepEqual(
+    enabled.map((provider) => provider.models[0]),
+    [
+      { id: "historical-schema-less", upstreamId: "gpt-5.6-luna" },
+      { id: "historical-model", upstreamId: "gpt-5.6-luna" },
+    ],
+  );
+  assert.deepEqual(
+    (await store.statuses()).map((provider) => provider.models[0]),
+    [
+      { id: "historical-schema-less", upstreamId: "gpt-5.6-luna" },
+      { id: "historical-model", upstreamId: "gpt-5.6-luna" },
+    ],
+  );
 });
 
 test("concurrent provider writes cannot claim the same model id", async () => {

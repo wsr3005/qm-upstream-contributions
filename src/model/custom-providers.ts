@@ -9,6 +9,7 @@ export interface CustomModelSpec {
   name?: string;
   contextWindow?: number;
   maxTokens?: number;
+  inputModalities?: ("text" | "image")[];
   /** USD per million input tokens. Defaults to 0 (unknown / not metered). */
   input?: number;
   /** USD per million output tokens. Defaults to 0. */
@@ -72,6 +73,16 @@ export function validateCustomProviderSpec(spec: CustomProviderSpec): void {
         throw new Error(`model "${m.id}": ${field} must be a positive integer`);
       }
     }
+    if (
+      m.inputModalities !== undefined &&
+      (!Array.isArray(m.inputModalities) ||
+        m.inputModalities.length === 0 ||
+        !m.inputModalities.includes("text") ||
+        m.inputModalities.some((modality) => modality !== "text" && modality !== "image") ||
+        new Set(m.inputModalities).size !== m.inputModalities.length)
+    ) {
+      throw new Error(`model "${m.id}": inputModalities must be text or text,image`);
+    }
     for (const [field, v] of [
       ["input", m.input],
       ["output", m.output],
@@ -120,7 +131,7 @@ function toRuntimeModel(provider: CustomProviderSpec, m: CustomModelSpec): Custo
     api: runtimeApi(provider.protocol),
     baseUrl: provider.baseUrl,
     reasoning: false,
-    input: ["text"],
+    input: m.inputModalities ? [...m.inputModalities] : ["text"],
     cost: { input: m.input ?? 0, output: m.output ?? 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: m.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
     maxTokens: m.maxTokens ?? DEFAULT_MAX_TOKENS,
@@ -217,6 +228,7 @@ export function customModelsJsonForProviders(
             name: m.name ?? m.id,
             contextWindow: m.contextWindow ?? 128_000,
             maxTokens: m.maxTokens ?? 8_192,
+            input: m.inputModalities ? [...m.inputModalities] : ["text"],
             cost: { input: m.input ?? 0, output: m.output ?? 0, cacheRead: 0, cacheWrite: 0 },
           })),
         },

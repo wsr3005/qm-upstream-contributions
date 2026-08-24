@@ -4004,14 +4004,15 @@
                     placeholder="Write-only; blank on edit keeps the stored key"
                 /></label>
                 <label
-                  >Models (one per line: local id | name | context | maxTokens | upstream id)
+                  >Models (one per line: local id | name | context | maxTokens | upstream id | input modalities)
                   <textarea
                     id="custom-provider-models"
                     rows="3"
-                    placeholder="gpt-5.6-luna | GPT 5.6 Luna | 1050000 | 128000"
+                    placeholder="gpt-5.6-luna | GPT 5.6 Luna | 1050000 | 128000 | gpt-5.6-luna | text,image"
                   ></textarea>
                   <small
-                    >The optional fifth value overrides the model id sent upstream. Built-in id conflicts are namespaced
+                    >The optional fifth value overrides the model id sent upstream. Use text,image in the sixth value
+                    for models that accept images; the default is text. Built-in id conflicts are namespaced
                     automatically.</small
                   >
                 </label>
@@ -7628,12 +7629,15 @@
           .map((line) => line.trim())
           .filter(Boolean)
           .map((line) => {
-            const [id, name, contextWindow, maxTokens, upstreamId] = line.split("|").map((part) => part.trim());
+            const [id, name, contextWindow, maxTokens, upstreamId, inputModalities] = line
+              .split("|")
+              .map((part) => part.trim());
             const model = { id };
             if (name) model.name = name;
             if (contextWindow) model.contextWindow = Number(contextWindow);
             if (maxTokens) model.maxTokens = Number(maxTokens);
             if (upstreamId) model.upstreamId = upstreamId;
+            if (inputModalities) model.inputModalities = inputModalities.split(",").map((part) => part.trim());
             return model;
           });
       }
@@ -7735,7 +7739,14 @@
             $("custom-provider-key").value = "";
             $("custom-provider-models").value = provider.models
               .map((model) =>
-                [model.id, model.name, model.contextWindow, model.maxTokens, model.upstreamId]
+                [
+                  model.id,
+                  model.name,
+                  model.contextWindow,
+                  model.maxTokens,
+                  model.upstreamId,
+                  model.inputModalities?.join(","),
+                ]
                   .map((part) => part ?? "")
                   .join(" | ")
                   .replace(/(?: \| )+$/, ""),

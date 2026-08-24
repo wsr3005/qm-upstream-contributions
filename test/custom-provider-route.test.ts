@@ -1058,3 +1058,23 @@ test("model aliases remain inactive until every runtime supports wire ids", asyn
     await srv.close();
   }
 });
+
+test("image capability remains inactive until every runtime supports schema 2", async () => {
+  const srv = start(undefined, false);
+  try {
+    const put = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify({
+        ...BODY,
+        models: [{ id: "acme-luna", inputModalities: ["text", "image"] }],
+        validate: false,
+      }),
+    });
+    assert.equal(put.status, 409);
+    assert.equal(((await put.json()) as { error: string }).error, "runtime_rollout_incomplete");
+    assert.equal(resolveModel("acme-luna"), undefined);
+  } finally {
+    await srv.close();
+  }
+});

@@ -180,6 +180,8 @@ import { resolveCustomModel, runtimeModelForCustomProvider, setCustomProviders }
 import {
   createCustomProviderStore,
   CUSTOM_PROVIDER_HARNESS_TEST_CAPABILITY,
+  CUSTOM_PROVIDER_INPUT_MODALITIES_CAPABILITY,
+  CUSTOM_PROVIDER_INPUT_MODALITIES_SCHEMA,
   CUSTOM_PROVIDER_WIRE_ID_CAPABILITY,
   CUSTOM_PROVIDER_WIRE_ID_SCHEMA,
   type CustomProviderStore,
@@ -760,13 +762,22 @@ export function buildApp(
           instanceId: randomUUID(),
           buildSha: config.buildSha,
           startedAt: Date.now(),
-          capabilities: [CUSTOM_PROVIDER_WIRE_ID_CAPABILITY, CUSTOM_PROVIDER_HARNESS_TEST_CAPABILITY],
+          capabilities: [
+            CUSTOM_PROVIDER_WIRE_ID_CAPABILITY,
+            CUSTOM_PROVIDER_INPUT_MODALITIES_CAPABILITY,
+            CUSTOM_PROVIDER_HARNESS_TEST_CAPABILITY,
+          ],
         })
       : createNoopInstanceRegistry());
   const customProviderRuntimeSchemaReady = async (schema: number) => {
-    if (schema !== CUSTOM_PROVIDER_WIRE_ID_SCHEMA) return false;
     if (!config.production) return true;
-    return (await instanceRegistry.allLiveSupport?.(CUSTOM_PROVIDER_WIRE_ID_CAPABILITY)) ?? false;
+    const capabilitiesBySchema = new Map([
+      [CUSTOM_PROVIDER_WIRE_ID_SCHEMA, CUSTOM_PROVIDER_WIRE_ID_CAPABILITY],
+      [CUSTOM_PROVIDER_INPUT_MODALITIES_SCHEMA, CUSTOM_PROVIDER_INPUT_MODALITIES_CAPABILITY],
+    ]);
+    const capability = capabilitiesBySchema.get(schema);
+    if (!capability) return false;
+    return (await instanceRegistry.allLiveSupport?.(capability)) ?? false;
   };
   const customProviderHarnessTestFence = async (): Promise<string | null> => {
     if (!config.production) return "non-production";

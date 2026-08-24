@@ -719,6 +719,11 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
                     m.upstreamId?.trim() || m.id,
                     {
                       name: m.name ?? m.id,
+                      attachment: m.inputModalities?.includes("image") ?? false,
+                      modalities: {
+                        input: m.inputModalities ?? ["text"],
+                        output: ["text"],
+                      },
                       limit: {
                         context: m.contextWindow ?? 128_000,
                         output: m.maxTokens ?? 8_192,

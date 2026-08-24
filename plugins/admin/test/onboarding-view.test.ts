@@ -257,7 +257,7 @@ function createCustomProviderUi(
       element("custom-provider-id").value = "gateway";
       element("custom-provider-name").value = "Gateway";
       element("custom-provider-url").value = "https://models.example/v1";
-      element("custom-provider-models").value = "luna | Luna | 1000 | 128 | gpt-5.6-luna";
+      element("custom-provider-models").value = "luna | Luna | 1000 | 128 | gpt-5.6-luna | text,image";
     },
     setApi(handler: ApiHandler) {
       apiHandler = handler;
@@ -390,13 +390,28 @@ test("custom provider load errors clear after a successful refresh", async () =>
 });
 
 test("custom provider save does not overwrite a failed refresh with a success", async () => {
-  const harness = createCustomProviderUi(async (method) =>
-    method === "PUT" ? { ok: true, data: {} } : { ok: false, data: { message: "refresh failed" } },
-  );
+  let savedBody: unknown;
+  const harness = createCustomProviderUi(async (method, _path, body) => {
+    if (method === "PUT") {
+      savedBody = body;
+      return { ok: true, data: {} };
+    }
+    return { ok: false, data: { message: "refresh failed" } };
+  });
   harness.setProviderForm();
 
   await harness.ui.saveProvider();
 
+  assert.deepEqual(JSON.parse(JSON.stringify((savedBody as { models: unknown }).models)), [
+    {
+      id: "luna",
+      name: "Luna",
+      contextWindow: 1000,
+      maxTokens: 128,
+      upstreamId: "gpt-5.6-luna",
+      inputModalities: ["text", "image"],
+    },
+  ]);
   assert.equal(harness.providerStatus.textContent, "refresh failed");
   assert.equal(harness.providerStatus.className, "status err");
 });
