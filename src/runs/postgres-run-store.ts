@@ -162,9 +162,15 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
          ON CONFLICT (idempotency_key) DO NOTHING RETURNING *`,
         [id, sessionId, JSON.stringify(request), dedupKey ?? null, maxAttempts, Date.now()],
       );
-      if (inserted[0]) return { run: rowToRun(inserted[0]), deduped: false };
+      if (inserted[0]) return { run: rowToRun(inserted[0]), deduped: false, conflict: false };
       const { rows } = await q("SELECT * FROM runs WHERE idempotency_key = $1", [dedupKey]);
-      return { run: rowToRun(rows[0]!), deduped: true };
+      const row = rows[0]!;
+      return {
+        run: rowToRun(row),
+        deduped: true,
+        conflict:
+          row.session_id !== sessionId || JSON.stringify(JSON.parse(row.request as string)) !== JSON.stringify(request),
+      };
     },
 
     async claim(workerId, ttlMs): Promise<Run | null> {

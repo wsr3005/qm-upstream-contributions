@@ -22,6 +22,16 @@ const MEMBERSHIP_SKIP_NOTE = "the acting person is no longer a member of this tr
 const UNKNOWN_HOME_SKIP_NOTE =
   "this trigger's home scope is missing from the directory snapshot (roster sync gap) and the acting person has no session there — run skipped";
 
+function automatedRefusalText(result: TurnResult): string | null {
+  if (result.refusalKind === "budget_limit") {
+    return "⚠️ I couldn't finish that turn: budget exceeded";
+  }
+  if (result.refusalKind !== "rate_limit") return null;
+  const seconds = /^rate limit exceeded — try again in ([1-9]\d*)s$/u.exec(result.reason ?? "");
+  if (seconds) return `⚠️ I couldn't finish that turn: rate limit exceeded — try again in ${seconds[1]}s`;
+  return "⚠️ I couldn't finish that turn: rate limited";
+}
+
 export interface TriggerDeps {
   deliveries: DeliveryStore;
   idempotency: IdempotencyStore;
@@ -65,10 +75,6 @@ export interface TriggerOutcome {
   note?: string;
   reply?: string;
   sessionId?: string;
-}
-
-function isTriggerFailure(outcome: TriggerOutcome): boolean {
-  return outcome.ran && outcome.status !== undefined && outcome.status !== "ok" && outcome.status !== "silent";
 }
 
 const NO_UPDATE_SENTINEL = "[no-update]";
@@ -236,10 +242,36 @@ export async function runTrigger(deps: TriggerDeps, spec: TriggerSpec): Promise<
   let note: string | undefined;
   let reply: string | undefined;
   let sessionId: string | undefined;
+  let guardedRefusalText: string | null = null;
+  let securityQuarantined = false;
   const ownerSkipNotice = async () => {
     await deps.deliveries.enqueue({
       destination: principalDestination(spec.owner, spec.owner),
       text: `Scheduled delivery skipped: ${consentNote}`,
+      idempotencyKey: `${spec.fireKey}:err`,
+      provenance: deliveryProvenance(spec, threadRef),
+      ...(spec.shadow ? { shadow: true } : {}),
+    });
+  };
+  const enqueueErrorNotice = async () => {
+    const errorNotice = spec.errorNotice;
+    const destination = spec.destination;
+    if (
+      !errorNotice ||
+      !destination ||
+      !consented ||
+      !deliverable ||
+      status === undefined ||
+      status === "ok" ||
+      status === "silent" ||
+      securityQuarantined ||
+      guardedRefusalText
+    ) {
+      return;
+    }
+    await deps.deliveries.enqueue({
+      destination,
+      text: errorNotice(note ?? status),
       idempotencyKey: `${spec.fireKey}:err`,
       provenance: deliveryProvenance(spec, threadRef),
       ...(spec.shadow ? { shadow: true } : {}),
@@ -293,12 +325,32 @@ export async function runTrigger(deps: TriggerDeps, spec: TriggerSpec): Promise<
       idempotencyKey: spec.fireKey,
     });
     status = res.status;
-    reply = res.reply;
     sessionId = res.sessionId;
+    securityQuarantined = res.status === "refused" && res.refusalKind === "security_quarantine";
+    reply = securityQuarantined ? undefined : res.reply;
+    guardedRefusalText = res.status === "refused" && isPollSurface(spec.surface) ? automatedRefusalText(res) : null;
+    if (securityQuarantined) {
+      note = "refused: security quarantine";
+      return;
+    }
     if (res.status === "silent") return;
     if (res.status === "pending_approval") {
       note = "hit a require_approval command — failed closed (no human at fire/event time)";
       console.warn(`[trigger] ${spec.surface} ${spec.fireKey} ${note}`);
+      await enqueueErrorNotice();
+      return;
+    }
+    if (guardedRefusalText) {
+      note = res.reason ? `${res.status}: ${res.reason}` : res.status;
+      if (!spec.destination || !consented || !deliverable) return;
+      await reachEnqueue({
+        deliveries: deps.deliveries,
+        destination: spec.destination,
+        text: guardedRefusalText,
+        idempotencyKey: spec.fireKey,
+        provenance: deliveryProvenance(spec, threadRef, res),
+        ...(spec.shadow ? { shadow: true } : {}),
+      });
       return;
     }
     if (res.status === "ok" && (res.reply || res.attachments?.length)) {
@@ -328,6 +380,7 @@ export async function runTrigger(deps: TriggerDeps, spec: TriggerSpec): Promise<
     }
     if (res.status === "ok") note = "produced no reply";
     else note = res.reason ? `${res.status}: ${res.reason}` : res.status;
+    await enqueueErrorNotice();
   });
 
   const outcome: TriggerOutcome = {
@@ -338,16 +391,6 @@ export async function runTrigger(deps: TriggerDeps, spec: TriggerSpec): Promise<
     ...(reply !== undefined ? { reply } : {}),
     ...(sessionId ? { sessionId } : {}),
   };
-
-  if (spec.errorNotice && spec.destination && consented && deliverable && isTriggerFailure(outcome)) {
-    await deps.deliveries.enqueue({
-      destination: spec.destination,
-      text: spec.errorNotice(note ?? status!),
-      idempotencyKey: `${spec.fireKey}:err`,
-      provenance: deliveryProvenance(spec, threadRef),
-      ...(spec.shadow ? { shadow: true } : {}),
-    });
-  }
 
   return outcome;
 }

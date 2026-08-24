@@ -29,6 +29,8 @@ import {
 import { DEFAULT_AGENT_MODEL_ID, auxiliaryModelFor, getRequiredModel, resolveModel } from "../src/model/pi-models.ts";
 import { reconstructMessagesFromHistory } from "../src/harness/replay.ts";
 import type { SessionEntry } from "../src/types.ts";
+import type { HarnessLlmRequestRecord, HarnessTurnInput } from "../src/harness/harness.ts";
+import type { CustomProviderSpec } from "../src/model/custom-providers.ts";
 import { testConfig } from "./support/test-config.ts";
 
 function countTempDirs(prefix: string): number {
@@ -266,6 +268,93 @@ test("oneShot completes an authenticated Pi 0.82 turn", async (t) => {
   assert.equal(apiKey, "test-key");
   assert.match(requestBody, /system/);
   assert.match(requestBody, /hello/);
+});
+
+test("Pi records a custom local model id while sending its upstream wire id", async (t) => {
+  const requests: Array<{ auth?: string; model?: string }> = [];
+  const server = createServer((request, response) => {
+    let body = "";
+    request.on("data", (chunk) => (body += String(chunk)));
+    request.on("end", () => {
+      const payload = JSON.parse(body) as { model?: string };
+      requests.push({ auth: request.headers.authorization, model: payload.model });
+      const item = {
+        id: "msg_pi_alias",
+        type: "message",
+        role: "assistant",
+        status: "completed",
+        content: [{ type: "output_text", text: "PI ALIAS OK", annotations: [] }],
+      };
+      const completed = {
+        id: "resp_pi_alias",
+        object: "response",
+        created_at: Math.floor(Date.now() / 1000),
+        status: "completed",
+        model: "gpt-5.6-luna",
+        output: [item],
+        usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8 },
+      };
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      for (const event of [
+        { type: "response.created", response: { ...completed, status: "in_progress", output: [] } },
+        { type: "response.output_item.added", output_index: 0, item: { ...item, status: "in_progress", content: [] } },
+        { type: "response.output_text.delta", output_index: 0, content_index: 0, delta: "PI ALIAS OK" },
+        { type: "response.output_item.done", output_index: 0, item },
+        { type: "response.completed", response: completed },
+      ]) {
+        response.write(`data: ${JSON.stringify(event)}\n\n`);
+      }
+      response.write("data: [DONE]\n\n");
+      response.end();
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  assert(address && typeof address !== "string");
+  const provider: CustomProviderSpec = {
+    id: "gateway",
+    name: "Gateway",
+    protocol: "openai-responses",
+    baseUrl: `http://127.0.0.1:${address.port}/v1`,
+    models: [{ id: "gateway/gpt-luna", upstreamId: "gpt-5.6-luna" }],
+  };
+  const harness = createPiHarness({
+    turnWallClockMs: 10_000,
+    resolveProviderRuntime: async () => ({ keys: { gateway: "sk-pi-alias" }, customProviders: [provider] }),
+  });
+  t.after(async () => {
+    await harness.turns.close?.();
+    await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+  });
+  const modelCalls: Array<{ model: string }> = [];
+  const llmRows: HarnessLlmRequestRecord[] = [];
+  let seq = 0;
+  const scope = "org:test" as HarnessTurnInput["scopeLabel"];
+  const result = await harness.turns.runTurn({
+    session: { id: "pi-alias" } as HarnessTurnInput["session"],
+    input: "reply briefly",
+    model: "gateway/gpt-luna",
+    systemPrompt: "be concise",
+    history: [],
+    tools: {} as HarnessTurnInput["tools"],
+    scopeLabel: scope,
+    orgScopeId: scope,
+    readOnly: true,
+    emit: async (entry) => ({ ...entry, sessionId: "pi-alias", seq: ++seq, parentSeq: null, createdAt: Date.now() }),
+    recordModelCall: (record) => modelCalls.push(record),
+    recordLlmRequest: async (record) => {
+      llmRows.push(record);
+    },
+  });
+
+  assert.equal(result.reply, "PI ALIAS OK");
+  assert.deepEqual(requests, [{ auth: "Bearer sk-pi-alias", model: "gpt-5.6-luna" }]);
+  assert.equal(modelCalls[0]?.model, "gateway/gpt-luna");
+  assert.equal(llmRows[0]?.model, "gateway/gpt-luna");
+  assert.equal(llmRows[0]?.transport?.modelId, "gpt-5.6-luna");
 });
 
 test("Pi assistant error messages fail the turn instead of becoming a blank reply", () => {

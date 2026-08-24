@@ -26,9 +26,13 @@ for (const backend of backends) {
   test(`[${backend.name}] enqueue dedups by dedup key`, async () => {
     const { runs } = backend.make();
     const a = await runs.enqueue({ sessionId: "s1", request: turn("hi"), dedupKey: "k1" });
-    const b = await runs.enqueue({ sessionId: "s1", request: turn("hi again"), dedupKey: "k1" });
+    const b = await runs.enqueue({ sessionId: "s1", request: turn("hi"), dedupKey: "k1" });
     assert.equal(a.deduped, false);
     assert.equal(b.deduped, true);
+    assert.equal(b.conflict, false);
+    const conflict = await runs.enqueue({ sessionId: "s1", request: turn("hi again"), dedupKey: "k1" });
+    assert.equal(conflict.deduped, true);
+    assert.equal(conflict.conflict, true);
     assert.equal(b.run.id, a.run.id);
     const c = await runs.enqueue({ sessionId: "s1", request: turn("fresh"), dedupKey: "k2" });
     assert.notEqual(c.run.id, a.run.id);

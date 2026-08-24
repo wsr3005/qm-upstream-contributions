@@ -1830,10 +1830,26 @@ test("AWS source builds honor a per-service dockerfile override and stamp GIT_SH
       `core build uses the override: ${coreBuild}`,
     );
     assert.ok(coreBuild?.includes(`--build-arg GIT_SHA=${head}`), `core build stamps GIT_SHA: ${coreBuild}`);
+    assert.equal(coreBuild?.match(/--build-arg GIT_SHA=/g)?.length, 1);
     const webUiBuild = builds.find((line) => line.includes("qm-web-ui"));
     assert.ok(
       webUiBuild?.includes(`-f ${join(sourceDir, "deploy", "web-ui", "Dockerfile")}`),
       `web-ui build keeps the default: ${webUiBuild}`,
+    );
+    assert.doesNotMatch(webUiBuild ?? "", /--build-arg GIT_SHA=/);
+    const reservedConfig: QmConfig = {
+      ...layeredConfig,
+      aws: {
+        ...layeredConfig.aws!,
+        services: {
+          ...layeredConfig.aws!.services,
+          core: { ...layeredConfig.aws!.services.core!, buildArgs: { GIT_SHA: "spoofed" } },
+        },
+      },
+    };
+    await assert.rejects(
+      () => awsUp(reservedConfig, dir, { yes: true, buildFrom: true, buildFromPath: sourceDir }),
+      /aws\.services\.core\.buildArgs\.GIT_SHA is reserved/,
     );
     const dirtySource = join(dir, "dirty-source");
     for (const service of ["core", "web-ui", "portal"]) {

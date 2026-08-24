@@ -253,3 +253,113 @@ describe("runTrigger: an autonomous cron does NOT go live (it may be conditional
     assert.equal((await d.deliveries.pending("slack")).length, 1, "core delivers the cron reply via the enqueue path");
   });
 });
+
+describe("runTrigger: autonomous guard refusals are delivered safely", () => {
+  const cases = [
+    [
+      "budget_limit",
+      "budget exceeded ($12.34 of $20); try again later",
+      "⚠️ I couldn't finish that turn: budget exceeded",
+    ],
+    [
+      "rate_limit",
+      "rate limit exceeded — try again in 12s",
+      "⚠️ I couldn't finish that turn: rate limit exceeded — try again in 12s",
+    ],
+    ["rate_limit", "provider returned 429 too many requests", "⚠️ I couldn't finish that turn: rate limited"],
+  ];
+
+  for (const [refusalKind, reason, expected] of cases) {
+    it(`delivers one redacted notice for ${reason}`, async () => {
+      const d = deps(async () => ({ status: "refused", refusalKind, reason }) as TurnResult);
+      const out = await runTrigger(d, {
+        owner: "U1",
+        ownerScopeId: scopeId("personal", "U1"),
+        input: "scheduled work",
+        fireKey: `cron:guard:${reason}`,
+        surface: "cron",
+        destination: toChannel,
+        errorNotice: (detail) => `duplicate ${detail}`,
+      });
+      assert.equal(out.status, "refused");
+      assert.equal(out.note, `refused: ${reason}`);
+      const pending = await d.deliveries.pending("slack");
+      assert.equal(pending.length, 1);
+      assert.equal(pending[0]?.text, expected);
+    });
+  }
+
+  it("leaves caller-owned refusal handling intact when an unstructured reason mentions guard words", async () => {
+    const d = deps(async () => ({ status: "refused", reason: "command policy denied budget-429-report" }));
+    await runTrigger(d, {
+      owner: "U1",
+      ownerScopeId: scopeId("personal", "U1"),
+      input: "scheduled work",
+      fireKey: "cron:guard:unrelated",
+      surface: "cron",
+      destination: toChannel,
+      errorNotice: () => "caller fallback",
+    });
+    const pending = await d.deliveries.pending("slack");
+    assert.equal(pending.length, 1);
+    assert.equal(pending[0]?.text, "caller fallback");
+  });
+
+  it("keeps autonomous security quarantine silent and redacts its outcome", async () => {
+    const reason = "provider quota 429 request-id=secret";
+    const d = deps(async () => ({
+      status: "refused",
+      refusalKind: "security_quarantine",
+      reason,
+      reply: "private-reply",
+    }));
+    const out = await runTrigger(d, {
+      owner: "U1",
+      ownerScopeId: scopeId("personal", "U1"),
+      input: "scheduled work",
+      fireKey: "cron:guard:quarantine",
+      surface: "cron",
+      destination: toChannel,
+      errorNotice: (detail) => `unsafe ${detail}`,
+    });
+    assert.equal(out.status, "refused");
+    assert.equal(out.note, "refused: security quarantine");
+    assert.equal(out.reply, undefined);
+    assert.equal(out.note.includes("secret"), false);
+    assert.equal((await d.deliveries.pending("slack")).length, 0);
+  });
+
+  it("retries an ordinary failure when its error notice could not be durably enqueued", async () => {
+    let runs = 0;
+    const d = deps(async () => {
+      runs += 1;
+      return { status: "refused", reason: "ordinary failure" };
+    });
+    const enqueue = d.deliveries.enqueue.bind(d.deliveries);
+    let enqueues = 0;
+    d.deliveries.enqueue = async (input) => {
+      enqueues += 1;
+      if (enqueues === 1) throw new Error("delivery store unavailable");
+      return enqueue(input);
+    };
+    const spec = {
+      owner: "U1",
+      ownerScopeId: scopeId("personal", "U1"),
+      input: "scheduled work",
+      fireKey: "cron:ordinary:error",
+      surface: "cron",
+      destination: toChannel,
+      errorNotice: (detail: string) => `caller fallback: ${detail}`,
+    };
+
+    await assert.rejects(runTrigger(d, spec), /delivery store unavailable/);
+    const retry = await runTrigger(d, spec);
+    const duplicate = await runTrigger(d, spec);
+
+    assert.equal(retry.ran, true);
+    assert.equal(duplicate.ran, false);
+    assert.equal(runs, 2);
+    assert.equal(enqueues, 2);
+    assert.equal((await d.deliveries.pending("slack"))[0]?.text, "caller fallback: refused: ordinary failure");
+  });
+});

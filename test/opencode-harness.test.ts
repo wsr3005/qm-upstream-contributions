@@ -1,12 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { assistantFailure, createOpenCodeHarness, latestAssistantParts } from "../src/harness/opencode-harness.ts";
 import type { OpencodeClient } from "@opencode-ai/sdk";
 import type { HarnessLlmRequestRecord, HarnessTurnInput } from "../src/harness/harness.ts";
 import type { ScopeId, Session, SessionEntry } from "../src/types.ts";
+import { setCustomProviders } from "../src/model/custom-providers.ts";
+
+const realOpenCodeBinary = resolve(import.meta.dirname, "../node_modules/.bin/opencode");
 
 function fakeSidecar(dir: string, name: string, handlers: string): string {
   const script = join(dir, `${name}.js`);
@@ -121,6 +126,26 @@ test("OpenCode surfaces a provider error as a non-retryable failure, never a suc
   assert.equal(llmRows[0]!.step, 0);
 });
 
+test("OpenCode fails closed before startup when an explicitly requested model is unavailable", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-opencode-unavailable-"));
+  let resolutions = 0;
+  const harness = createOpenCodeHarness({
+    binaryPath: fakeSidecar(dir, "unavailable", promptHandlers(okAssistant)),
+    resolveCustomProviders: async () => {
+      resolutions += 1;
+      return [];
+    },
+  });
+  t.after(async () => {
+    await harness.turns.close?.();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const input = turnInput([], []);
+  input.model = "removed-custom-model";
+  await assert.rejects(harness.turns.runTurn(input), /does not support requested model/);
+  assert.equal(resolutions, 0);
+});
+
 test("OpenCode records real usage, cost, and timings for each captured model call", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "qm-opencode-test-"));
   const harness = createOpenCodeHarness({ binaryPath: fakeSidecar(dir, "usage", promptHandlers(okAssistant)) });
@@ -158,7 +183,7 @@ test("OpenCode startup failure reports the sidecar's real output and honors the 
   const noisy = join(dir, "noisy");
   writeFileSync(noisy, `#!/bin/sh\necho "FATAL: missing libfoo" >&2\nexec sleep 30\n`);
   chmodSync(noisy, 0o755);
-  const noisyHarness = createOpenCodeHarness({ binaryPath: noisy, startupTimeoutMs: 400 });
+  const noisyHarness = createOpenCodeHarness({ binaryPath: noisy, startupTimeoutMs: 1500 });
   t.after(async () => noisyHarness.turns.close?.());
   await assert.rejects(noisyHarness.turns.runTurn(turnInput([], [])), (error: Error) => {
     assert.match(error.message, /did not start within \d+s/);
@@ -168,7 +193,7 @@ test("OpenCode startup failure reports the sidecar's real output and honors the 
   const silent = join(dir, "silent");
   writeFileSync(silent, `#!/bin/sh\nexec sleep 30\n`);
   chmodSync(silent, 0o755);
-  const silentHarness = createOpenCodeHarness({ binaryPath: silent, startupTimeoutMs: 400 });
+  const silentHarness = createOpenCodeHarness({ binaryPath: silent, startupTimeoutMs: 1500 });
   t.after(async () => silentHarness.turns.close?.());
   await assert.rejects(silentHarness.turns.runTurn(turnInput([], [])), (error: Error) => {
     assert.match(error.message, /did not start within \d+s: \(no output\)/);
@@ -319,6 +344,22 @@ test("custom providers materialize into the opencode config (enabled + provider 
         },
         apiKey: "sk-lite",
       },
+      {
+        spec: {
+          id: "responses-gateway",
+          name: "Responses Gateway",
+          protocol: "openai-responses" as const,
+          baseUrl: "http://responses.internal/v1",
+          models: [
+            {
+              id: "responses-gateway/gpt-luna",
+              upstreamId: "gpt-5.6-luna",
+              inputModalities: ["text", "image"],
+            },
+          ],
+        },
+        apiKey: "sk-responses",
+      },
     ],
   });
   const entries: SessionEntry[] = [];
@@ -331,9 +372,187 @@ test("custom providers materialize into the opencode config (enabled + provider 
     assert.equal(litellm.npm, "@ai-sdk/openai-compatible");
     assert.equal(litellm.options.baseURL, "http://litellm.internal:4000/v1");
     assert.equal(litellm.options.apiKey, "sk-lite");
-    assert.deepEqual(litellm.models["deepseek-chat"], { name: "DeepSeek", limit: { context: 128000, output: 8192 } });
+    assert.deepEqual(litellm.models["deepseek-chat"], {
+      name: "DeepSeek",
+      attachment: false,
+      modalities: { input: ["text"], output: ["text"] },
+      limit: { context: 128000, output: 8192 },
+    });
+    assert.equal(config.provider["responses-gateway"].npm, "@ai-sdk/openai");
+    assert.equal(config.provider["responses-gateway"].options.baseURL, "http://responses.internal/v1");
+    assert.deepEqual(config.provider["responses-gateway"].models["gpt-5.6-luna"].limit, {
+      context: 128000,
+      output: 8192,
+    });
+    assert.equal(config.provider["responses-gateway"].models["gpt-5.6-luna"].attachment, true);
+    assert.deepEqual(config.provider["responses-gateway"].models["gpt-5.6-luna"].modalities.input, ["text", "image"]);
   } finally {
     await harness.turns.close?.();
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test(
+  "the installed OpenCode sidecar completes a turn through a saved Responses provider",
+  { skip: existsSync(realOpenCodeBinary) ? false : "opencode-ai is not installed" },
+  async (t) => {
+    const requests: Array<{ path: string; auth?: string; model?: string; maxOutputTokens?: number; image?: boolean }> =
+      [];
+    const upstream = createServer((req, res) => {
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", () => {
+        const payload = body ? (JSON.parse(body) as { model?: string; max_output_tokens?: number }) : {};
+        requests.push({
+          path: req.url ?? "",
+          auth: req.headers.authorization,
+          model: payload.model,
+          maxOutputTokens: payload.max_output_tokens,
+          image: body.includes("iVBORw0KGgo"),
+        });
+        if (!req.url?.endsWith("/responses")) {
+          res.writeHead(404);
+          return res.end();
+        }
+        const item = {
+          id: "msg_opencode_qa",
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [{ type: "output_text", text: "OPENCODE RESPONSES OK", annotations: [] }],
+        };
+        const response = {
+          id: "resp_opencode_qa",
+          object: "response",
+          created_at: Math.floor(Date.now() / 1000),
+          status: "completed",
+          model: "gpt-5.6-luna",
+          output: [item],
+          usage: {
+            input_tokens: 5,
+            input_tokens_details: { cached_tokens: 0 },
+            output_tokens: 4,
+            output_tokens_details: { reasoning_tokens: 0 },
+            total_tokens: 9,
+          },
+        };
+        const events = [
+          { type: "response.created", response: { ...response, status: "in_progress", output: [] } },
+          {
+            type: "response.output_item.added",
+            output_index: 0,
+            item: { ...item, status: "in_progress", content: [] },
+          },
+          {
+            type: "response.content_part.added",
+            output_index: 0,
+            item_id: item.id,
+            content_index: 0,
+            part: { type: "output_text", text: "", annotations: [] },
+          },
+          {
+            type: "response.output_text.delta",
+            output_index: 0,
+            item_id: item.id,
+            content_index: 0,
+            delta: "OPENCODE RESPONSES OK",
+          },
+          {
+            type: "response.output_text.done",
+            output_index: 0,
+            item_id: item.id,
+            content_index: 0,
+            text: "OPENCODE RESPONSES OK",
+          },
+          {
+            type: "response.content_part.done",
+            output_index: 0,
+            item_id: item.id,
+            content_index: 0,
+            part: item.content[0],
+          },
+          { type: "response.output_item.done", output_index: 0, item },
+          { type: "response.completed", response },
+        ];
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        events.forEach((event, sequence_number) =>
+          res.write(`event: ${event.type}\ndata: ${JSON.stringify({ ...event, sequence_number })}\n\n`),
+        );
+        res.end();
+      });
+    });
+    await new Promise<void>((resolveListen) => upstream.listen(0, "127.0.0.1", resolveListen));
+    const baseUrl = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}/v1`;
+    setCustomProviders([
+      {
+        id: "responses-gateway",
+        name: "Responses Gateway",
+        protocol: "openai-responses",
+        baseUrl,
+        models: [
+          {
+            id: "responses-gateway/gpt-luna",
+            upstreamId: "gpt-5.6-luna",
+            inputModalities: ["text", "image"],
+          },
+        ],
+      },
+    ]);
+    const harness = createOpenCodeHarness({
+      binaryPath: realOpenCodeBinary,
+      turnWallClockMs: 60_000,
+      resolveCustomProviders: async () => [
+        {
+          spec: {
+            id: "responses-gateway",
+            name: "Responses Gateway",
+            protocol: "openai-responses",
+            baseUrl,
+            models: [
+              {
+                id: "responses-gateway/gpt-luna",
+                upstreamId: "gpt-5.6-luna",
+                inputModalities: ["text", "image"],
+              },
+            ],
+          },
+          apiKey: "sk-opencode-qa",
+        },
+      ],
+    });
+    t.after(async () => {
+      await harness.turns.close?.();
+      upstream.close();
+      setCustomProviders([], []);
+    });
+    const llmRows: HarnessLlmRequestRecord[] = [];
+    const modelCalls: Array<{ model: string }> = [];
+    const input = turnInput([], llmRows);
+    input.session = { id: "real-opencode-responses" } as Session;
+    input.model = "responses-gateway/gpt-luna";
+    input.readOnly = true;
+    input.images = [
+      {
+        mimeType: "image/png",
+        dataBase64: readFileSync(resolve(import.meta.dirname, "live-slack/fixtures/taylor-selfie.png")).toString(
+          "base64",
+        ),
+      },
+    ];
+    input.recordModelCall = (record) => modelCalls.push(record);
+    const result = await harness.turns.runTurn(input);
+    assert.equal(result.reply, "OPENCODE RESPONSES OK");
+    assert.deepEqual(requests, [
+      {
+        path: "/v1/responses",
+        auth: "Bearer sk-opencode-qa",
+        model: "gpt-5.6-luna",
+        maxOutputTokens: 8192,
+        image: true,
+      },
+    ]);
+    assert.equal(modelCalls[0]?.model, "responses-gateway/gpt-luna");
+    assert.equal(llmRows[0]?.model, "responses-gateway/gpt-luna");
+    assert.equal(llmRows[0]?.transport?.modelId, "responses-gateway/gpt-5.6-luna");
+  },
+);

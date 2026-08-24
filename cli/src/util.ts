@@ -49,6 +49,29 @@ export function capture(
   }
 }
 
+const sourceBuildInfoByRoot = new Map<string, { gitCommit?: string; dirty?: boolean }>();
+
+export function sourceBuildInfo(root: string): { gitCommit?: string; dirty?: boolean } {
+  const cached = sourceBuildInfoByRoot.get(root);
+  if (cached) return cached;
+  const info: { gitCommit?: string; dirty?: boolean } = {};
+  try {
+    info.gitCommit = capture("git", ["-C", root, "rev-parse", "HEAD"]).trim();
+    info.dirty = capture("git", ["-C", root, "status", "--porcelain"]).trim().length > 0;
+  } catch {
+    void 0;
+  }
+  sourceBuildInfoByRoot.set(root, info);
+  return info;
+}
+
+export function sourceBuildArgs(root: string, service: string): string[] {
+  if (service !== "core") return [];
+  const info = sourceBuildInfo(root);
+  if (!info.gitCommit) throw new CliError("building core from source requires a Git checkout with a commit");
+  return ["--build-arg", `GIT_SHA=${info.gitCommit}${info.dirty ? "-dirty" : ""}`];
+}
+
 export function captureBoth(cmd: string, args: string[], opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {}): string {
   const r = spawnSync(cmd, args, {
     encoding: "utf8",

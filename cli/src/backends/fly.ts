@@ -12,6 +12,7 @@ import {
   promptHidden,
   readEnvFile,
   settleAll,
+  sourceBuildArgs,
   streamLabeled,
   which,
 } from "../util.ts";
@@ -791,7 +792,13 @@ async function deployService(
   } else if (imageSource?.kind === "manifest") {
     args.push("--image", ctx.config.imageOverrides[service] ?? manifestRef(service));
   } else {
-    args.push("--remote-only", "--dockerfile", join(ctx.sourceRoot!, "deploy", service, "Dockerfile"), ctx.sourceRoot!);
+    args.push(
+      "--remote-only",
+      "--dockerfile",
+      join(ctx.sourceRoot!, "deploy", service, "Dockerfile"),
+      ...sourceBuildArgs(ctx.sourceRoot!, service),
+      ctx.sourceRoot!,
+    );
   }
   step(`fly ${args.join(" ")}`);
 
@@ -832,6 +839,7 @@ async function buildServiceImage(
     "--remote-only",
     "--dockerfile",
     join(ctx.sourceRoot!, "deploy", service, "Dockerfile"),
+    ...sourceBuildArgs(ctx.sourceRoot!, service),
     ctx.sourceRoot!,
   ];
   step(`fly ${args.join(" ")}`);

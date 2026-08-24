@@ -28,6 +28,15 @@ export function resolveRuntimeChoice(
     approved.includes(fallback.harnessId) && modelSupportedByHarness(fallback.modelId, fallback.harnessId)
       ? fallback
       : { harnessId: firstApproved, modelId: defaultModelForHarness(firstApproved, fallback.modelId) };
+  if (
+    (orgStored || orgLegacy) &&
+    (!approved.includes(configuredOrg.harnessId) ||
+      !modelSupportedByHarness(configuredOrg.modelId, configuredOrg.harnessId))
+  ) {
+    throw new NonRetryableTurnError(
+      `configured runtime ${configuredOrg.harnessId}/${configuredOrg.modelId} is unavailable`,
+    );
+  }
   const org =
     approved.includes(configuredOrg.harnessId) &&
     modelSupportedByHarness(configuredOrg.modelId, configuredOrg.harnessId)
@@ -40,6 +49,12 @@ export function resolveRuntimeChoice(
     inherited = { harnessId: scopedStored.harnessId, modelId: scopedStored.modelId };
   } else if (scopedLegacy) {
     inherited = { harnessId: fallback.harnessId, modelId: scopedLegacy };
+  }
+  if (
+    (scopedStored || scopedLegacy) &&
+    (!approved.includes(inherited.harnessId) || !modelSupportedByHarness(inherited.modelId, inherited.harnessId))
+  ) {
+    throw new NonRetryableTurnError(`configured runtime ${inherited.harnessId}/${inherited.modelId} is unavailable`);
   }
   const choice =
     requested?.harnessId || requested?.modelId

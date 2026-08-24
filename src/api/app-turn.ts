@@ -61,6 +61,7 @@ export function createTurnMethods(
       if (!deps.identity.isInternal(actor)) {
         return { status: "refused", reason: "internal-only: non-internal principals cannot interact" };
       }
+      await deps.refreshCustomProviders?.();
       let projectAudience: Principal[] | undefined;
       let projectName: string | undefined;
       let projectVersion: string | undefined;
@@ -439,7 +440,8 @@ export function createTurnMethods(
         });
       const enqueued = await withCurrentProjectRoster(enqueue);
       if (!enqueued) return { status: "refused", reason: "project membership changed; retry from the current project" };
-      const { run, deduped } = enqueued;
+      const { run, deduped, conflict } = enqueued;
+      if (conflict) return { status: "refused", reason: "idempotency key conflicts with an earlier request" };
       if (!deduped) {
         deps.sessionStateBus?.emit({
           threadRef: conversation.threadRef,

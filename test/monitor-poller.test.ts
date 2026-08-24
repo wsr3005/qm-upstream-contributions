@@ -278,14 +278,16 @@ test("fire-time authz fails closed: a deactivated owner disarms the watch withou
 });
 
 test("a wake whose turn didn't complete is reported to the destination, not silently dropped", async () => {
-  const h = await harness({ result: { status: "refused", reason: "rate limit exceeded" } });
+  const h = await harness({
+    result: { status: "refused", refusalKind: "rate_limit", reason: "rate limit exceeded" },
+  });
   const m = await h.arm();
   h.append("p-1", "line\n");
   await h.poller.tick();
 
   assert.equal(h.calls.length, 1);
   const pending = await h.deliveries.pending("slack");
-  assert.match(pending[0]?.text ?? "", /⚠️.*could not run.*rate limit/);
+  assert.equal(pending[0]?.text, "⚠️ I couldn't finish that turn: rate limited");
   const after = await h.monitors.get(m.id);
   assert.equal(after?.cursor, "line\n".length);
   assert.equal(after?.enabled, true);

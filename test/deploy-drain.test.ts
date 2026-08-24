@@ -2,6 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
+import { createInsecureTestServer } from "../src/api/server.ts";
+import type { App } from "../src/api/app.ts";
 import { createMemoryRunStore } from "../src/runs/memory-run-store.ts";
 import { createMemorySessionStore } from "../src/sessions/memory-session-store.ts";
 import { createWorker } from "../src/runs/worker.ts";
@@ -112,11 +114,17 @@ test("task protection tracks busyness: asserted while a turn runs, released once
 
 test("noteBusy asserts protection at the idle→busy edge without waiting for a sweep", async () => {
   const puts: Array<{ ProtectionEnabled: boolean }> = [];
+  let releaseSeen!: () => void;
+  const released = new Promise<void>((resolve) => {
+    releaseSeen = resolve;
+  });
   const server = createServer((req, res) => {
     let body = "";
     req.on("data", (c: Buffer) => (body += String(c)));
     req.on("end", () => {
-      puts.push(JSON.parse(body) as (typeof puts)[number]);
+      const put = JSON.parse(body) as (typeof puts)[number];
+      puts.push(put);
+      if (!put.ProtectionEnabled) releaseSeen();
       res.writeHead(200, { "content-type": "application/json" });
       res.end("{}");
     });
@@ -129,16 +137,25 @@ test("noteBusy asserts protection at the idle→busy edge without waiting for a 
     busy: () => true,
     sweepMs: 60_000,
   });
-  drain.noteBusy();
-  await sleep(50);
-  assert.deepEqual(puts.length && puts[0]?.ProtectionEnabled, true, "protection asserted immediately on claim");
-  drain.noteBusy();
-  await sleep(30);
-  assert.equal(puts.length, 1, "already-on is a no-op");
-  drain.stop();
-  await sleep(30);
-  assert.equal(puts.at(-1)?.ProtectionEnabled, false, "stop releases protection best-effort");
-  server.close();
+  try {
+    drain.noteBusy();
+    await sleep(50);
+    assert.deepEqual(puts.length && puts[0]?.ProtectionEnabled, true, "protection asserted immediately on claim");
+    drain.noteBusy();
+    await sleep(30);
+    assert.equal(puts.length, 1, "already-on is a no-op");
+    drain.stop();
+    await Promise.race([
+      released,
+      sleep(1_000).then(() => {
+        throw new Error("task protection release was not observed");
+      }),
+    ]);
+    assert.equal(puts.at(-1)?.ProtectionEnabled, false, "stop releases protection best-effort");
+  } finally {
+    drain.stop();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 });
 
 test("a failing protection endpoint degrades silently and canClaim stays governed by supersession only", async () => {
@@ -149,8 +166,68 @@ test("a failing protection endpoint degrades silently and canClaim stays governe
     busy: () => true,
     sweepMs: 10,
   });
+  await drain.ready();
   drain.start();
   await sleep(50);
   assert.equal(drain.canClaim(), true);
+  assert.equal(drain.readyForTraffic(), true);
   drain.stop();
+});
+
+test("traffic readiness closes after a registry failure and reopens only after a successful heartbeat", async () => {
+  let failing = false;
+  const drain = createDrainController({
+    registry: {
+      beat: async () => {
+        if (failing) throw new Error("registry unavailable");
+        return false;
+      },
+    },
+    protection: null,
+    busy: () => false,
+    sweepMs: 10,
+    freshnessMs: 40,
+  });
+  await drain.ready();
+  assert.equal(drain.readyForTraffic(), true);
+  failing = true;
+  drain.start();
+  await sleep(25);
+  assert.equal(drain.readyForTraffic(), false);
+  failing = false;
+  await sleep(25);
+  assert.equal(drain.readyForTraffic(), true);
+  drain.stop();
+});
+
+test("traffic readiness expires when the registry heartbeat stops advancing", async () => {
+  const drain = createDrainController({
+    registry: { beat: async () => false },
+    protection: null,
+    busy: () => false,
+    freshnessMs: 10,
+  });
+  await drain.ready();
+  assert.equal(drain.readyForTraffic(), true);
+  await sleep(20);
+  assert.equal(drain.readyForTraffic(), false);
+  drain.stop();
+});
+
+test("healthz reflects traffic readiness", async () => {
+  let ready = true;
+  const server = createInsecureTestServer({} as App, { readyForTraffic: () => ready });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    let response = await fetch(`${base}/healthz`);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { ok: true });
+    ready = false;
+    response = await fetch(`${base}/healthz`);
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { ok: false });
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 });

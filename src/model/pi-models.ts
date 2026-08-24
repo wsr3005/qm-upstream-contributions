@@ -1,7 +1,7 @@
 import { getBuiltinModel } from "@earendil-works/pi-ai/providers/all";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { providerBaseUrl } from "./provider-endpoints.ts";
-import { isCustomModelId, resolveCustomModel } from "./custom-providers.ts";
+import { isCustomModelId, isKnownCustomModelId, resolveCustomModel } from "./custom-providers.ts";
 
 const getModel = getBuiltinModel as unknown as (provider: string, id: string) => Model<Api> | undefined;
 
@@ -97,7 +97,12 @@ const REGISTRY_BY_ID = new Map(MODEL_REGISTRY.map((m) => [m.id, m]));
 const OPENROUTER_CATALOG_MODELS = new Map<string, PiModel>();
 
 export function modelDisplayName(id: string): string {
-  return REGISTRY_BY_ID.get(id)?.name ?? OPENROUTER_CATALOG_MODELS.get(id)?.name ?? id;
+  return (
+    REGISTRY_BY_ID.get(id)?.name ??
+    resolveCustomModel(id)?.name ??
+    (isKnownCustomModelId(id) ? id : OPENROUTER_CATALOG_MODELS.get(id)?.name) ??
+    id
+  );
 }
 
 export const DEFAULT_WEBUI_MODEL_IDS: readonly string[] = MODEL_REGISTRY.filter((m) => m.webui).map((m) => m.id);
@@ -162,7 +167,7 @@ export function registerOpenRouterCatalogModel(definition: OpenRouterCatalogMode
   return model;
 }
 
-export function resolveModel(id: string): PiModel | undefined {
+export function resolveStaticModel(id: string): PiModel | undefined {
   const entry = REGISTRY_BY_ID.get(id);
   if (entry?.clone) {
     const template = builtinModel(entry.clone.template);
@@ -179,9 +184,15 @@ export function resolveModel(id: string): PiModel | undefined {
         })
       : undefined;
   }
-  return (
-    builtinModel(id) ?? (resolveCustomModel(id) as unknown as PiModel | undefined) ?? OPENROUTER_CATALOG_MODELS.get(id)
-  );
+  return builtinModel(id);
+}
+
+export function resolveModel(id: string): PiModel | undefined {
+  const stable = resolveStaticModel(id);
+  if (stable) return stable;
+  const custom = resolveCustomModel(id) as unknown as PiModel | undefined;
+  if (custom) return custom;
+  return isKnownCustomModelId(id) ? undefined : OPENROUTER_CATALOG_MODELS.get(id);
 }
 
 export function auxiliaryModelForProvider(provider: string): string | undefined {
@@ -207,8 +218,10 @@ export function contextTokenBudgetForModel(id: string): number | undefined {
 
 export function modelSupportedByHarness(id: string | undefined, harness: string): boolean {
   if (!id) return false;
-  if (isCustomModelId(id) && !REGISTRY_BY_ID.has(id))
+  if (isCustomModelId(id) && !REGISTRY_BY_ID.has(id)) {
+    if (harness === "codex") return resolveCustomModel(id)?.api === "openai-responses";
     return harness === "pi" || harness === "opencode" || harness === "mock";
+  }
   if (harness === "pi" || harness === "opencode" || harness === "mock") return Boolean(resolveModel(id));
   const provider = resolveModel(id)?.provider;
   if (harness === "claude") return provider === "anthropic" || /^claude-/i.test(id);

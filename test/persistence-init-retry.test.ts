@@ -65,6 +65,16 @@ test("pg pool: a failed init is retried with a fresh attempt (rejection not cach
   await pg.close();
 });
 
+test("pg pool: an empty schema still validates the connection and retries failures", async () => {
+  const pg = createPgPool("postgres://127.0.0.1:9/nope", []);
+  const first = await pg.pool().catch((e: unknown) => e);
+  const second = await pg.pool().catch((e: unknown) => e);
+  assert.ok(first instanceof Error);
+  assert.ok(second instanceof Error);
+  assert.notEqual(first, second);
+  await pg.close();
+});
+
 test("pg pool: an idle-client 'error' is logged, not fatal", { skip }, async () => {
   const pg = createPgPool(URL!, ["SELECT 1"]);
   const pool = await pg.pool();

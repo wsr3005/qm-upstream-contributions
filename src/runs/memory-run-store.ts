@@ -39,7 +39,13 @@ export function createMemoryRunStore(opts?: { maxClaims?: number }): MemoryRunti
         const existingId = byKey.get(dedupKey);
         if (existingId) {
           const existing = runs.get(existingId);
-          if (existing) return { run: existing, deduped: true };
+          if (existing)
+            return {
+              run: existing,
+              deduped: true,
+              conflict:
+                existing.sessionId !== sessionId || JSON.stringify(existing.request) !== JSON.stringify(request),
+            };
         }
       }
       const run: Run = {
@@ -62,7 +68,7 @@ export function createMemoryRunStore(opts?: { maxClaims?: number }): MemoryRunti
       };
       runs.set(run.id, run);
       if (dedupKey) byKey.set(dedupKey, run.id);
-      return { run, deduped: false };
+      return { run, deduped: false, conflict: false };
     },
 
     async claim(workerId, ttlMs) {

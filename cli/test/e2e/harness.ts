@@ -103,6 +103,13 @@ export function standInCheckout(services: readonly string[]): string {
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, "Dockerfile"), STANDIN_DOCKERFILE);
   }
+  execFileSync("git", ["init", "-q"], { cwd: root });
+  execFileSync("git", ["add", "-A"], { cwd: root });
+  execFileSync(
+    "git",
+    ["-c", "user.email=test@qm.invalid", "-c", "user.name=QM Test", "commit", "-q", "-m", "stand-in"],
+    { cwd: root },
+  );
   return root;
 }
 

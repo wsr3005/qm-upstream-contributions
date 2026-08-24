@@ -894,13 +894,16 @@ test("pg run store: enqueue dedup, atomic one-per-session claim, fencing, ledger
     assert.equal((await runs.get(first!.id))?.status, "done");
 
     const a = await runs.enqueue({ sessionId: "s1", request: turn("hi"), dedupKey: "k1" });
-    const b = await runs.enqueue({ sessionId: "s1", request: turn("again"), dedupKey: "k1" });
+    const b = await runs.enqueue({ sessionId: "s1", request: turn("hi"), dedupKey: "k1" });
     assert.equal(b.deduped, true);
+    assert.equal(b.conflict, false);
+    const conflict = await runs.enqueue({ sessionId: "s1", request: turn("again"), dedupKey: "k1" });
+    assert.equal(conflict.conflict, true);
     assert.equal(b.run.id, a.run.id);
 
     const N = 8;
     const raced = await Promise.all(
-      Array.from({ length: N }, (_, i) => runs.enqueue({ sessionId: "s2", request: turn(`c${i}`), dedupKey: "kc" })),
+      Array.from({ length: N }, () => runs.enqueue({ sessionId: "s2", request: turn("same"), dedupKey: "kc" })),
     );
     const racedIds = new Set(raced.map((r) => r.run.id));
     assert.equal(racedIds.size, 1, "all concurrent same-key enqueues return the same run");

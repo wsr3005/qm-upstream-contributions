@@ -14,6 +14,16 @@ export function audit(deps: ServerDeps, e: Omit<AuditEvent, "at">): void {
   deps.auditLog?.record({ at: Date.now(), ...e });
 }
 
+export async function auditRequired(deps: ServerDeps, key: string, e: Omit<AuditEvent, "at">): Promise<boolean> {
+  if (!deps.auditLog?.recordOnce) return false;
+  try {
+    await deps.auditLog.recordOnce(key, { at: Date.now(), ...e });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function adminActorFrom(ctx: Pick<ApiCtx, "req" | "deps" | "capability" | "actor">): Principal | null {
   if (ctx.capability) return { id: ctx.capability.actorId, type: "internal" };
   if (ctx.actor)

@@ -254,9 +254,14 @@ export function createPostgresMap<T>(pg: PgPool, table: string): DurableMap<T> {
 export interface PostgresArtifactMaps {
   map<T>(table: string): DurableMap<T>;
   pool: PgPool;
+  advisoryPool: PgPool;
 }
 
 export function createPostgresMapFactory(connectionString: string): PostgresArtifactMaps {
   const pg = createPgPool(connectionString, []);
-  return { map: <T>(table: string): DurableMap<T> => createPostgresMap<T>(pg, table), pool: pg };
+  return {
+    map: <T>(table: string): DurableMap<T> => createPostgresMap<T>(pg, table),
+    pool: pg,
+    advisoryPool: createPgPool(connectionString, []),
+  };
 }

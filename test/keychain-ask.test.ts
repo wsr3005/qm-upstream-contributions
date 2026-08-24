@@ -397,15 +397,21 @@ test("fireAskResolution: a turn that fires but doesn't land falls back to a plai
     grantId: "g1",
   };
 
-  const deps = mkDeps(async () => ({ status: "refused", reason: "rate limit exceeded" }) as TurnResult);
+  const deps = mkDeps(
+    async () => ({ status: "refused", refusalKind: "rate_limit", reason: "rate limit exceeded" }) as TurnResult,
+  );
   await fireAskResolution(deps, ask);
-  let pending = (await deliveries.pending("slack")).filter((d) => d.text.includes(ask.id));
+  let allPending = await deliveries.pending("slack");
+  assert.equal(allPending.length, 1, "the caller-owned fallback is the only delivery");
+  let pending = allPending.filter((d) => d.text.includes(ask.id));
   assert.equal(pending.length, 1);
   assert.match(pending[0]!.text, /couldn't resume the task automatically/);
   assert.match(pending[0]!.text, /was approved/);
 
   await fireAskResolution(deps, ask);
-  pending = (await deliveries.pending("slack")).filter((d) => d.text.includes(ask.id));
+  allPending = await deliveries.pending("slack");
+  assert.equal(allPending.length, 1, "the caller-owned fallback remains the only delivery");
+  pending = allPending.filter((d) => d.text.includes(ask.id));
   assert.equal(pending.length, 1, "fallback is at-most-once");
 
   const notified = { ...ask, id: "fa11bacc1111", notifiedAt: 5 };

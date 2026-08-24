@@ -502,7 +502,7 @@ export interface TurnResult {
   reply?: string;
   reactions?: string[];
   reason?: string;
-  refusalKind?: "security_quarantine";
+  refusalKind?: "budget_limit" | "rate_limit" | "security_quarantine";
   adminUrl?: string;
   runId?: string;
   steered?: true;

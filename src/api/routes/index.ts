@@ -27,7 +27,15 @@ import { egressAuditRoutes } from "./egress-audit.ts";
 import { authBrokerRoutes } from "./auth-broker.ts";
 
 export const rawRoutes: ReadonlyArray<Route<BaseCtx>> = [
-  { method: "GET", path: "/healthz", auth: "public", handle: ({ res }) => sendJson(res, 200, { ok: true }) },
+  {
+    method: "GET",
+    path: "/healthz",
+    auth: "public",
+    handle: ({ res, deps }) => {
+      const ok = deps.readyForTraffic?.() ?? true;
+      sendJson(res, ok ? 200 : 503, { ok });
+    },
+  },
   {
     match: (m, p) => (m === "GET" || m === "POST") && p.startsWith(GIT_HTTP_BROKER_PREFIX),
     auth: { aud: "credential-broker" },
