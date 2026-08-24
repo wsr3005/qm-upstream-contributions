@@ -127,8 +127,11 @@ async function forward(
       },
       ...(body ? { body } : {}),
     });
+    const responseHeaders: Record<string, string> = { "content-type": "application/json" };
+    const retryAfter = r.headers.get("retry-after");
+    if (retryAfter) responseHeaders["retry-after"] = retryAfter;
     if (r.body && acceptsGzip(req)) {
-      res.writeHead(r.status, { "content-type": "application/json", "content-encoding": "gzip" });
+      res.writeHead(r.status, { ...responseHeaders, "content-encoding": "gzip" });
       const src = Readable.fromWeb(r.body as Parameters<typeof Readable.fromWeb>[0]);
       const gz = createGzip();
       src.on("error", () => res.destroy());
@@ -142,7 +145,7 @@ async function forward(
       src.pipe(gz).pipe(res);
       return;
     }
-    res.writeHead(r.status, { "content-type": "application/json" });
+    res.writeHead(r.status, responseHeaders);
     pipeBody(res, r.body);
   } catch (err) {
     console.error("[admin] core request failed:", String(err));

@@ -1,6 +1,7 @@
 import type { ModelProviderAvailability } from "../model/pi-models.ts";
 import type { ModelCredentialStore } from "../model/model-credential-store.ts";
 import type { CustomProviderStore } from "../model/custom-provider-store.ts";
+import type { CustomProviderTestRunStore } from "../model/custom-provider-test-runs.ts";
 import type { McpServerStore } from "../mcp/mcp-server-store.ts";
 import type { McpToolService } from "../mcp/mcp-tool-service.ts";
 import type { ReplayDedupe } from "../auth/replay-dedupe.ts";
@@ -114,6 +115,7 @@ export interface ServerDeps {
   refreshCustomProviders?: () => Promise<void>;
   customProviderHarnessTest?: CustomProviderHarnessTestRunner;
   customProviderHarnessTestFence?: () => Promise<string | null>;
+  customProviderTestRuns?: CustomProviderTestRunStore;
   brandingDefault?: OrgBranding;
   harnessId?: string;
   admin?: AdminService;

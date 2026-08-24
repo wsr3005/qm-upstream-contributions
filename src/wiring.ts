@@ -184,6 +184,11 @@ import {
   CUSTOM_PROVIDER_WIRE_ID_SCHEMA,
   type CustomProviderStore,
 } from "./model/custom-provider-store.ts";
+import {
+  createCustomProviderTestRunStore,
+  type CustomProviderTestRunStore,
+  type StoredCustomProviderTestRun,
+} from "./model/custom-provider-test-runs.ts";
 import { createMemorySessionStore } from "./sessions/memory-session-store.ts";
 import { createPostgresSessionStore } from "./sessions/postgres-session-store.ts";
 import type { SessionStore } from "./sessions/session-store.ts";
@@ -350,6 +355,7 @@ export interface BuiltApp {
   modelGateway: ModelGateway;
   modelCredentials: ModelCredentialStore;
   customProviders: CustomProviderStore;
+  customProviderTestRuns: CustomProviderTestRunStore;
   refreshCustomProviders: () => Promise<void>;
   customProviderHarnessTest: CustomProviderHarnessTestRunner;
   customProviderHarnessTestFence: () => Promise<string | null>;
@@ -457,7 +463,7 @@ export function buildApp(
     ? createPostgresLeaderLease(pgArtifactMap.pool)
     : createNoopLeaderLease();
   const advisoryLock: AdvisoryLock = pgArtifactMap
-    ? createPostgresAdvisoryLock(pgArtifactMap.pool)
+    ? createPostgresAdvisoryLock(pgArtifactMap.advisoryPool)
     : createMemoryAdvisoryLock();
   const configStore = createMemoryConfigStore(config.orgId, {
     connectorClients: artifactMap<StoredConnectorClient>("connector_clients"),
@@ -772,6 +778,11 @@ export function buildApp(
     advisoryLock,
     runtimeSchemaReady: customProviderRuntimeSchemaReady,
     runtimeSchemaWritable: customProviderRuntimeSchemaReady,
+  });
+  const customProviderTestRuns = createCustomProviderTestRunStore({
+    backing: artifactMap<StoredCustomProviderTestRun>("custom_provider_test_runs"),
+    advisoryLock,
+    durable: pgArtifactMap !== null,
   });
   const refreshCustomProviders = async () => {
     const [enabled, knownIds] = await Promise.all([customProviders.enabled(), customProviders.knownModelIds()]);
@@ -1530,6 +1541,9 @@ export function buildApp(
   const deployIdleTtlMs = deployProvider.profile.managedScaleToZero ? undefined : config.deployIdleTtlMs;
   const BLOB_TTL_MS = 6 * 60 * 60_000;
   const blobSweeper = createSweeper(() => blobTransfer.sweep(BLOB_TTL_MS), 30 * 60_000);
+  const customProviderTestRunSweeper = createSweeper(() => customProviderTestRuns.sweep(), 5 * 60_000, {
+    label: "custom-provider-test-runs",
+  });
   const BLOB_TRANSFER_EXPIRY_DAYS = 1;
   void blobTransfer
     .ensureExpiry?.(BLOB_TRANSFER_EXPIRY_DAYS)
@@ -1568,6 +1582,7 @@ export function buildApp(
       monitorPoller?.start(config.monitorPollMs);
       if (config.skillSyncPollMs > 0) skillSyncEngine.start(config.skillSyncPollMs);
       blobSweeper.start();
+      customProviderTestRunSweeper.start();
       idleSweeper?.start();
       deepIdleSweeper?.start();
       reachDeniedNotifier?.start(config.insightsIntervalMs);
@@ -1586,6 +1601,7 @@ export function buildApp(
       deepIdleSweeper?.stop();
       reachDeniedNotifier?.stop();
       blobSweeper.stop();
+      customProviderTestRunSweeper.stop();
       wakeSweep.stop();
       orphanedSignalSweeper.stop();
       await Promise.all(workers.map((w) => w.stop(config.shutdownDrainMs))).catch(
@@ -1624,6 +1640,7 @@ export function buildApp(
     modelGateway,
     modelCredentials,
     customProviders,
+    customProviderTestRuns,
     refreshCustomProviders,
     customProviderHarnessTest,
     customProviderHarnessTestFence,
@@ -1697,6 +1714,7 @@ export function serverDeps(
     providerKeys: providerKeysPresent(config),
     modelCredentials: built.modelCredentials,
     customProviders: built.customProviders,
+    customProviderTestRuns: built.customProviderTestRuns,
     refreshCustomProviders: built.refreshCustomProviders,
     customProviderHarnessTest: built.customProviderHarnessTest,
     customProviderHarnessTestFence: built.customProviderHarnessTestFence,

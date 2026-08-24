@@ -144,6 +144,7 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
     config: built.config,
     modelCredentials: built.modelCredentials,
     customProviders: built.customProviders,
+    customProviderTestRuns: built.customProviderTestRuns,
     refreshCustomProviders: built.refreshCustomProviders,
     customProviderHarnessTest: built.customProviderHarnessTest,
     customProviderHarnessTestFence: built.customProviderHarnessTestFence,
@@ -247,12 +248,12 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
     ]);
     r = await api("/v1/admin/custom-providers/qa/harness-test", {
       method: "POST",
-      body: JSON.stringify({ modelId: "not-registered" }),
+      body: JSON.stringify({ modelId: "not-registered", requestId: "request-not-registered" }),
     });
     assert.equal(r.status, 400);
     r = await api("/v1/admin/custom-providers/qa/harness-test", {
       method: "POST",
-      body: JSON.stringify({ modelId: "qa-chat" }),
+      body: JSON.stringify({ modelId: "qa-chat", requestId: "request-qa-success" }),
     });
     assert.equal(r.status, 200);
     const testResult = (await r.json()) as {
@@ -285,7 +286,7 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
     failCompletions = true;
     r = await api("/v1/admin/custom-providers/qa/harness-test", {
       method: "POST",
-      body: JSON.stringify({ modelId: "qa-chat" }),
+      body: JSON.stringify({ modelId: "qa-chat", requestId: "request-qa-failure" }),
     });
     assert.equal(r.status, 502);
     assert.equal(seen.filter((s) => s.path.endsWith("/chat/completions")).length, callsBeforeFailure + 1);
@@ -299,7 +300,9 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
       testAudits
         .filter((event) => event.status !== "attempted")
         .every((event) =>
-          /^harness=pi upstreamModelId=qa-chat providerRevision=\d+ latencyMs=\d+$/.test(event.detail ?? ""),
+          /^harness=pi upstreamModelId=qa-chat providerRevision=\d+ latencyMs=\d+ requestIdHash=/.test(
+            event.detail ?? "",
+          ),
         ),
     );
     failCompletions = false;
@@ -323,7 +326,7 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
     const callsBeforeBuiltInCollision = seen.filter((s) => s.path.endsWith("/chat/completions")).length;
     r = await api("/v1/admin/custom-providers/collision/harness-test", {
       method: "POST",
-      body: JSON.stringify({ modelId: "collision/gpt-5.6-luna" }),
+      body: JSON.stringify({ modelId: "collision/gpt-5.6-luna", requestId: "request-collision" }),
     });
     assert.equal(r.status, 200);
     const builtInCollisionCalls = seen.filter((s) => s.path.endsWith("/chat/completions"));
@@ -481,6 +484,7 @@ test("QA: OpenAI Responses custom provider serves the Admin self-test path", asy
     config: built.config,
     modelCredentials: built.modelCredentials,
     customProviders: built.customProviders,
+    customProviderTestRuns: built.customProviderTestRuns,
     refreshCustomProviders: built.refreshCustomProviders,
     customProviderHarnessTest: built.customProviderHarnessTest,
     customProviderHarnessTestFence: built.customProviderHarnessTestFence,
@@ -510,7 +514,11 @@ test("QA: OpenAI Responses custom provider serves the Admin self-test path", asy
       result = await fetch(`${base}/v1/admin/custom-providers/responses/harness-test`, {
         method: "POST",
         headers: ADMIN,
-        body: JSON.stringify({ modelId: "responses/gpt-5.6-luna", harness }),
+        body: JSON.stringify({
+          modelId: "responses/gpt-5.6-luna",
+          harness,
+          requestId: `request-responses-${harness}-success`,
+        }),
       });
       const responseText = await result.text();
       assert.equal(result.status, 200, `${harness} self-test succeeds: ${responseText}; calls=${JSON.stringify(seen)}`);
@@ -549,7 +557,11 @@ test("QA: OpenAI Responses custom provider serves the Admin self-test path", asy
       result = await fetch(`${base}/v1/admin/custom-providers/responses/harness-test`, {
         method: "POST",
         headers: ADMIN,
-        body: JSON.stringify({ modelId: "responses/gpt-5.6-luna", harness }),
+        body: JSON.stringify({
+          modelId: "responses/gpt-5.6-luna",
+          harness,
+          requestId: `request-responses-${harness}-failure`,
+        }),
       });
       assert.equal(result.status, 502, `${harness} reports the failed single-attempt test`);
       assert.equal(
@@ -615,6 +627,7 @@ test("QA: every harness rejects redirects, sends one tool-free request, and pres
     config: built.config,
     modelCredentials: built.modelCredentials,
     customProviders: built.customProviders,
+    customProviderTestRuns: built.customProviderTestRuns,
     refreshCustomProviders: built.refreshCustomProviders,
     customProviderHarnessTest: built.customProviderHarnessTest,
     customProviderHarnessTestFence: built.customProviderHarnessTestFence,
@@ -643,7 +656,11 @@ test("QA: every harness rejects redirects, sends one tool-free request, and pres
       result = await fetch(`${base}/v1/admin/custom-providers/redirect/harness-test`, {
         method: "POST",
         headers: ADMIN,
-        body: JSON.stringify({ modelId: "redirect/gpt-5.6-luna", harness }),
+        body: JSON.stringify({
+          modelId: "redirect/gpt-5.6-luna",
+          harness,
+          requestId: `request-redirect-${harness}`,
+        }),
       });
       const responseText = await result.text();
       assert.equal(result.status, 502, `${harness} rejects the redirect: ${responseText}`);
@@ -724,6 +741,7 @@ test("QA: every harness keeps the captured provider snapshot during an in-flight
     config: built.config,
     modelCredentials: built.modelCredentials,
     customProviders: built.customProviders,
+    customProviderTestRuns: built.customProviderTestRuns,
     refreshCustomProviders: built.refreshCustomProviders,
     customProviderHarnessTest: built.customProviderHarnessTest,
     customProviderHarnessTestFence: built.customProviderHarnessTestFence,
@@ -754,7 +772,7 @@ test("QA: every harness keeps the captured provider snapshot during an in-flight
       const pending = fetch(`${base}/v1/admin/custom-providers/snapshot/harness-test`, {
         method: "POST",
         headers: ADMIN,
-        body: JSON.stringify({ modelId: "snapshot-model", harness }),
+        body: JSON.stringify({ modelId: "snapshot-model", harness, requestId: `request-snapshot-${harness}` }),
       });
       try {
         await gate.seen;
@@ -834,6 +852,7 @@ test("QA: anthropic-protocol custom provider serves a real turn (correct wire sh
     config: built.config,
     modelCredentials: built.modelCredentials,
     customProviders: built.customProviders,
+    customProviderTestRuns: built.customProviderTestRuns,
     refreshCustomProviders: built.refreshCustomProviders,
     customProviderHarnessTest: built.customProviderHarnessTest,
     customProviderHarnessTestFence: built.customProviderHarnessTestFence,
@@ -862,7 +881,7 @@ test("QA: anthropic-protocol custom provider serves a real turn (correct wire sh
     r = await fetch(`${base}/v1/admin/custom-providers/antcompat/harness-test`, {
       method: "POST",
       headers: ADMIN,
-      body: JSON.stringify({ modelId: "claude-compat" }),
+      body: JSON.stringify({ modelId: "claude-compat", requestId: "request-anthropic" }),
     });
     assert.equal(r.status, 200);
     assert.equal(((await r.json()) as { reply: string }).reply, "ANTHROPIC QA REPLY");

@@ -41,6 +41,7 @@ test("serverDeps wires the custom-provider store and resolves a custom boot defa
   const built = buildApp(config, { modelCredentialFetch: async () => new Response(null, { status: 200 }) });
   const deps = serverDeps(config, built);
   assert.equal(deps.customProviders, built.customProviders);
+  assert.equal(deps.customProviderTestRuns, built.customProviderTestRuns);
   assert.equal(deps.refreshCustomProviders, built.refreshCustomProviders);
   assert.equal(deps.customProviderHarnessTestFence, built.customProviderHarnessTestFence);
   assert.equal(deps.baseModelDefault, "acme-large");

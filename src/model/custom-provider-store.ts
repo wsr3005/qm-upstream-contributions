@@ -15,7 +15,7 @@ import { validateCustomProviderSpec, type CustomProviderSpec } from "./custom-pr
 
 export const CUSTOM_PROVIDER_WIRE_ID_SCHEMA = 1;
 export const CUSTOM_PROVIDER_WIRE_ID_CAPABILITY = "custom-provider-wire-id-v1";
-export const CUSTOM_PROVIDER_HARNESS_TEST_CAPABILITY = "custom-provider-harness-test-v1";
+export const CUSTOM_PROVIDER_HARNESS_TEST_CAPABILITY = "custom-provider-harness-test-v2";
 
 export class CustomProviderRuntimeNotReadyError extends Error {}
 

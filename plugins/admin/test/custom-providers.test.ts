@@ -15,6 +15,11 @@ const core = createServer((req: IncomingMessage, res) => {
       signed: Boolean(req.headers["x-timestamp"] && req.headers["x-signature"]),
       body,
     });
+    if ((JSON.parse(body || "{}") as { requestId?: string }).requestId === "request-busy") {
+      res.writeHead(409, { "content-type": "application/json", "retry-after": "12" });
+      res.end(JSON.stringify({ error: "harness_test_in_progress", retryAfterMs: 12_000 }));
+      return;
+    }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, modelId: "gpt-5.6-luna", reply: "ready", latencyMs: 1 }));
   });
@@ -39,7 +44,7 @@ test("POST /api/custom-providers/:id/harness-test forwards the paid model test w
   const response = await fetch(`${base}/api/custom-providers/gateway/harness-test`, {
     method: "POST",
     headers: { cookie: "admin=U-admin", "content-type": "application/json" },
-    body: JSON.stringify({ modelId: "gpt-5.6-luna", harness: "codex" }),
+    body: JSON.stringify({ modelId: "gpt-5.6-luna", harness: "codex", requestId: "request-paid" }),
   });
   assert.equal(response.status, 200);
   const call = calls.at(-1)!;
@@ -47,7 +52,21 @@ test("POST /api/custom-providers/:id/harness-test forwards the paid model test w
   assert.equal(call.url, "/v1/admin/custom-providers/gateway/harness-test");
   assert.equal(call.actor, "U-admin@acme");
   assert.equal(call.signed, true);
-  assert.deepEqual(JSON.parse(call.body), { modelId: "gpt-5.6-luna", harness: "codex" });
+  assert.deepEqual(JSON.parse(call.body), {
+    modelId: "gpt-5.6-luna",
+    harness: "codex",
+    requestId: "request-paid",
+  });
+});
+
+test("the paid model test forwards the core retry window", async () => {
+  const response = await fetch(`${base}/api/custom-providers/gateway/harness-test`, {
+    method: "POST",
+    headers: { cookie: "admin=U-admin", "content-type": "application/json" },
+    body: JSON.stringify({ modelId: "gpt-5.6-luna", harness: "pi", requestId: "request-busy" }),
+  });
+  assert.equal(response.status, 409);
+  assert.equal(response.headers.get("retry-after"), "12");
 });
 
 test("the paid model test rejects signed-out callers before reaching core", async () => {
