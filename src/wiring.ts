@@ -595,6 +595,8 @@ export function buildApp(
   const buildLocal = (): Sandbox =>
     createLocalSandbox(workspace, {
       ...config.localSandbox,
+      orgId: config.orgId,
+      environment: config.production ? "production" : "dev",
       onError: sandboxOnError,
     });
   const buildSprites = (): Sandbox =>
