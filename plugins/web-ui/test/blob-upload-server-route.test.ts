@@ -15,6 +15,7 @@ type TurnBody = {
   text?: string;
   harness?: string;
   model?: string;
+  idempotencyKey?: string;
 };
 let lastTurnBody: TurnBody | null = null;
 const setTurnBody = (b: TurnBody | null): void => {
@@ -55,7 +56,7 @@ const coreUrl = `http://localhost:${(core.address() as AddressInfo).port}`;
 const SECRET = "blob-route-test-secret";
 process.env.CORE_API_URL = coreUrl;
 process.env.CORE_SIGNING_SECRET = SECRET;
-process.env.WEB_UI_PRINCIPALS = "alice";
+process.env.WEB_UI_PRINCIPALS = "alice,bob";
 
 const { handler } = await import("../server/index.ts");
 
@@ -137,6 +138,7 @@ test("POST /api/turn forwards blobId attachments to core as references (no inlin
       threadRef: "web:alice:t1",
       harness: "codex",
       model: "gpt-5.6-sol",
+      idempotencyKey: "qa-codex-attachment-1",
       attachments: [
         { name: "big.bin", mimetype: "application/octet-stream", sizeBytes: 5242880, blobId: "blob-abc123" },
       ],
@@ -152,6 +154,46 @@ test("POST /api/turn forwards blobId attachments to core as references (no inlin
   assert.equal((atts[0] as Record<string, unknown>).contentBase64, undefined, "no inline bytes ride the turn body");
   assert.equal(lastTurnBody!.harness, "codex", "the selected harness reaches core");
   assert.equal(lastTurnBody!.model, "gpt-5.6-sol", "the selected model reaches core");
+  assert.match(
+    lastTurnBody!.idempotencyKey ?? "",
+    /^web-qa:alice:qa-codex-attachment-1:[a-f0-9]{64}$/u,
+    "the paid QA correlation reaches core in a user and request-bound namespace",
+  );
+});
+
+test("the same external key cannot collide across users or different turn bodies", async () => {
+  const coreKeys = [];
+  for (const [user, text] of [
+    ["alice", "first body"],
+    ["alice", "different body"],
+    ["bob", "first body"],
+  ]) {
+    const identity = {
+      cookie: `webuiuser=${user}`,
+      [PORTAL_IDENTITY_HEADER]: mintPortalIdentity({ p: user, exp: Date.now() + 60_000 }, SECRET),
+    };
+    const r = await fetch(`${base}/api/turn`, {
+      method: "POST",
+      headers: { ...identity, "content-type": "application/json" },
+      body: JSON.stringify({ text, threadRef: `web:${user}:qa`, idempotencyKey: "qa-shared-1" }),
+    });
+    assert.equal(r.status, 200);
+    coreKeys.push(lastTurnBody!.idempotencyKey);
+  }
+  assert.equal(new Set(coreKeys).size, 3);
+  assert.match(coreKeys[0] ?? "", /^web-qa:alice:/u);
+  assert.match(coreKeys[2] ?? "", /^web-qa:bob:/u);
+});
+
+test("POST /api/turn rejects an invalid idempotency key before reaching core", async () => {
+  setTurnBody(null);
+  const r = await fetch(`${base}/api/turn`, {
+    method: "POST",
+    headers: { ...IDENTITY, "content-type": "application/json" },
+    body: JSON.stringify({ text: "msg", threadRef: "web:alice:t-invalid", idempotencyKey: "contains spaces" }),
+  });
+  assert.equal(r.status, 400);
+  assert.equal(lastTurnBody, null);
 });
 
 test("POST /api/turn drops an attachment with no blobId rather than forwarding junk", async () => {
