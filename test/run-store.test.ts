@@ -38,6 +38,30 @@ for (const backend of backends) {
     assert.notEqual(c.run.id, a.run.id);
   });
 
+  test(`[${backend.name}] enqueue recognizes legacy project dedup keys`, async () => {
+    const { runs } = backend.make();
+    const request = turn("paid project turn");
+    const legacy = await runs.enqueue({ sessionId: "s1", request, dedupKey: "paid-key:project-100" });
+    const replay = await runs.enqueue({
+      sessionId: "s1",
+      request,
+      dedupKey: "paid-key",
+      legacyDedupKeyPrefix: "paid-key:project-",
+    });
+    assert.equal(replay.run.id, legacy.run.id);
+    assert.equal(replay.deduped, true);
+    assert.equal(replay.conflict, false);
+    const changed = await runs.enqueue({
+      sessionId: "s1",
+      request: turn("paid project turn after roster change"),
+      dedupKey: "paid-key",
+      legacyDedupKeyPrefix: "paid-key:project-",
+    });
+    assert.equal(changed.run.id, legacy.run.id);
+    assert.equal(changed.conflict, true);
+    assert.equal((await runs.list()).length, 1);
+  });
+
   test(`[${backend.name}] activeForThread returns the in-flight run, null once terminal`, async () => {
     const { runs } = backend.make();
     assert.equal(await runs.activeForThread("sX"), null, "nothing running");

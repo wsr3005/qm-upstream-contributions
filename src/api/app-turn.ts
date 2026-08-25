@@ -433,6 +433,7 @@ export function createTurnMethods(
           request,
           maxAttempts: deps.maxAttempts,
           ...(dedupKey ? { dedupKey } : {}),
+          ...(dedupKey && projectId ? { legacyDedupKeyPrefix: `${dedupKey}:project-` } : {}),
         });
       const enqueued = await withCurrentProjectRoster(enqueue);
       if (!enqueued) return { status: "refused", reason: "project membership changed; retry from the current project" };

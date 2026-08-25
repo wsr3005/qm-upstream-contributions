@@ -901,6 +901,30 @@ test("pg run store: enqueue dedup, atomic one-per-session claim, fencing, ledger
     assert.equal(conflict.conflict, true);
     assert.equal(b.run.id, a.run.id);
 
+    const legacyRequest = turn("legacy paid project turn");
+    const legacy = await runs.enqueue({
+      sessionId: "sLegacy",
+      request: legacyRequest,
+      dedupKey: "legacy-paid-key:project-100",
+    });
+    const legacyReplay = await runs.enqueue({
+      sessionId: "sLegacy",
+      request: legacyRequest,
+      dedupKey: "legacy-paid-key",
+      legacyDedupKeyPrefix: "legacy-paid-key:project-",
+    });
+    assert.equal(legacyReplay.run.id, legacy.run.id);
+    assert.equal(legacyReplay.deduped, true);
+    assert.equal(legacyReplay.conflict, false);
+    const legacyConflict = await runs.enqueue({
+      sessionId: "sLegacy",
+      request: turn("legacy paid project turn after roster change"),
+      dedupKey: "legacy-paid-key",
+      legacyDedupKeyPrefix: "legacy-paid-key:project-",
+    });
+    assert.equal(legacyConflict.run.id, legacy.run.id);
+    assert.equal(legacyConflict.conflict, true);
+
     const N = 8;
     const raced = await Promise.all(
       Array.from({ length: N }, () => runs.enqueue({ sessionId: "s2", request: turn("same"), dedupKey: "kc" })),

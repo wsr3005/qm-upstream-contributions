@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { createPgPool } from "../persistence/pg-pool.ts";
+import { createPgPool, withPgTransaction } from "../persistence/pg-pool.ts";
 import type { TurnResult } from "../types.ts";
 import type { OrchestratorInput } from "../core/orchestrator.ts";
 import { resolveTurnOrigin } from "../core/turn-origin.ts";
@@ -46,7 +46,7 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
   const events = new EventEmitter();
   events.setMaxListeners(0);
 
-  const { query: q, close: closePool } = createPgPool(connectionString, [
+  const pg = createPgPool(connectionString, [
     `CREATE TABLE IF NOT EXISTS runs(
         id TEXT PRIMARY KEY, session_id TEXT NOT NULL, status TEXT NOT NULL,
         request TEXT NOT NULL, result TEXT, idempotency_key TEXT UNIQUE,
@@ -106,6 +106,7 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
         END IF;
       END $$`,
   ]);
+  const { query: q, close: closePool } = pg;
 
   async function getRun(id: string): Promise<Run | null> {
     const { rows } = await q("SELECT * FROM runs WHERE id = $1", [id]);
@@ -154,23 +155,58 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
   const runs: RunStore = {
     ...(Number.isFinite(maxClaims) ? { maxClaims } : {}),
 
-    async enqueue({ sessionId, request, dedupKey, maxAttempts = 3 }: EnqueueInput): Promise<EnqueueResult> {
-      const id = randomUUID();
-      const { rows: inserted } = await q(
-        `INSERT INTO runs(id, session_id, status, request, idempotency_key, attempts, max_attempts, created_at)
-         VALUES ($1,$2,'pending',$3,$4,0,$5,$6)
-         ON CONFLICT (idempotency_key) DO NOTHING RETURNING *`,
-        [id, sessionId, JSON.stringify(request), dedupKey ?? null, maxAttempts, Date.now()],
-      );
-      if (inserted[0]) return { run: rowToRun(inserted[0]), deduped: false, conflict: false };
-      const { rows } = await q("SELECT * FROM runs WHERE idempotency_key = $1", [dedupKey]);
-      const row = rows[0]!;
-      return {
-        run: rowToRun(row),
-        deduped: true,
-        conflict:
-          row.session_id !== sessionId || JSON.stringify(JSON.parse(row.request as string)) !== JSON.stringify(request),
-      };
+    async enqueue({
+      sessionId,
+      request,
+      dedupKey,
+      legacyDedupKeyPrefix,
+      maxAttempts = 3,
+    }: EnqueueInput): Promise<EnqueueResult> {
+      if (!dedupKey || !legacyDedupKeyPrefix) {
+        const id = randomUUID();
+        const { rows: inserted } = await q(
+          `INSERT INTO runs(id, session_id, status, request, idempotency_key, attempts, max_attempts, created_at)
+           VALUES ($1,$2,'pending',$3,$4,0,$5,$6)
+           ON CONFLICT (idempotency_key) DO NOTHING RETURNING *`,
+          [id, sessionId, JSON.stringify(request), dedupKey ?? null, maxAttempts, Date.now()],
+        );
+        if (inserted[0]) return { run: rowToRun(inserted[0]), deduped: false, conflict: false };
+        const { rows } = await q("SELECT * FROM runs WHERE idempotency_key = $1", [dedupKey]);
+        const row = rows[0]!;
+        return {
+          run: rowToRun(row),
+          deduped: true,
+          conflict:
+            row.session_id !== sessionId ||
+            JSON.stringify(JSON.parse(row.request as string)) !== JSON.stringify(request),
+        };
+      }
+      return withPgTransaction(await pg.pool(), async (client) => {
+        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [dedupKey]);
+        const existing = await client.query(
+          `SELECT * FROM runs
+           WHERE idempotency_key = $1 OR starts_with(idempotency_key, $2)
+           ORDER BY CASE WHEN idempotency_key = $1 THEN 0 ELSE 1 END, created_at, seq
+           LIMIT 1`,
+          [dedupKey, legacyDedupKeyPrefix],
+        );
+        const row = existing.rows[0] as Record<string, unknown> | undefined;
+        if (row) {
+          return {
+            run: rowToRun(row),
+            deduped: true,
+            conflict:
+              row.session_id !== sessionId ||
+              JSON.stringify(JSON.parse(row.request as string)) !== JSON.stringify(request),
+          };
+        }
+        const inserted = await client.query(
+          `INSERT INTO runs(id, session_id, status, request, idempotency_key, attempts, max_attempts, created_at)
+           VALUES ($1,$2,'pending',$3,$4,0,$5,$6) RETURNING *`,
+          [randomUUID(), sessionId, JSON.stringify(request), dedupKey, maxAttempts, Date.now()],
+        );
+        return { run: rowToRun(inserted.rows[0] as Record<string, unknown>), deduped: false, conflict: false };
+      });
     },
 
     async claim(workerId, ttlMs): Promise<Run | null> {

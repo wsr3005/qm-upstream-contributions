@@ -39,6 +39,7 @@ export interface EnqueueInput {
   sessionId: string;
   request: OrchestratorInput;
   dedupKey?: string;
+  legacyDedupKeyPrefix?: string;
   maxAttempts?: number;
 }
 
