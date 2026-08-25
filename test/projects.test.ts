@@ -703,6 +703,37 @@ test("a member added mid-turn sees the thread but never the prior roster's outpu
   }
 });
 
+test("Project idempotency keys conflict after roster changes", async () => {
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "project-idempotency-roster-")) }));
+  await built.app.upsertDirectory([
+    { principalId: "owner", displayName: "Owner", type: "internal" },
+    { principalId: "late-member", displayName: "Late Member", type: "internal" },
+  ]);
+  const project = await built.app.createProject("owner", "Idempotency roster");
+  assert.ok(project);
+  const request = {
+    surface: "web" as const,
+    actor: { externalId: "owner" },
+    conversation: {
+      kind: "group" as const,
+      channelRef: projectGroupRef(project.id),
+      threadRef: "web:owner:project-idempotency-roster",
+      audience: [],
+    },
+    text: "run once for this roster",
+    async: true,
+    idempotencyKey: "project-roster-version-1",
+  };
+
+  const first = await built.app.turn(request);
+  assert.equal(first.status, "queued");
+  assert.equal((await built.app.addProjectMember(project.id, "owner", "late-member")).status, "ok");
+  const replay = await built.app.turn(request);
+  assert.equal(replay.status, "refused");
+  assert.match(replay.reason ?? "", /idempotency key conflicts/);
+  assert.equal((await built.runs.list()).length, 1);
+});
+
 test("Project turns rebuild the full thread for a member who joined later", async () => {
   const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "project-tape-tenure-")) }));
   await built.app.upsertDirectory([

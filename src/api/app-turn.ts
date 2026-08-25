@@ -295,11 +295,7 @@ export function createTurnMethods(
         if (!matches(req.approval?.requestId)) return blocked;
       }
 
-      let dedupKey: string | undefined;
-      if (req.idempotencyKey) {
-        dedupKey =
-          projectVersion === undefined ? req.idempotencyKey : `${req.idempotencyKey}:project-${projectVersion}`;
-      }
+      const dedupKey = req.idempotencyKey;
 
       if (origin.kind === "human" && !req.approval) deps.reaperPoke?.();
 
