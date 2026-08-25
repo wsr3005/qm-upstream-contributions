@@ -426,6 +426,7 @@ export interface TurnRequest {
   model?: string;
   modelProviderId?: string;
   modelProviderRevision?: number;
+  modelProviderResolvedAtIntake?: true;
   harness?: string;
   thinkingLevel?: string;
   fastMode?: boolean;

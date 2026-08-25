@@ -468,6 +468,9 @@ test("non-Web custom model turns persist Provider bindings before enqueue", asyn
   const run = await built.runs.get(queued.runId);
   assert.equal(run?.request.modelProviderId, "dingtalk-gateway");
   assert.equal(run?.request.modelProviderRevision, revision);
+  assert.equal(run?.request.modelProviderResolvedAtIntake, true);
+  assert.equal(run?.request.harness, "mock");
+  assert.equal(run?.request.model, "dingtalk-model");
 });
 
 test("non-Web orphaned steers cannot switch custom Providers during replay", async () => {

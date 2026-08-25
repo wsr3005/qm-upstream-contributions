@@ -137,6 +137,7 @@ export function createTurnMethods(
       }
 
       let modelProviderBinding: { providerId: string; revision: number } | undefined;
+      let resolvedNonWebRuntime: { harnessId: string; modelId: string } | undefined;
       if (req.surface === "web") {
         const threadRef = req.conversation.threadRef;
         const existing = await deps.sessions.getByThread(threadRef);
@@ -261,6 +262,7 @@ export function createTurnMethods(
         } catch (error) {
           return { status: "refused", reason: errMessage(error) };
         }
+        resolvedNonWebRuntime = runtime;
         const providerId = resolveModel(runtime.modelId)?.provider;
         const active = providerId && deps.customProviders ? await deps.customProviders.resolveActive(String(providerId)) : null;
         if (active) {
@@ -330,8 +332,13 @@ export function createTurnMethods(
         ...(req.detectOpener ? { detectOpener: req.detectOpener } : {}),
         ...(req.attachments?.length ? { attachments: req.attachments } : {}),
         ...(req.inboundNotes?.length ? { inboundNotes: req.inboundNotes } : {}),
-        ...(req.harness ? { harness: req.harness } : {}),
-        ...(req.model ? { model: req.model } : {}),
+        ...(resolvedNonWebRuntime
+          ? { harness: resolvedNonWebRuntime.harnessId, model: resolvedNonWebRuntime.modelId }
+          : {
+              ...(req.harness ? { harness: req.harness } : {}),
+              ...(req.model ? { model: req.model } : {}),
+            }),
+        modelProviderResolvedAtIntake: true as const,
         ...(modelProviderBinding
           ? {
               modelProviderId: modelProviderBinding.providerId,
@@ -358,10 +365,20 @@ export function createTurnMethods(
       const replayRequest: TurnRequest = modelProviderBinding
         ? {
             ...req,
+            ...(resolvedNonWebRuntime
+              ? { harness: resolvedNonWebRuntime.harnessId, model: resolvedNonWebRuntime.modelId }
+              : {}),
             modelProviderId: modelProviderBinding.providerId,
             modelProviderRevision: modelProviderBinding.revision,
+            modelProviderResolvedAtIntake: true,
           }
-        : req;
+        : {
+            ...req,
+            ...(resolvedNonWebRuntime
+              ? { harness: resolvedNonWebRuntime.harnessId, model: resolvedNonWebRuntime.modelId }
+              : {}),
+            modelProviderResolvedAtIntake: true,
+          };
 
       if (projectGroup && req.approval) {
         const [approval, approvalSession] = await Promise.all([

@@ -1040,3 +1040,31 @@ test("a second ambient wake while the first worker is LIVE steers into it instea
     "no sibling worker run was enqueued",
   );
 });
+
+test("an automatic ambient wake does not create a replayable signal for a historical unbound run", async () => {
+  const built = freshApp();
+  const container = "C-historical-unbound";
+  await built.app.setChannelPolicy(container, "!engage !post tag the team", "U-admin");
+  await built.app.ingestSurfaceEvents([
+    { container, ts: "200.1", authorId: "U1", text: "events site is down", createdAt: 1 },
+  ]);
+  await built.app.judgeAmbientContainer("slack", container);
+  const firstRef = `slack:${container}:ambient:200.1`;
+  const live = await built.runs.activeForThread(firstRef);
+  assert.ok(live);
+  delete live!.request.modelProviderResolvedAtIntake;
+  delete live!.request.modelProviderId;
+  delete live!.request.modelProviderRevision;
+  await built.app.ingestSurfaceEvents([
+    { container, ts: "200.2", authorId: "U2", text: "same here, meetup page too", createdAt: 2 },
+  ]);
+  await built.app.judgeAmbientContainer("slack", container);
+  assert.deepEqual(await built.signals.takePending(live!.id), []);
+  const runs = await built.runs.list();
+  const ambientRuns = runs.filter((run) => run.sessionId.startsWith(`slack:${container}:ambient:`));
+  assert.equal(ambientRuns.length, 2);
+  const fresh = ambientRuns.find((run) => run.id !== live!.id);
+  assert.equal(fresh?.request.modelProviderResolvedAtIntake, true);
+  assert.ok(fresh?.request.harness);
+  assert.ok(fresh?.request.model);
+});

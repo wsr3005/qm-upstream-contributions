@@ -318,15 +318,25 @@ export function createAmbientHelpers(deps: AppDeps, app: App) {
       })
       .catch(() => "block" as const);
     if (decision === "block") return false;
+    if (
+      live.request.modelProviderResolvedAtIntake !== true ||
+      !live.request.harness ||
+      !live.request.model
+    )
+      return true;
     const steerText = decision === "unscreened" ? `${unscreenedNotice("mid-turn message")}\n${req.text}` : req.text;
-    const replayRequest =
-      live.request.modelProviderId && live.request.modelProviderRevision
+    const replayRequest = {
+      ...req,
+      harness: live.request.harness,
+      model: live.request.model,
+      modelProviderResolvedAtIntake: true as const,
+      ...(live.request.modelProviderId && live.request.modelProviderRevision
         ? {
-            ...req,
             modelProviderId: live.request.modelProviderId,
             modelProviderRevision: live.request.modelProviderRevision,
           }
-        : req;
+        : {}),
+    };
     await deps.signals.send(live.id, { kind: "steer", text: steerText, ts: latestTs, request: replayRequest });
     const after = await deps.runs.get(live.id);
     if (!after || isTerminal(after.status)) await app.replayOrphanedRunSignals(live.id);
