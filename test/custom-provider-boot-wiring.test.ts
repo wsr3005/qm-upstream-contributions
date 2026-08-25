@@ -469,3 +469,61 @@ test("non-Web custom model turns persist Provider bindings before enqueue", asyn
   assert.equal(run?.request.modelProviderId, "dingtalk-gateway");
   assert.equal(run?.request.modelProviderRevision, revision);
 });
+
+test("non-Web orphaned steers cannot switch custom Providers during replay", async () => {
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "custom-provider-steer-bound-")) }));
+  await built.customProviders.upsert(
+    {
+      id: "provider-a",
+      name: "Provider A",
+      protocol: "openai",
+      baseUrl: "https://provider-a.example.com/v1",
+      models: [{ id: "shared-model" }],
+    },
+    "sk-provider-a",
+    "admin-alice@default-org",
+  );
+  const first = await built.app.turn({
+    surface: "dingtalk",
+    actor: { externalId: "alice" },
+    conversation: { kind: "dm", threadRef: "dingtalk:alice:provider-steer" },
+    text: "first",
+    model: "shared-model",
+    liveActor: true,
+    async: true,
+  });
+  assert.equal(first.status, "queued");
+  if (first.status !== "queued" || !first.runId) return;
+  const second = await built.app.turn({
+    surface: "dingtalk",
+    actor: { externalId: "alice" },
+    conversation: { kind: "dm", threadRef: "dingtalk:alice:provider-steer" },
+    text: "second",
+    model: "shared-model",
+    liveActor: true,
+    async: true,
+  });
+  assert.equal(second.status, "queued");
+  assert.equal(second.steered, true);
+  const [signal] = await built.signals.takePending(first.runId);
+  assert.equal(signal?.request?.modelProviderId, "provider-a");
+  assert.equal(signal?.request?.modelProviderRevision, 1);
+  await built.signals.send(first.runId, signal!);
+  await built.customProviders.delete("provider-a", "admin-alice@default-org");
+  await built.customProviders.upsert(
+    {
+      id: "provider-b",
+      name: "Provider B",
+      protocol: "openai",
+      baseUrl: "https://provider-b.example.com/v1",
+      models: [{ id: "shared-model" }],
+    },
+    "sk-provider-b",
+    "admin-alice@default-org",
+  );
+  assert.equal(await built.runs.withdraw(first.runId), true);
+  await built.app.replayOrphanedRunSignals(first.runId);
+  const runs = await built.runs.list();
+  assert.equal(runs.length, 0);
+  assert.equal(await built.runs.activeForThread("dingtalk:alice:provider-steer"), null);
+});

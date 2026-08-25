@@ -355,6 +355,13 @@ export function createTurnMethods(
         ...(sessionParticipantIds ? { sessionParticipantIds } : {}),
         ...(projectVersion ? { scopeVersion: projectVersion } : {}),
       };
+      const replayRequest: TurnRequest = modelProviderBinding
+        ? {
+            ...req,
+            modelProviderId: modelProviderBinding.providerId,
+            modelProviderRevision: modelProviderBinding.revision,
+          }
+        : req;
 
       if (projectGroup && req.approval) {
         const [approval, approvalSession] = await Promise.all([
@@ -439,7 +446,7 @@ export function createTurnMethods(
                   kind: route.signal,
                   ...(route.text ? { text: route.text } : {}),
                   ...(steerTs ? { ts: steerTs } : {}),
-                  ...(route.signal === "steer" ? { request: req } : {}),
+                  ...(route.signal === "steer" ? { request: replayRequest } : {}),
                 });
               return live.id;
             });
@@ -485,7 +492,7 @@ export function createTurnMethods(
                   kind: "steer",
                   text: req.text,
                   ts: origin.messageTs,
-                  request: req,
+                  request: replayRequest,
                 });
               return liveAmbient.id;
             });
