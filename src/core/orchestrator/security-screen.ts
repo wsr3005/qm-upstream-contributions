@@ -31,7 +31,7 @@ export type SecurityClassifier = (
     model?: string;
     modelProviderId?: string;
     modelProviderRevision?: number;
-    providerFenceAlreadyHeld?: boolean;
+    providerFenceToken?: object;
   },
 ) => Promise<SecurityScreenVerdict | undefined>;
 
@@ -55,7 +55,7 @@ export function createSecurityClassifier(deps: OrchestratorDeps): SecurityClassi
           ...(context.modelProviderRevision !== undefined
             ? { modelProviderRevision: context.modelProviderRevision }
             : {}),
-          ...(context.providerFenceAlreadyHeld ? { providerFenceAlreadyHeld: true } : {}),
+          ...(context.providerFenceToken ? { providerFenceToken: context.providerFenceToken } : {}),
           recordModelCall: (rec) => {
             deps.modelGateway.recordCall({ at: Date.now(), scopeLabel, ...rec });
             void deps.budget?.record(actorId, estimateCostUsd(rec.inputTokens));

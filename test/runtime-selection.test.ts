@@ -275,6 +275,15 @@ test("tool-result screening reuses its turn Provider fence without re-entering t
   let guardActive = false;
   let guardCalls = 0;
   let screenCalls = 0;
+  let capturedRuntime:
+    | {
+        harness: string;
+        model: string;
+        modelProviderId?: string;
+        modelProviderRevision?: number;
+        providerFenceToken: object;
+      }
+    | undefined;
   const adapter = {
     models: {
       async screenSecurity() {
@@ -314,7 +323,7 @@ test("tool-result screening reuses its turn Provider fence without re-entering t
     model: string;
     modelProviderId?: string;
     modelProviderRevision?: number;
-    providerFenceAlreadyHeld: true;
+    providerFenceToken: object;
   }) =>
     router.models.screenSecurity!({
       payload: "safe",
@@ -330,7 +339,10 @@ test("tool-result screening reuses its turn Provider fence without re-entering t
     orgScopeId: ORG,
     modelProviderId: "gateway",
     modelProviderRevision: 7,
-    screenToolResult: async (_tool, _result, _unscreenable, runtime) => (await classify(runtime))?.decision === "auto",
+    screenToolResult: async (_tool, _result, _unscreenable, runtime) => {
+      capturedRuntime = runtime;
+      return (await classify(runtime))?.decision === "auto";
+    },
     screenExternalContent: async (_external, runtime) => classify(runtime),
   } as HarnessTurnInput);
 
@@ -338,6 +350,9 @@ test("tool-result screening reuses its turn Provider fence without re-entering t
   assert.equal(screenCalls, 2);
   assert.equal(guardCalls, 1);
   assert.equal(guardActive, false);
+  assert.deepEqual(await classify(capturedRuntime), { decision: "auto" });
+  assert.equal(screenCalls, 3);
+  assert.equal(guardCalls, 2);
 });
 
 test("an aborted title releases the shared execution guard for the next turn", async () => {

@@ -120,6 +120,7 @@ export function createHarnessRouter(
   runWithChoice?: RuntimeExecution,
 ): Harness {
   const lastHarness = new Map<string, HarnessId>();
+  const activeProviderFences = new WeakSet<object>();
   return {
     profile: utility.profile,
     models: {
@@ -130,7 +131,7 @@ export function createHarnessRouter(
         if (!adapter) throw new Error(`harness ${choice.harnessId} is unavailable`);
         const execute = async () =>
           adapter.models.screenSecurity?.({ ...input, harness: choice.harnessId, model: choice.modelId });
-        return runWithChoice && !input.providerFenceAlreadyHeld
+        return runWithChoice && (!input.providerFenceToken || !activeProviderFences.has(input.providerFenceToken))
           ? runWithChoice({ ...input, runtimeOperation: "security-screen" }, choice, execute)
           : execute();
       },
@@ -163,24 +164,29 @@ export function createHarnessRouter(
             ...(input.modelProviderRevision !== undefined
               ? { modelProviderRevision: input.modelProviderRevision }
               : {}),
-            providerFenceAlreadyHeld: true as const,
+            providerFenceToken: {},
           };
-          return adapter.turns.runTurn({
-            ...input,
-            harness: choice.harnessId,
-            model: choice.modelId,
-            ...(input.screenToolResult
-              ? {
-                  screenToolResult: (tool, result, unscreenable) =>
-                    input.screenToolResult!(tool, result, unscreenable, runtime),
-                }
-              : {}),
-            ...(input.screenExternalContent
-              ? {
-                  screenExternalContent: (external) => input.screenExternalContent!(external, runtime),
-                }
-              : {}),
-          });
+          activeProviderFences.add(runtime.providerFenceToken);
+          try {
+            return await adapter.turns.runTurn({
+              ...input,
+              harness: choice.harnessId,
+              model: choice.modelId,
+              ...(input.screenToolResult
+                ? {
+                    screenToolResult: (tool, result, unscreenable) =>
+                      input.screenToolResult!(tool, result, unscreenable, runtime),
+                  }
+                : {}),
+              ...(input.screenExternalContent
+                ? {
+                    screenExternalContent: (external) => input.screenExternalContent!(external, runtime),
+                  }
+                : {}),
+            });
+          } finally {
+            activeProviderFences.delete(runtime.providerFenceToken);
+          }
         };
         return runWithChoice ? runWithChoice({ ...input, runtimeOperation: "turn" }, choice, execute) : execute();
       },

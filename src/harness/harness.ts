@@ -49,7 +49,7 @@ export interface HarnessSecurityScreenInput {
   model?: string;
   modelProviderId?: string;
   modelProviderRevision?: number;
-  providerFenceAlreadyHeld?: boolean;
+  providerFenceToken?: object;
   recordModelCall(rec: { model: string; inputTokens: number; entryCount: number }): void;
   recordLlmRequest?(rec: HarnessLlmRequestRecord): void | Promise<void>;
 }
@@ -129,7 +129,7 @@ export interface HarnessRuntimeContext {
   model: string;
   modelProviderId?: string;
   modelProviderRevision?: number;
-  providerFenceAlreadyHeld: true;
+  providerFenceToken: object;
 }
 
 export interface HarnessTurnResult {
