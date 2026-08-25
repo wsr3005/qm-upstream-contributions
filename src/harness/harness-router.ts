@@ -1,13 +1,24 @@
 import type { ScopedConfigStore } from "../resolution/config-store.ts";
 import { defaultModelForHarness, isHarnessId, modelSupportedByHarness, type HarnessId } from "../model/pi-models.ts";
 import type { ScopeId } from "../types.ts";
-import type { Harness, HarnessTurnInput, HarnessTurnResult } from "./harness.ts";
+import type { Harness, HarnessTitleInput, HarnessTurnInput, HarnessTurnResult } from "./harness.ts";
 import { NonRetryableTurnError } from "../core/turn-error.ts";
 
 export interface RuntimeChoice {
   harnessId: HarnessId;
   modelId: string;
 }
+
+type RuntimeInput = Pick<
+  HarnessTurnInput,
+  "scopeLabel" | "harness" | "model" | "modelProviderId" | "modelProviderRevision"
+>;
+
+type RuntimeExecution = <T>(
+  input: RuntimeInput & { runtimeOperation: "turn" | "title" },
+  choice: RuntimeChoice,
+  execute: () => Promise<T>,
+) => Promise<T>;
 
 export function resolveRuntimeChoice(
   config: Pick<ScopedConfigStore, "getApprovedHarnesses" | "getRuntimeSelection" | "getBaseModel">,
@@ -99,17 +110,23 @@ export async function resolveRuntimeChoiceDurable(
 export function createHarnessRouter(
   adapters: ReadonlyMap<HarnessId, Harness>,
   utility: Harness,
-  resolve: (input: HarnessTurnInput) => RuntimeChoice | Promise<RuntimeChoice>,
-  runTurn?: (
-    input: HarnessTurnInput,
-    choice: RuntimeChoice,
-    execute: () => Promise<HarnessTurnResult>,
-  ) => Promise<HarnessTurnResult>,
+  resolve: (input: RuntimeInput) => RuntimeChoice | Promise<RuntimeChoice>,
+  runWithChoice?: RuntimeExecution,
 ): Harness {
   const lastHarness = new Map<string, HarnessId>();
   return {
     profile: utility.profile,
-    models: utility.models,
+    models: {
+      ...utility.models,
+      generateTitle: async (input: HarnessTitleInput) => {
+        const choice = await resolve(input);
+        const adapter = adapters.get(choice.harnessId);
+        if (!adapter) throw new Error(`harness ${choice.harnessId} is unavailable`);
+        const execute = async () =>
+          adapter.models.generateTitle?.({ ...input, harness: choice.harnessId, model: choice.modelId });
+        return runWithChoice ? runWithChoice({ ...input, runtimeOperation: "title" }, choice, execute) : execute();
+      },
+    },
     tools: utility.tools,
     turns: {
       async runTurn(input) {
@@ -125,7 +142,7 @@ export function createHarnessRouter(
           lastHarness.set(input.session.id, choice.harnessId);
           return adapter.turns.runTurn({ ...input, harness: choice.harnessId, model: choice.modelId });
         };
-        return runTurn ? runTurn(input, choice, execute) : execute();
+        return runWithChoice ? runWithChoice({ ...input, runtimeOperation: "turn" }, choice, execute) : execute();
       },
       async resetSession(sessionId) {
         lastHarness.delete(sessionId);

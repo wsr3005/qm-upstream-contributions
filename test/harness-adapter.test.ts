@@ -5,6 +5,7 @@ import { createOpenCodeHarness } from "../src/harness/opencode-harness.ts";
 import { createCodexHarness } from "../src/harness/codex-harness.ts";
 import { createClaudeHarness } from "../src/harness/claude-harness.ts";
 import { createPiHarness } from "../src/harness/pi-harness.ts";
+import type { ScopeId } from "../src/types.ts";
 
 test("harness adapters declare their native control and tool transports", async (t) => {
   const mock = createMockHarness();
@@ -59,4 +60,28 @@ test("model utilities are independent from turn control", async () => {
   assert.equal(await harness.models.oneShot?.("system", "hello"), "mock one-shot reply to: hello");
   assert.equal("oneShot" in harness.turns, false);
   assert.equal("runTurn" in harness.models, false);
+});
+
+test("Claude title generation rejects an incompatible selected model instead of falling back", async () => {
+  const harness = createClaudeHarness();
+  await assert.rejects(
+    harness.models.generateTitle!({
+      transcript: "User:\nName this",
+      scopeLabel: "org:test" as ScopeId,
+      model: "gpt-5.6-luna",
+    }),
+    /does not support requested title model gpt-5\.6-luna/,
+  );
+});
+
+test("Codex title generation rejects an incompatible selected model instead of falling back", async () => {
+  const harness = createCodexHarness();
+  await assert.rejects(
+    harness.models.generateTitle!({
+      transcript: "User:\nName this",
+      scopeLabel: "org:test" as ScopeId,
+      model: "claude-opus-4-8",
+    }),
+    /does not support requested model claude-opus-4-8/,
+  );
 });

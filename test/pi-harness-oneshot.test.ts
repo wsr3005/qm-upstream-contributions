@@ -28,7 +28,7 @@ import {
 } from "../src/harness/pi-harness.ts";
 import { DEFAULT_AGENT_MODEL_ID, auxiliaryModelFor, getRequiredModel, resolveModel } from "../src/model/pi-models.ts";
 import { reconstructMessagesFromHistory } from "../src/harness/replay.ts";
-import type { SessionEntry } from "../src/types.ts";
+import type { ScopeId, SessionEntry } from "../src/types.ts";
 import type { HarnessLlmRequestRecord, HarnessTurnInput } from "../src/harness/harness.ts";
 import type { CustomProviderSpec } from "../src/model/custom-providers.ts";
 import { testConfig } from "./support/test-config.ts";
@@ -182,8 +182,33 @@ test("Pi title generation surfaces a missing auxiliary-model credential", async 
     resolveProviderKeys: async () => ({}),
   });
   await assert.rejects(
-    harness.models.generateTitle!("User:\nPrioritize the public qm issues"),
+    harness.models.generateTitle!({
+      transcript: "User:\nPrioritize the public qm issues",
+      scopeLabel: "org:test" as ScopeId,
+    }),
     /missing openai credential for title model gpt-5\.6-luna/i,
+  );
+});
+
+test("Pi title generation honors the selected custom model", async () => {
+  const provider: CustomProviderSpec = {
+    id: "gateway",
+    name: "Gateway",
+    protocol: "openai-responses",
+    baseUrl: "https://gateway.example/v1",
+    models: [{ id: "gateway/gpt-luna", upstreamId: "gpt-5.6-luna" }],
+  };
+  const harness = createPiHarness({
+    defaultModelId: "gpt-5.6-sol",
+    resolveProviderRuntime: async () => ({ keys: {}, customProviders: [provider] }),
+  });
+  await assert.rejects(
+    harness.models.generateTitle!({
+      transcript: "User:\nPrioritize the public qm issues",
+      scopeLabel: "org:test" as ScopeId,
+      model: "gateway/gpt-luna",
+    }),
+    /missing gateway credential for title model gpt-5\.6-luna/i,
   );
 });
 
@@ -263,11 +288,62 @@ test("oneShot completes an authenticated Pi 0.82 turn", async (t) => {
   const baseModel = getBuiltinModel("anthropic", "claude-haiku-4-5");
   assert(baseModel);
   const model = { ...baseModel, baseUrl: `http://127.0.0.1:${address.port}` };
+  const requests: HarnessLlmRequestRecord[] = [];
 
-  assert.equal(await oneShot("pi-positive-test", model, "test-key", "system", "hello"), "working");
+  assert.equal(
+    await oneShot("pi-positive-test", model, "test-key", "system", "hello", {
+      recordModelId: "enterprise/fast",
+      recordLlmRequest: (request) => {
+        requests.push(request);
+      },
+    }),
+    "working",
+  );
   assert.equal(apiKey, "test-key");
   assert.match(requestBody, /system/);
   assert.match(requestBody, /hello/);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]!.model, "enterprise/fast");
+  assert.deepEqual(requests[0]!.usage, {
+    input: 1,
+    output: 1,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 2,
+    costUsd: 0.000006,
+  });
+});
+
+test("oneShot aborts a hung provider request and records the failed attempt", async (t) => {
+  const server = createServer(() => {});
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  t.after(
+    () =>
+      new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      }),
+  );
+  const address = server.address();
+  assert(address && typeof address !== "string");
+  const baseModel = getBuiltinModel("anthropic", "claude-haiku-4-5");
+  assert(baseModel);
+  const model = { ...baseModel, baseUrl: `http://127.0.0.1:${address.port}` };
+  const requests: HarnessLlmRequestRecord[] = [];
+
+  assert.equal(
+    await oneShot("pi-abort-test", model, "test-key", "system", "hello", {
+      signal: AbortSignal.timeout(50),
+      recordLlmRequest: (request) => {
+        requests.push(request);
+      },
+    }),
+    undefined,
+  );
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]!.usage?.totalTokens, 0);
 });
 
 test("Pi records a custom local model id while sending its upstream wire id", async (t) => {

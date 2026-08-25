@@ -917,40 +917,50 @@ export function buildApp(
     },
   };
   const judgeModelId = (): string => config.judgeModelId ?? auxiliaryModelFor(orgBaseModelId() ?? fallback.modelId);
-  const harness = createHarnessRouter(adapters, adapters.get(fallbackHarness)!, async (input) => {
-    await refreshCustomProviders();
-    return resolveRuntimeChoiceDurable(configStore, runtimeOrgScope, input.scopeLabel, fallback, {
-      ...(input.harness ? { harnessId: input.harness as HarnessId } : {}),
-      ...(input.model ? { modelId: input.model } : {}),
-    });
-  }, async (input, choice, execute) => {
-    let executeOutside = false;
-    let result: Awaited<ReturnType<typeof execute>> | undefined;
-    await advisoryLock.withLock("custom-model-providers", async () => {
+  const harness = createHarnessRouter(
+    adapters,
+    adapters.get(fallbackHarness)!,
+    async (input) => {
       await refreshCustomProviders();
-      const providerId = resolveModel(choice.modelId)?.provider;
-      const active = providerId ? await customProviders.resolveActive(String(providerId)) : null;
-      if (!active) {
-        if (input.modelProviderId !== undefined || input.modelProviderRevision !== undefined) {
+      return resolveRuntimeChoiceDurable(configStore, runtimeOrgScope, input.scopeLabel, fallback, {
+        ...(input.harness ? { harnessId: input.harness as HarnessId } : {}),
+        ...(input.model ? { modelId: input.model } : {}),
+      });
+    },
+    async (input, choice, execute) => {
+      let executeOutside = false;
+      let outcome: { value: Awaited<ReturnType<typeof execute>> } | undefined;
+      await advisoryLock.withLock("custom-model-providers", async () => {
+        await refreshCustomProviders();
+        const providerId = resolveModel(choice.modelId)?.provider;
+        const active = providerId ? await customProviders.resolveActive(String(providerId)) : null;
+        if (!active) {
+          if (input.modelProviderId !== undefined || input.modelProviderRevision !== undefined) {
+            throw new NonRetryableTurnError("custom model provider changed; refresh the model configuration and retry");
+          }
+          executeOutside = true;
+          return;
+        }
+        const unboundInternalTitle =
+          input.runtimeOperation === "title" &&
+          input.modelProviderId === undefined &&
+          input.modelProviderRevision === undefined;
+        if (
+          (!unboundInternalTitle &&
+            (input.modelProviderId !== String(providerId) ||
+              input.modelProviderRevision === undefined ||
+              active.revision !== input.modelProviderRevision)) ||
+          !active.provider.models.some((candidate) => candidate.id === choice.modelId)
+        ) {
           throw new NonRetryableTurnError("custom model provider changed; refresh the model configuration and retry");
         }
-        executeOutside = true;
-        return;
-      }
-      if (
-        input.modelProviderId !== String(providerId) ||
-        input.modelProviderRevision === undefined ||
-        active.revision !== input.modelProviderRevision ||
-        !active.provider.models.some((candidate) => candidate.id === choice.modelId)
-      ) {
-        throw new NonRetryableTurnError("custom model provider changed; refresh the model configuration and retry");
-      }
-      result = await execute();
-    });
-    if (executeOutside) return execute();
-    if (!result) throw new NonRetryableTurnError("custom model provider execution did not complete");
-    return result;
-  });
+        outcome = { value: await execute() };
+      });
+      if (executeOutside) return execute();
+      if (!outcome) throw new NonRetryableTurnError("custom model provider execution did not complete");
+      return outcome.value;
+    },
+  );
   const customProviderHarnessTest: CustomProviderHarnessTestRunner = async (input) => {
     const initialState = input.draft
       ? { active: { ...input.draft, revision: 0 }, rolloutFence: await customProviderHarnessTestFence() }

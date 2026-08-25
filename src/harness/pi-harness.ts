@@ -65,6 +65,7 @@ import {
   type HarnessCompactInput,
   type HarnessDetectInput,
   type HarnessDetectResult,
+  type HarnessLlmRequestRecord,
   type HarnessTurnInput,
   type HarnessTurnResult,
   type GapWork,
@@ -1078,7 +1079,13 @@ export async function oneShot(
   keys: ProviderKeys | string,
   systemPrompt: string,
   prompt: string,
-  opts?: { signal?: AbortSignal; disableRetries?: boolean; customProviders?: CustomProviderSpec[] },
+  opts?: {
+    signal?: AbortSignal;
+    disableRetries?: boolean;
+    customProviders?: CustomProviderSpec[];
+    recordModelId?: string;
+    recordLlmRequest?: (rec: HarnessLlmRequestRecord) => void | Promise<void>;
+  },
 ): Promise<string | undefined> {
   const modelRuntime = await buildModelRuntime(keys, opts?.customProviders);
   const { resourceLoader, cwd, agentDir } = await createIsolatedResources(prefix, systemPrompt);
@@ -1102,17 +1109,47 @@ export async function oneShot(
     });
     const messagesBefore = session.messages.length;
     if (opts?.signal?.aborted) return undefined;
+    let startedAt: number | undefined;
+    let firstChunkAt: number | undefined;
+    let usage: LlmCallUsage | null = null;
+    const unsubscribe = session.subscribe((event) => {
+      if (event.type === "message_start" && (event.message as { role?: string }).role === "assistant") {
+        startedAt = Date.now();
+      } else if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+        if (firstChunkAt === undefined) firstChunkAt = Date.now();
+      } else if (event.type === "message_end" && (event.message as { role?: string }).role === "assistant") {
+        usage = piUsageToCallUsage((event.message as { usage?: PiUsageShape }).usage);
+      }
+    });
     const onAbort = () => {
       void session.abort().catch(() => undefined);
     };
     opts?.signal?.addEventListener("abort", onAbort, { once: true });
+    let failure: unknown;
     try {
       await session.prompt(prompt);
     } catch (err) {
-      throw piTurnError(session, err, messagesBefore);
+      failure = piTurnError(session, err, messagesBefore);
     } finally {
       opts?.signal?.removeEventListener("abort", onAbort);
+      unsubscribe();
     }
+    const finishedAt = Date.now();
+    await opts?.recordLlmRequest?.({
+      turnSeq: null,
+      step: -1,
+      model: opts?.recordModelId ?? model.id,
+      promptEnvelope: { system: systemPrompt, messages: [{ role: "user", content: prompt }] },
+      truncated: false,
+      transport: transportFromModel(model),
+      ttftMs: startedAt !== undefined && firstChunkAt !== undefined ? firstChunkAt - startedAt : null,
+      durationMs: startedAt !== undefined ? finishedAt - startedAt : null,
+      stepGapMs: null,
+      toolWallMs: null,
+      gapPhases: null,
+      usage,
+    });
+    if (failure !== undefined) throw failure;
     return piLastAssistantTextOrThrow(session);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
@@ -2239,21 +2276,25 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
         }
       },
 
-      async generateTitle(transcript: string): Promise<string | undefined> {
-        if (!transcript.trim()) return undefined;
+      async generateTitle(input): Promise<string | undefined> {
+        if (!input.transcript.trim()) return undefined;
         const providerRuntime = await resolveProviderRuntime();
-        const model = modelForRuntime(titleModelId(), providerRuntime);
+        const model = modelForRuntime(input.model ?? titleModelId(), providerRuntime);
         if (!keyForModel(providerRuntime.keys, model)) {
           throw new Error(`Missing ${model.provider} credential for title model ${model.id}`);
         }
-        const out = await oneShot(
-          "pi-title",
-          model,
-          providerRuntime.keys,
-          TITLE_GENERATION_PROMPT,
-          titleUserPrompt(transcript),
-          { customProviders: providerRuntime.customProviders },
-        );
+        const prompt = titleUserPrompt(input.transcript);
+        input.recordModelCall?.({
+          model: input.model ?? model.id,
+          inputTokens: countTokens(TITLE_GENERATION_PROMPT) + countTokens(prompt),
+          entryCount: 1,
+        });
+        const out = await oneShot("pi-title", model, providerRuntime.keys, TITLE_GENERATION_PROMPT, prompt, {
+          ...(input.signal ? { signal: input.signal } : {}),
+          customProviders: providerRuntime.customProviders,
+          recordModelId: input.model ?? model.id,
+          ...(input.recordLlmRequest ? { recordLlmRequest: input.recordLlmRequest } : {}),
+        });
         return sanitizeTitle(out);
       },
 

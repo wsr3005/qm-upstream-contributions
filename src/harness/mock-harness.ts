@@ -781,8 +781,8 @@ export function createMockHarness(): Harness {
         );
       },
 
-      generateTitle(transcript: string): Promise<string | undefined> {
-        const line = transcript
+      generateTitle(input): Promise<string | undefined> {
+        const line = input.transcript
           .split("\n")
           .map((l) => l.trim())
           .find((l) => l && !/^(user|assistant):$/i.test(l));

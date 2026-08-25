@@ -1337,8 +1337,19 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
             signal,
           ),
         ),
-      generateTitle: async (transcript) =>
-        sanitizeTitle(await single(TITLE_GENERATION_PROMPT, titleUserPrompt(transcript))),
+      generateTitle: async (input) =>
+        sanitizeTitle(
+          await single(
+            TITLE_GENERATION_PROMPT,
+            titleUserPrompt(input.transcript),
+            {
+              recordModelCall: input.recordModelCall ?? (() => {}),
+              ...(input.recordLlmRequest ? { recordLlmRequest: input.recordLlmRequest } : {}),
+            },
+            input.signal,
+            input.model,
+          ),
+        ),
       summarizeApproval: async (command, reason, purpose) =>
         single(
           "Explain this command in one plain-English sentence for an approver.",

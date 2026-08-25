@@ -330,6 +330,51 @@ test("paid web turns bind the provider revision through queued execution", async
   }
 });
 
+test("manual title regeneration resolves the scope's current custom model under the Provider fence", async () => {
+  const built = buildApp(
+    testConfig({ dataDir: mkdtempSync(join(tmpdir(), "custom-provider-title-regenerate-")), harness: "mock" }),
+  );
+  await built.customProviders.upsert(
+    {
+      id: "title-gateway",
+      name: "Title Gateway",
+      protocol: "openai-responses",
+      baseUrl: "https://title.example.com/v1",
+      models: [{ id: "title-gateway/luna" }],
+    },
+    "sk-title",
+    "admin-alice@default-org",
+  );
+  built.config.setApprovedHarnesses(["mock"]);
+  await built.config.setRuntimeSelectionLatest("org:default-org", {
+    harnessId: "mock",
+    modelId: "title-gateway/luna",
+  });
+  const turn = await built.app.turn({
+    surface: "web",
+    actor: { externalId: "title-user" },
+    conversation: { kind: "dm", threadRef: "web:title-user:custom-title" },
+    text: "Plan the enterprise rollout",
+    model: "title-gateway/luna",
+  });
+  assert.equal(turn.status, "ok");
+  assert.ok(turn.sessionId);
+
+  await built.customProviders.upsert(
+    {
+      id: "title-gateway",
+      name: "Title Gateway v2",
+      protocol: "openai-responses",
+      baseUrl: "https://title-v2.example.com/v1",
+      models: [{ id: "title-gateway/luna" }],
+    },
+    "sk-title-v2",
+    "admin-alice@default-org",
+  );
+  const regenerated = await built.app.regenerateTitle(turn.sessionId!, "title-user");
+  assert.equal(regenerated?.title, "Chat: Plan the enterprise rollout");
+});
+
 test("paid custom model turns reject missing or replaced Provider identities", async () => {
   const built = buildApp(
     testConfig({ dataDir: mkdtempSync(join(tmpdir(), "custom-provider-identity-bound-")), maxAttempts: 1 }),

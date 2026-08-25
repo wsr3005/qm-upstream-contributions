@@ -188,6 +188,7 @@ const MODE_FALLBACK_MD = loadProtocolFile("mode-fallback");
 const FIRST_BLOCK_CAPTURE_MAX_CHARS = 20_000;
 
 const DEFAULT_APPROVAL_SUMMARY_TIMEOUT_MS = 6_000;
+const DEFAULT_TITLE_GENERATION_TIMEOUT_MS = 30_000;
 
 const CONNECTOR_HOSTS = Object.values(PROVIDERS).flatMap((p) => p.hosts);
 const INSTANCE_CACHE_MAX_ENTRIES = 5_000;
@@ -267,10 +268,39 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
     scopeId: ScopeId,
     transcript: string,
     principalId?: string,
+    runtime?: Pick<OrchestratorInput, "cancel" | "harness" | "model" | "modelProviderId" | "modelProviderRevision">,
+    billingPrincipalId?: string,
   ): Promise<string | undefined> {
     if (!deps.harness.models.generateTitle || !transcript.trim()) return undefined;
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(new Error("title generation timed out")),
+      deps.titleGenerationTimeoutMs ?? DEFAULT_TITLE_GENERATION_TIMEOUT_MS,
+    );
+    const signal = runtime?.cancel ? AbortSignal.any([runtime.cancel, controller.signal]) : controller.signal;
     try {
-      const title = await deps.harness.models.generateTitle(transcript);
+      const title = await deps.harness.models.generateTitle({
+        transcript,
+        scopeLabel: scopeId,
+        signal,
+        ...(runtime?.harness ? { harness: runtime.harness } : {}),
+        ...(runtime?.model ? { model: runtime.model } : {}),
+        ...(runtime?.modelProviderId ? { modelProviderId: runtime.modelProviderId } : {}),
+        ...(runtime?.modelProviderRevision !== undefined
+          ? { modelProviderRevision: runtime.modelProviderRevision }
+          : {}),
+        recordModelCall: (rec) => {
+          deps.modelGateway.recordCall({ at: Date.now(), scopeLabel: scopeId, ...rec });
+          if (billingPrincipalId) void deps.budget?.record(billingPrincipalId, estimateCostUsd(rec.inputTokens));
+        },
+        recordLlmRequest: async (rec) => {
+          try {
+            await deps.sessions.recordLlmRequest(sessionId, { ...rec, scopeLabel: scopeId });
+          } catch (err) {
+            console.error("[orchestrator] failed to persist title LLM request snapshot:", errMessage(err));
+          }
+        },
+      });
       if (title) {
         if (principalId) await deps.sessions.updateParticipantView(sessionId, principalId, { title });
         else await deps.sessions.updateTitle(sessionId, title);
@@ -285,6 +315,8 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         sessionId,
       });
       return undefined;
+    } finally {
+      clearTimeout(timeout);
     }
   }
 
@@ -391,6 +423,8 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         session.scopeId,
         transcript,
         participantIds?.length ? principalId : undefined,
+        undefined,
+        principalId,
       );
       return { title: title ?? (participantIds ? null : (session.title ?? null)) };
     },
@@ -2276,7 +2310,14 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             : undefined;
         const earlyTitleGen: Promise<string | undefined> | undefined =
           humanTurn && !session.title && !syntheticPrompt && input.text.trim()
-            ? generateAndStoreTitle(session.id, scopeId, `User:\n${stripTurnBoilerplate(input.text)}`)
+            ? generateAndStoreTitle(
+                session.id,
+                scopeId,
+                `User:\n${stripTurnBoilerplate(input.text)}`,
+                undefined,
+                input,
+                actor.id,
+              )
             : undefined;
         const requestedTurnWallClockMs =
           typeof input.turnWallClockMs === "number" && input.turnWallClockMs > 0 ? input.turnWallClockMs : undefined;
@@ -2931,7 +2972,14 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
               }
             }
             if (!pausing && turnCompleted && !session.title && !(earlyTitleGen && (await earlyTitleGen))) {
-              await generateAndStoreTitle(session.id, scopeId, `User:\n${input.text}\n\nAssistant:\n${result.reply}`);
+              await generateAndStoreTitle(
+                session.id,
+                scopeId,
+                `User:\n${input.text}\n\nAssistant:\n${result.reply}`,
+                undefined,
+                input,
+                actor.id,
+              );
             }
           } finally {
             await reclaimBox();

@@ -1163,8 +1163,19 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
             ...(recordLlmRequest ? { recordLlmRequest } : {}),
           }),
         ),
-      generateTitle: async (transcript) =>
-        sanitizeTitle(await single(TITLE_GENERATION_PROMPT, titleUserPrompt(transcript))),
+      generateTitle: async (input) =>
+        sanitizeTitle(
+          await single(
+            TITLE_GENERATION_PROMPT,
+            titleUserPrompt(input.transcript),
+            input.signal,
+            {
+              recordModelCall: input.recordModelCall ?? (() => {}),
+              ...(input.recordLlmRequest ? { recordLlmRequest: input.recordLlmRequest } : {}),
+            },
+            input.model,
+          ),
+        ),
       summarizeApproval: async (command, reason, purpose) =>
         single(
           "Explain this command in one plain-English sentence for an approver.",

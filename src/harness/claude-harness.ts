@@ -923,8 +923,23 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
             ...(recordLlmRequest ? { recordLlmRequest } : {}),
           }),
         ),
-      generateTitle: async (transcript) =>
-        sanitizeTitle(await single(TITLE_GENERATION_PROMPT, titleUserPrompt(transcript))),
+      generateTitle: async (input) => {
+        if (input.model && !modelSupportedByHarness(input.model, "claude")) {
+          throw new NonRetryableTurnError(`Claude does not support requested title model ${input.model}`);
+        }
+        return sanitizeTitle(
+          await single(
+            TITLE_GENERATION_PROMPT,
+            titleUserPrompt(input.transcript),
+            input.signal,
+            {
+              recordModelCall: input.recordModelCall ?? (() => {}),
+              ...(input.recordLlmRequest ? { recordLlmRequest: input.recordLlmRequest } : {}),
+            },
+            input.model,
+          ),
+        );
+      },
       summarizeApproval: async (command, reason, purpose) =>
         single(
           "Explain this command in one plain-English sentence for an approver.",

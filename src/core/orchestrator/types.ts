@@ -112,6 +112,7 @@ export interface OrchestratorDeps {
   execTimeoutMs?: number;
   execTimeoutCeilingMs?: number;
   approvalSummaryTimeoutMs?: number;
+  titleGenerationTimeoutMs?: number;
   securityScreenTimeoutMs?: number;
   securityScreener?: SecurityScreener;
   backgroundJobTtlMs?: number;

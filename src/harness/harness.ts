@@ -48,6 +48,18 @@ interface HarnessSecurityScreenInput {
   recordLlmRequest?(rec: HarnessLlmRequestRecord): void | Promise<void>;
 }
 
+export interface HarnessTitleInput {
+  transcript: string;
+  scopeLabel: ScopeId;
+  signal?: AbortSignal;
+  harness?: string;
+  model?: string;
+  modelProviderId?: string;
+  modelProviderRevision?: number;
+  recordModelCall?(rec: { model: string; inputTokens: number; entryCount: number }): void;
+  recordLlmRequest?(rec: HarnessLlmRequestRecord): void | Promise<void>;
+}
+
 export interface HarnessTurnInput {
   session: Session;
   runId?: string;
@@ -174,7 +186,7 @@ export interface HarnessModelUtilities {
   judge?(systemPrompt: string, prompt: string): Promise<string | undefined>;
   screenSecurity?(input: HarnessSecurityScreenInput): Promise<SecurityScreenVerdict | undefined>;
   pickAckEmoji?(text: string, candidates: readonly string[]): Promise<string | undefined>;
-  generateTitle?(transcript: string): Promise<string | undefined>;
+  generateTitle?(input: HarnessTitleInput): Promise<string | undefined>;
   summarizeApproval?(command: string, reason: string, purpose?: string): Promise<string | undefined>;
 }
 

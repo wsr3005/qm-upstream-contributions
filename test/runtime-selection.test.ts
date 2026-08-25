@@ -5,9 +5,14 @@ import {
   type PersistedApprovedHarnesses,
   type PersistedBaseModel,
 } from "../src/resolution/config-store.ts";
-import { createHarnessRouter, resolveRuntimeChoice, resolveRuntimeChoiceDurable } from "../src/harness/harness-router.ts";
+import {
+  createHarnessRouter,
+  resolveRuntimeChoice,
+  resolveRuntimeChoiceDurable,
+} from "../src/harness/harness-router.ts";
 import { createMemoryMap } from "../src/persistence/durable-map.ts";
-import type { Harness, HarnessTurnInput } from "../src/harness/harness.ts";
+import { createMemoryAdvisoryLock } from "../src/persistence/advisory-lock.ts";
+import type { Harness, HarnessTitleInput, HarnessTurnInput } from "../src/harness/harness.ts";
 
 const ORG = "org:default-org" as const;
 const PERSONAL = "personal:alice" as const;
@@ -146,4 +151,100 @@ test("the routed turn guard encloses adapter execution", async () => {
   const result = await router.turns.runTurn({ session: { id: "guarded" } } as HarnessTurnInput);
   assert.equal(result.reply, "ok");
   assert.equal(guardActive, false);
+});
+
+test("title generation resolves the selected Harness and runs inside the same guard", async () => {
+  let guardActive = false;
+  const calls: Array<{ harness: string; model?: string; provider?: string; revision?: number }> = [];
+  const adapter = (harness: string): Harness =>
+    ({
+      models: {
+        async generateTitle(input) {
+          assert.equal(guardActive, true);
+          calls.push({
+            harness,
+            ...(input.model ? { model: input.model } : {}),
+            ...(input.modelProviderId ? { provider: input.modelProviderId } : {}),
+            ...(input.modelProviderRevision !== undefined ? { revision: input.modelProviderRevision } : {}),
+          });
+          return `${harness}:${input.model}`;
+        },
+      },
+    }) as Harness;
+  const adapters = new Map([
+    ["pi", adapter("pi")],
+    ["codex", adapter("codex")],
+    ["opencode", adapter("opencode")],
+  ] as const);
+  const router = createHarnessRouter(
+    adapters,
+    adapters.get("pi")!,
+    async (input) => ({
+      harnessId: (input.harness ?? "pi") as "pi" | "codex" | "opencode",
+      modelId: input.model ?? "org/default",
+    }),
+    async (input, choice, execute) => {
+      assert.equal(input.modelProviderId, choice.modelId === "gateway/luna" ? "gateway" : undefined);
+      guardActive = true;
+      try {
+        return await execute();
+      } finally {
+        guardActive = false;
+      }
+    },
+  );
+
+  const selected = await router.models.generateTitle!({
+    transcript: "User:\nName this",
+    scopeLabel: ORG,
+    harness: "codex",
+    model: "gateway/luna",
+    modelProviderId: "gateway",
+    modelProviderRevision: 7,
+  });
+  const inherited = await router.models.generateTitle!({ transcript: "User:\nName this", scopeLabel: ORG });
+
+  assert.equal(selected, "codex:gateway/luna");
+  assert.equal(inherited, "pi:org/default");
+  assert.deepEqual(calls, [
+    { harness: "codex", model: "gateway/luna", provider: "gateway", revision: 7 },
+    { harness: "pi", model: "org/default" },
+  ]);
+  assert.equal(guardActive, false);
+});
+
+test("an aborted title releases the shared execution guard for the next turn", async () => {
+  const lock = createMemoryAdvisoryLock();
+  const adapter = {
+    models: {
+      generateTitle: async (input: HarnessTitleInput) =>
+        new Promise<undefined>((resolve) =>
+          input.signal?.addEventListener("abort", () => resolve(undefined), { once: true }),
+        ),
+    },
+    turns: {
+      async runTurn() {
+        return { reply: "next turn ran" };
+      },
+    },
+  } as unknown as Harness;
+  const router = createHarnessRouter(
+    new Map([["pi", adapter]]),
+    adapter,
+    async () => ({ harnessId: "pi", modelId: "gateway/luna" }),
+    async (_input, _choice, execute) => lock.withLock("custom-model-providers", execute),
+  );
+
+  await router.models.generateTitle!({
+    transcript: "User:\nHang",
+    scopeLabel: ORG,
+    signal: AbortSignal.timeout(20),
+  });
+  const turn = await router.turns.runTurn({ session: { id: "after-title-timeout" } } as HarnessTurnInput);
+  let providerWriteCompleted = false;
+  await lock.withLock("custom-model-providers", async () => {
+    providerWriteCompleted = true;
+  });
+  assert.equal(turn.reply, "next turn ran");
+  assert.equal(providerWriteCompleted, true);
 });
