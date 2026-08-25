@@ -323,7 +323,7 @@ export function createAmbientHelpers(deps: AppDeps, app: App) {
       !live.request.harness ||
       !live.request.model
     )
-      return true;
+      return false;
     const steerText = decision === "unscreened" ? `${unscreenedNotice("mid-turn message")}\n${req.text}` : req.text;
     const replayRequest = {
       ...req,
