@@ -44,7 +44,12 @@ export function createMemoryRunStore(opts?: { maxClaims?: number }): MemoryRunti
       if (dedupKey) {
         const existingId =
           byKey.get(dedupKey) ??
-          (legacyDedupKeyPrefix ? [...byKey].find(([key]) => key.startsWith(legacyDedupKeyPrefix))?.[1] : undefined);
+          (legacyDedupKeyPrefix
+            ? [...byKey].find(
+                ([key]) =>
+                  key.startsWith(legacyDedupKeyPrefix) && /^\d+$/u.test(key.slice(legacyDedupKeyPrefix.length)),
+              )?.[1]
+            : undefined);
         if (existingId) {
           const existing = runs.get(existingId);
           if (existing)

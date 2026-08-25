@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { createPgPool, withPgTransaction } from "../persistence/pg-pool.ts";
+import { createPgPool } from "../persistence/pg-pool.ts";
 import type { TurnResult } from "../types.ts";
 import type { OrchestratorInput } from "../core/orchestrator.ts";
 import { resolveTurnOrigin } from "../core/turn-origin.ts";
@@ -61,6 +61,52 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
     `CREATE INDEX IF NOT EXISTS idx_runs_status_created ON runs(status, created_at)`,
     `CREATE INDEX IF NOT EXISTS idx_runs_session_active_created
         ON runs(session_id, created_at DESC) WHERE status IN ('pending','running')`,
+    `CREATE TABLE IF NOT EXISTS run_idempotency_families(
+        family_key TEXT PRIMARY KEY, run_id TEXT UNIQUE NOT NULL
+      )`,
+    `CREATE OR REPLACE FUNCTION qm_claim_run_idempotency_family() RETURNS trigger LANGUAGE plpgsql AS $$
+      DECLARE
+        family_key_value TEXT;
+        existing_run_id TEXT;
+        claimed_run_id TEXT;
+      BEGIN
+        IF NEW.idempotency_key IS NULL THEN RETURN NEW; END IF;
+        family_key_value := regexp_replace(NEW.idempotency_key, ':project-[0-9]+$', '');
+        SELECT id INTO existing_run_id FROM runs WHERE idempotency_key=NEW.idempotency_key;
+        INSERT INTO run_idempotency_families(family_key, run_id)
+          VALUES (family_key_value, COALESCE(existing_run_id, NEW.id))
+          ON CONFLICT (family_key) DO NOTHING;
+        SELECT run_id INTO claimed_run_id FROM run_idempotency_families WHERE family_key=family_key_value;
+        IF claimed_run_id <> COALESCE(existing_run_id, NEW.id) THEN
+          RAISE EXCEPTION 'idempotency family is already claimed' USING ERRCODE='23505';
+        END IF;
+        RETURN NEW;
+      END $$`,
+    `DROP TRIGGER IF EXISTS trg_runs_claim_idempotency_family ON runs`,
+    `CREATE TRIGGER trg_runs_claim_idempotency_family BEFORE INSERT ON runs
+      FOR EACH ROW EXECUTE FUNCTION qm_claim_run_idempotency_family()`,
+    `DO $$
+      BEGIN
+        IF EXISTS (
+          SELECT 1 FROM runs WHERE idempotency_key IS NOT NULL
+          GROUP BY regexp_replace(idempotency_key, ':project-[0-9]+$', '')
+          HAVING count(*) > 1 AND bool_or(status IN ('pending','running'))
+        ) THEN
+          RAISE EXCEPTION 'active legacy project idempotency duplicates require reconciliation';
+        END IF;
+      END $$`,
+    `INSERT INTO run_idempotency_families(family_key, run_id)
+      SELECT regexp_replace(idempotency_key, ':project-[0-9]+$', ''), id
+      FROM runs WHERE idempotency_key IS NOT NULL ORDER BY created_at, seq
+      ON CONFLICT (family_key) DO NOTHING`,
+    `CREATE OR REPLACE FUNCTION qm_release_run_idempotency_family() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        DELETE FROM run_idempotency_families WHERE run_id=OLD.id;
+        RETURN OLD;
+      END $$`,
+    `DROP TRIGGER IF EXISTS trg_runs_release_idempotency_family ON runs`,
+    `CREATE TRIGGER trg_runs_release_idempotency_family AFTER DELETE ON runs
+      FOR EACH ROW EXECUTE FUNCTION qm_release_run_idempotency_family()`,
     `DROP INDEX IF EXISTS idx_runs_status_priority_created`,
     `UPDATE runs SET status='pending', lease_token=NULL, lease_expires_at=NULL, worker_id=NULL
       WHERE status='running' AND id IN (
@@ -181,32 +227,44 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
             JSON.stringify(JSON.parse(row.request as string)) !== JSON.stringify(request),
         };
       }
-      return withPgTransaction(await pg.pool(), async (client) => {
-        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [dedupKey]);
-        const existing = await client.query(
-          `SELECT * FROM runs
-           WHERE idempotency_key = $1 OR starts_with(idempotency_key, $2)
-           ORDER BY CASE WHEN idempotency_key = $1 THEN 0 ELSE 1 END, created_at, seq
-           LIMIT 1`,
-          [dedupKey, legacyDedupKeyPrefix],
+      const findFamily = async (): Promise<Record<string, unknown> | undefined> => {
+        const { rows } = await q(
+          `SELECT runs.* FROM run_idempotency_families
+           JOIN runs ON runs.id=run_idempotency_families.run_id
+           WHERE family_key=$1`,
+          [dedupKey],
         );
-        const row = existing.rows[0] as Record<string, unknown> | undefined;
-        if (row) {
-          return {
-            run: rowToRun(row),
-            deduped: true,
-            conflict:
-              row.session_id !== sessionId ||
-              JSON.stringify(JSON.parse(row.request as string)) !== JSON.stringify(request),
-          };
-        }
-        const inserted = await client.query(
+        return rows[0];
+      };
+      const existing = await findFamily();
+      if (existing) {
+        return {
+          run: rowToRun(existing),
+          deduped: true,
+          conflict:
+            existing.session_id !== sessionId ||
+            JSON.stringify(JSON.parse(existing.request as string)) !== JSON.stringify(request),
+        };
+      }
+      try {
+        const { rows } = await q(
           `INSERT INTO runs(id, session_id, status, request, idempotency_key, attempts, max_attempts, created_at)
            VALUES ($1,$2,'pending',$3,$4,0,$5,$6) RETURNING *`,
           [randomUUID(), sessionId, JSON.stringify(request), dedupKey, maxAttempts, Date.now()],
         );
-        return { run: rowToRun(inserted.rows[0] as Record<string, unknown>), deduped: false, conflict: false };
-      });
+        return { run: rowToRun(rows[0]!), deduped: false, conflict: false };
+      } catch (error) {
+        if (!isUniqueViolation(error)) throw error;
+        const raced = await findFamily();
+        if (!raced) throw error;
+        return {
+          run: rowToRun(raced),
+          deduped: true,
+          conflict:
+            raced.session_id !== sessionId ||
+            JSON.stringify(JSON.parse(raced.request as string)) !== JSON.stringify(request),
+        };
+      }
     },
 
     async claim(workerId, ttlMs): Promise<Run | null> {

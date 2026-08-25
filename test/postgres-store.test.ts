@@ -13,7 +13,7 @@ before(async () => {
   const pg = (await import("pg")).default;
   const p = new pg.Pool({ connectionString: URL });
   await p.query(
-    "DROP TABLE IF EXISTS sessions, session_entries, participants, session_leases, session_tape, session_llm_requests, runs, tool_calls CASCADE",
+    "DROP TABLE IF EXISTS sessions, session_entries, participants, session_leases, session_tape, session_llm_requests, runs, tool_calls, run_idempotency_families CASCADE",
   );
   await p.end();
 });
@@ -924,6 +924,61 @@ test("pg run store: enqueue dedup, atomic one-per-session claim, fencing, ledger
     });
     assert.equal(legacyConflict.run.id, legacy.run.id);
     assert.equal(legacyConflict.conflict, true);
+
+    const pg = (await import("pg")).default;
+    const oldWriter = new pg.Pool({ connectionString: URL });
+    try {
+      const stableRequest = turn("new writer first");
+      const stable = await runs.enqueue({
+        sessionId: "sStable",
+        request: stableRequest,
+        dedupKey: "new-first-key",
+        legacyDedupKeyPrefix: "new-first-key:project-",
+      });
+      await assert.rejects(
+        oldWriter.query(
+          `INSERT INTO runs(id, session_id, status, request, idempotency_key, attempts, max_attempts, created_at)
+           VALUES ($1,$2,'pending',$3,$4,0,3,$5)
+           ON CONFLICT (idempotency_key) DO NOTHING RETURNING *`,
+          ["old-after-new", "sStable", JSON.stringify(stableRequest), "new-first-key:project-200", Date.now()],
+        ),
+        /idempotency family is already claimed/,
+      );
+      assert.equal(stable.deduped, false);
+      const simultaneousRequest = turn("simultaneous old and new writers");
+      const [newResult] = await Promise.all([
+        runs.enqueue({
+          sessionId: "sSimultaneous",
+          request: simultaneousRequest,
+          dedupKey: "simultaneous-key",
+          legacyDedupKeyPrefix: "simultaneous-key:project-",
+        }),
+        oldWriter
+          .query(
+            `INSERT INTO runs(id, session_id, status, request, idempotency_key, attempts, max_attempts, created_at)
+             VALUES ($1,$2,'pending',$3,$4,0,3,$5)
+             ON CONFLICT (idempotency_key) DO NOTHING RETURNING *`,
+            [
+              "simultaneous-old",
+              "sSimultaneous",
+              JSON.stringify(simultaneousRequest),
+              "simultaneous-key:project-300",
+              Date.now(),
+            ],
+          )
+          .catch(() => null),
+      ]);
+      assert.equal(newResult.conflict, false);
+      const familyCount = await oldWriter.query(
+        `SELECT count(*)::int AS count FROM runs
+         WHERE idempotency_key='simultaneous-key' OR idempotency_key='simultaneous-key:project-300'`,
+      );
+      assert.equal(familyCount.rows[0].count, 1);
+      assert.equal(await runs.withdraw(stable.run.id), true);
+      assert.equal(await runs.withdraw(newResult.run.id), true);
+    } finally {
+      await oldWriter.end();
+    }
 
     const N = 8;
     const raced = await Promise.all(

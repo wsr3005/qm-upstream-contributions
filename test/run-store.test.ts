@@ -62,6 +62,19 @@ for (const backend of backends) {
     assert.equal((await runs.list()).length, 1);
   });
 
+  test(`[${backend.name}] legacy project matching requires a numeric roster version`, async () => {
+    const { runs } = backend.make();
+    await runs.enqueue({ sessionId: "s1", request: turn("unrelated"), dedupKey: "paid-key:project-user" });
+    const current = await runs.enqueue({
+      sessionId: "s1",
+      request: turn("paid project turn"),
+      dedupKey: "paid-key",
+      legacyDedupKeyPrefix: "paid-key:project-",
+    });
+    assert.equal(current.deduped, false);
+    assert.equal((await runs.list()).length, 2);
+  });
+
   test(`[${backend.name}] activeForThread returns the in-flight run, null once terminal`, async () => {
     const { runs } = backend.make();
     assert.equal(await runs.activeForThread("sX"), null, "nothing running");
