@@ -2331,6 +2331,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             ...(extras.images?.length ? { images: extras.images } : {}),
             ...(input.harness ? { harness: input.harness } : {}),
             ...(input.model ? { model: input.model } : {}),
+            ...(input.modelProviderId ? { modelProviderId: input.modelProviderId } : {}),
             ...(input.modelProviderRevision !== undefined
               ? { modelProviderRevision: input.modelProviderRevision }
               : {}),

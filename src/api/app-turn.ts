@@ -67,6 +67,12 @@ export function createTurnMethods(
       ) {
         return { status: "refused", reason: "model provider revision must be a positive integer" };
       }
+      if (req.modelProviderId !== undefined && (typeof req.modelProviderId !== "string" || !req.modelProviderId)) {
+        return { status: "refused", reason: "model provider id must be a non-empty string" };
+      }
+      if ((req.modelProviderId === undefined) !== (req.modelProviderRevision === undefined)) {
+        return { status: "refused", reason: "model provider id and revision must be supplied together" };
+      }
       await deps.refreshCustomProviders?.();
       let projectAudience: Principal[] | undefined;
       let projectName: string | undefined;
@@ -130,6 +136,7 @@ export function createTurnMethods(
         return (await deps.projects.withVersion(conversationRef, projectVersion, fn)) ?? null;
       }
 
+      let modelProviderBinding: { providerId: string; revision: number } | undefined;
       if (req.surface === "web") {
         const threadRef = req.conversation.threadRef;
         const existing = await deps.sessions.getByThread(threadRef);
@@ -191,19 +198,27 @@ export function createTurnMethods(
             reason: "that model isn't available on this deployment (its provider isn't configured)",
           };
         }
-        if (req.modelProviderRevision !== undefined) {
-          const providerId = resolveModel(runtime.modelId)?.provider;
-          const active = providerId && deps.customProviders ? await deps.customProviders.resolveActive(String(providerId)) : null;
+        const providerId = resolveModel(runtime.modelId)?.provider;
+        const active = providerId && deps.customProviders ? await deps.customProviders.resolveActive(String(providerId)) : null;
+        if (active) {
+          modelProviderBinding = { providerId: String(providerId), revision: active.revision };
           if (
-            !active ||
-            active.revision !== req.modelProviderRevision ||
-            !active.provider.models.some((candidate) => candidate.id === runtime.modelId)
+            (req.idempotencyKey && req.modelProviderRevision === undefined) ||
+            (req.modelProviderRevision !== undefined &&
+              (req.modelProviderId !== providerId ||
+                active.revision !== req.modelProviderRevision ||
+                !active.provider.models.some((candidate) => candidate.id === runtime.modelId)))
           ) {
             return {
               status: "refused",
               reason: "custom model provider changed; refresh the model configuration and retry",
             };
           }
+        } else if (req.modelProviderRevision !== undefined) {
+          return {
+            status: "refused",
+            reason: "custom model provider changed; refresh the model configuration and retry",
+          };
         }
         const configuredWebuiModels = await deps.config.getWebuiModelsDurable(org);
         let enabledWebuiModels: string[] | null = null;
@@ -274,7 +289,12 @@ export function createTurnMethods(
         ...(req.inboundNotes?.length ? { inboundNotes: req.inboundNotes } : {}),
         ...(req.harness ? { harness: req.harness } : {}),
         ...(req.model ? { model: req.model } : {}),
-        ...(req.modelProviderRevision !== undefined ? { modelProviderRevision: req.modelProviderRevision } : {}),
+        ...(modelProviderBinding
+          ? {
+              modelProviderId: modelProviderBinding.providerId,
+              modelProviderRevision: modelProviderBinding.revision,
+            }
+          : {}),
         ...turnModelOptions(req),
         ...(req.readOnly ? { readOnly: true } : {}),
         ...(req.skipMemory ? { skipMemory: true } : {}),

@@ -924,20 +924,32 @@ export function buildApp(
       ...(input.model ? { modelId: input.model } : {}),
     });
   }, async (input, choice, execute) => {
-    if (input.modelProviderRevision === undefined) return execute();
-    return advisoryLock.withLock("custom-model-providers", async () => {
+    let executeOutside = false;
+    let result: Awaited<ReturnType<typeof execute>> | undefined;
+    await advisoryLock.withLock("custom-model-providers", async () => {
       await refreshCustomProviders();
       const providerId = resolveModel(choice.modelId)?.provider;
       const active = providerId ? await customProviders.resolveActive(String(providerId)) : null;
+      if (!active) {
+        if (input.modelProviderId !== undefined || input.modelProviderRevision !== undefined) {
+          throw new NonRetryableTurnError("custom model provider changed; refresh the model configuration and retry");
+        }
+        executeOutside = true;
+        return;
+      }
       if (
-        !active ||
+        input.modelProviderId !== String(providerId) ||
+        input.modelProviderRevision === undefined ||
         active.revision !== input.modelProviderRevision ||
         !active.provider.models.some((candidate) => candidate.id === choice.modelId)
       ) {
         throw new NonRetryableTurnError("custom model provider changed; refresh the model configuration and retry");
       }
-      return execute();
+      result = await execute();
     });
+    if (executeOutside) return execute();
+    if (!result) throw new NonRetryableTurnError("custom model provider execution did not complete");
+    return result;
   });
   const customProviderHarnessTest: CustomProviderHarnessTestRunner = async (input) => {
     const initialState = input.draft

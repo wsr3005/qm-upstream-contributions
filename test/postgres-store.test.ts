@@ -901,34 +901,57 @@ test("pg run store: enqueue dedup, atomic one-per-session claim, fencing, ledger
     assert.equal(conflict.conflict, true);
     assert.equal(b.run.id, a.run.id);
 
-    const legacyRequest = turn("legacy paid project turn");
-    const legacy = await runs.enqueue({
-      sessionId: "sLegacy",
-      request: legacyRequest,
-      dedupKey: "legacy-paid-key:project-100",
-    });
+    const pg = (await import("pg")).default;
+    const legacyRequest = { ...turn("legacy paid project turn"), scopeVersion: "100" };
+    const legacyWriter = new pg.Pool({ connectionString: URL });
+    await legacyWriter.query(
+      `INSERT INTO runs(id, session_id, status, request, idempotency_key, attempts, max_attempts, created_at)
+       VALUES ($1,$2,'pending',$3,$4,0,3,$5)`,
+      ["legacy-paid-run", "sLegacy", JSON.stringify(legacyRequest), "legacy-paid-key:project-100", Date.now()],
+    );
+    await legacyWriter.end();
     const legacyReplay = await runs.enqueue({
       sessionId: "sLegacy",
       request: legacyRequest,
       dedupKey: "legacy-paid-key",
       legacyDedupKeyPrefix: "legacy-paid-key:project-",
     });
-    assert.equal(legacyReplay.run.id, legacy.run.id);
+    assert.equal(legacyReplay.run.id, "legacy-paid-run");
     assert.equal(legacyReplay.deduped, true);
     assert.equal(legacyReplay.conflict, false);
     const legacyConflict = await runs.enqueue({
       sessionId: "sLegacy",
-      request: turn("legacy paid project turn after roster change"),
+      request: { ...turn("legacy paid project turn after roster change"), scopeVersion: "100" },
       dedupKey: "legacy-paid-key",
       legacyDedupKeyPrefix: "legacy-paid-key:project-",
     });
-    assert.equal(legacyConflict.run.id, legacy.run.id);
+    assert.equal(legacyConflict.run.id, "legacy-paid-run");
     assert.equal(legacyConflict.conflict, true);
 
-    const pg = (await import("pg")).default;
     const oldWriter = new pg.Pool({ connectionString: URL });
     try {
-      const stableRequest = turn("new writer first");
+      const oldSuffixRequest = { ...turn("old writer owns a key ending in a legacy-looking suffix"), scopeVersion: "200" };
+      await oldWriter.query(
+        `INSERT INTO runs(id, session_id, status, request, idempotency_key, attempts, max_attempts, created_at)
+         VALUES ($1,$2,'pending',$3,$4,0,3,$5)`,
+        [
+          "old-suffix-first",
+          "sOldSuffixFirst",
+          JSON.stringify(oldSuffixRequest),
+          "old-suffix-key:project-7:project-200",
+          Date.now(),
+        ],
+      );
+      const oldSuffixReplay = await runs.enqueue({
+        sessionId: "sOldSuffixFirst",
+        request: oldSuffixRequest,
+        dedupKey: "old-suffix-key:project-7",
+        legacyDedupKeyPrefix: "old-suffix-key:project-7:project-",
+      });
+      assert.equal(oldSuffixReplay.run.id, "old-suffix-first");
+      assert.equal(oldSuffixReplay.deduped, true);
+      assert.equal(oldSuffixReplay.conflict, false);
+      const stableRequest = { ...turn("new writer first"), scopeVersion: "200" };
       const stable = await runs.enqueue({
         sessionId: "sStable",
         request: stableRequest,
@@ -945,13 +968,36 @@ test("pg run store: enqueue dedup, atomic one-per-session claim, fencing, ledger
         /idempotency family is already claimed/,
       );
       assert.equal(stable.deduped, false);
-      const simultaneousRequest = turn("simultaneous old and new writers");
+      const suffixRequest = { ...turn("original key ends with a legacy-looking suffix"), scopeVersion: "200" };
+      const suffixStable = await runs.enqueue({
+        sessionId: "sSuffixStable",
+        request: suffixRequest,
+        dedupKey: "suffix-key:project-7",
+        legacyDedupKeyPrefix: "suffix-key:project-7:project-",
+      });
+      await assert.rejects(
+        oldWriter.query(
+          `INSERT INTO runs(id, session_id, status, request, idempotency_key, attempts, max_attempts, created_at)
+           VALUES ($1,$2,'pending',$3,$4,0,3,$5)
+           ON CONFLICT (idempotency_key) DO NOTHING RETURNING *`,
+          [
+            "old-after-suffix-new",
+            "sSuffixStable",
+            JSON.stringify(suffixRequest),
+            "suffix-key:project-7:project-200",
+            Date.now(),
+          ],
+        ),
+        /idempotency family is already claimed/,
+      );
+      assert.equal(suffixStable.deduped, false);
+      const simultaneousRequest = { ...turn("simultaneous old and new writers"), scopeVersion: "300" };
       const [newResult] = await Promise.all([
         runs.enqueue({
           sessionId: "sSimultaneous",
           request: simultaneousRequest,
-          dedupKey: "simultaneous-key",
-          legacyDedupKeyPrefix: "simultaneous-key:project-",
+          dedupKey: "simultaneous-key:project-9",
+          legacyDedupKeyPrefix: "simultaneous-key:project-9:project-",
         }),
         oldWriter
           .query(
@@ -962,7 +1008,7 @@ test("pg run store: enqueue dedup, atomic one-per-session claim, fencing, ledger
               "simultaneous-old",
               "sSimultaneous",
               JSON.stringify(simultaneousRequest),
-              "simultaneous-key:project-300",
+              "simultaneous-key:project-9:project-300",
               Date.now(),
             ],
           )
@@ -971,10 +1017,13 @@ test("pg run store: enqueue dedup, atomic one-per-session claim, fencing, ledger
       assert.equal(newResult.conflict, false);
       const familyCount = await oldWriter.query(
         `SELECT count(*)::int AS count FROM runs
-         WHERE idempotency_key='simultaneous-key' OR idempotency_key='simultaneous-key:project-300'`,
+         WHERE idempotency_key='simultaneous-key:project-9'
+            OR idempotency_key='simultaneous-key:project-9:project-300'`,
       );
       assert.equal(familyCount.rows[0].count, 1);
+      assert.equal(await runs.withdraw(oldSuffixReplay.run.id), true);
       assert.equal(await runs.withdraw(stable.run.id), true);
+      assert.equal(await runs.withdraw(suffixStable.run.id), true);
       assert.equal(await runs.withdraw(newResult.run.id), true);
 
       const withdrawRace = await runs.enqueue({
@@ -1537,11 +1586,12 @@ test("pg run store readiness rejects active duplicates written while migration w
     await writer.query("BEGIN");
     await writer.query(
       `INSERT INTO runs(id, session_id, status, request, idempotency_key, attempts, max_attempts, created_at)
-       VALUES ($1,$2,'pending',$3,$4,0,3,$5),($6,$2,'pending',$3,$7,0,3,$5)`,
+       VALUES ($1,$2,'pending',$3,$5,0,3,$6),($7,$2,'pending',$4,$8,0,3,$6)`,
       [
         `${suffix}-one`,
         suffix,
-        JSON.stringify(turn("migration duplicate")),
+        JSON.stringify({ ...turn("migration duplicate"), scopeVersion: "1" }),
+        JSON.stringify({ ...turn("migration duplicate"), scopeVersion: "2" }),
         `${suffix}:project-1`,
         Date.now(),
         `${suffix}-two`,

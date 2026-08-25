@@ -280,6 +280,7 @@ test("paid web turns bind the provider revision through queued execution", async
     conversation: { kind: "dm", threadRef: "web:alice:custom-provider-invalid-revision" },
     text: "hello",
     model: "bound-model",
+    modelProviderId: "bound-gateway",
     modelProviderRevision: revision + 1,
     async: true,
   });
@@ -294,12 +295,16 @@ test("paid web turns bind the provider revision through queued execution", async
     conversation: { kind: "dm", threadRef: "web:alice:custom-provider-revision" },
     text: "hello",
     model: "bound-model",
+    modelProviderId: "bound-gateway",
     modelProviderRevision: revision,
     async: true,
   });
   assert.equal(queued.status, "queued");
   if (queued.status !== "queued") return;
   assert.ok(queued.runId);
+  const queuedRun = await built.runs.get(queued.runId);
+  assert.equal(queuedRun?.request.modelProviderId, "bound-gateway");
+  assert.equal(queuedRun?.request.modelProviderRevision, revision);
   await built.customProviders.upsert(
     {
       id: "bound-gateway",
@@ -315,6 +320,116 @@ test("paid web turns bind the provider revision through queued execution", async
   built.runtime.start();
   try {
     const run = await built.runs.waitFor(queued.runId, 5_000);
+    assert.equal(run.status, "failed");
+    assert.match(
+      run.result?.status === "failed" ? (run.result.reason ?? "") : "",
+      /custom model provider changed; refresh the model configuration and retry/,
+    );
+  } finally {
+    await built.runtime.stop();
+  }
+});
+
+test("paid custom model turns reject missing or replaced Provider identities", async () => {
+  const built = buildApp(
+    testConfig({ dataDir: mkdtempSync(join(tmpdir(), "custom-provider-identity-bound-")), maxAttempts: 1 }),
+  );
+  await built.customProviders.upsert(
+    {
+      id: "identity-a",
+      name: "Identity A",
+      protocol: "openai",
+      baseUrl: "https://a.example.com/v1",
+      models: [{ id: "shared-model" }],
+    },
+    "sk-a",
+    "admin-alice@default-org",
+  );
+  const revision = (await built.customProviders.statuses())[0]!.revision;
+  const missing = await built.app.turn({
+    surface: "web",
+    actor: { externalId: "alice" },
+    conversation: { kind: "dm", threadRef: "web:alice:custom-provider-missing-identity" },
+    text: "hello",
+    model: "shared-model",
+    idempotencyKey: "paid-missing-identity",
+    async: true,
+  });
+  assert.deepEqual(missing, {
+    status: "refused",
+    reason: "custom model provider changed; refresh the model configuration and retry",
+  });
+
+  await built.customProviders.delete("identity-a", "admin-alice@default-org");
+  await built.customProviders.upsert(
+    {
+      id: "identity-b",
+      name: "Identity B",
+      protocol: "openai",
+      baseUrl: "https://b.example.com/v1",
+      models: [{ id: "shared-model" }],
+    },
+    "sk-b",
+    "admin-alice@default-org",
+  );
+  const replaced = await built.app.turn({
+    surface: "web",
+    actor: { externalId: "alice" },
+    conversation: { kind: "dm", threadRef: "web:alice:custom-provider-replaced-identity" },
+    text: "hello",
+    model: "shared-model",
+    modelProviderId: "identity-a",
+    modelProviderRevision: revision,
+    idempotencyKey: "paid-replaced-identity",
+    async: true,
+  });
+  assert.deepEqual(replaced, {
+    status: "refused",
+    reason: "custom model provider changed; refresh the model configuration and retry",
+  });
+});
+
+test("workers reject historical custom model runs without Provider bindings", async () => {
+  const built = buildApp(
+    testConfig({ dataDir: mkdtempSync(join(tmpdir(), "custom-provider-historical-unbound-")), maxAttempts: 1 }),
+  );
+  await built.customProviders.upsert(
+    {
+      id: "historical-gateway",
+      name: "Historical Gateway",
+      protocol: "openai",
+      baseUrl: "https://historical.example.com/v1",
+      models: [{ id: "historical-model" }],
+    },
+    "sk-historical",
+    "admin-alice@default-org",
+  );
+  const prepared = await built.app.turn({
+    surface: "web",
+    actor: { externalId: "alice" },
+    conversation: { kind: "dm", threadRef: "web:alice:custom-provider-historical-unbound" },
+    text: "hello",
+    model: "historical-model",
+    async: true,
+  });
+  assert.equal(prepared.status, "queued");
+  if (prepared.status !== "queued") return;
+  assert.ok(prepared.runId);
+  const preparedRun = await built.runs.get(prepared.runId);
+  assert.ok(preparedRun);
+  await built.runs.withdraw(prepared.runId);
+  const legacyRequest = { ...preparedRun.request };
+  delete legacyRequest.modelProviderId;
+  delete legacyRequest.modelProviderRevision;
+  const legacy = await built.runs.enqueue({
+    sessionId: "web:alice:custom-provider-historical-unbound",
+    request: legacyRequest,
+    maxAttempts: 1,
+  });
+  await built.runtime.ready();
+  built.runtime.start();
+  try {
+    const run = await built.runs.waitFor(legacy.run.id, 5_000);
     assert.equal(run.status, "failed");
     assert.match(
       run.result?.status === "failed" ? (run.result.reason ?? "") : "",

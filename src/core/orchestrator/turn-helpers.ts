@@ -254,6 +254,7 @@ export function replayableRequest(input: OrchestratorInput): TurnRequest {
     ...(input.attachments?.length ? { attachments: input.attachments } : {}),
     ...(input.harness ? { harness: input.harness } : {}),
     ...(input.model ? { model: input.model } : {}),
+    ...(input.modelProviderId ? { modelProviderId: input.modelProviderId } : {}),
     ...(input.modelProviderRevision !== undefined
       ? { modelProviderRevision: input.modelProviderRevision }
       : {}),

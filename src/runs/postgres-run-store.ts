@@ -58,6 +58,7 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
     `ALTER TABLE runs ADD COLUMN IF NOT EXISTS delivery_state TEXT`,
     `ALTER TABLE runs ADD COLUMN IF NOT EXISTS error_attempts INT NOT NULL DEFAULT 0`,
     `ALTER TABLE runs ADD COLUMN IF NOT EXISTS seq BIGSERIAL`,
+    `ALTER TABLE runs ADD COLUMN IF NOT EXISTS idempotency_family_key TEXT`,
     `CREATE INDEX IF NOT EXISTS idx_runs_status_created_seq ON runs(status, created_at, seq)`,
     `CREATE INDEX IF NOT EXISTS idx_runs_status_created ON runs(status, created_at)`,
     `CREATE INDEX IF NOT EXISTS idx_runs_session_active_created
@@ -66,6 +67,26 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
         family_key TEXT PRIMARY KEY,
         run_id TEXT UNIQUE NOT NULL REFERENCES runs(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
       )`,
+    `CREATE OR REPLACE FUNCTION qm_run_idempotency_family(
+        idempotency_key_value TEXT,
+        explicit_family_key TEXT,
+        request_value TEXT
+      ) RETURNS TEXT LANGUAGE plpgsql IMMUTABLE AS $$
+      DECLARE
+        scope_version TEXT;
+        legacy_suffix TEXT;
+      BEGIN
+        IF idempotency_key_value IS NULL THEN RETURN NULL; END IF;
+        IF explicit_family_key IS NOT NULL THEN RETURN explicit_family_key; END IF;
+        scope_version := request_value::jsonb->>'scopeVersion';
+        IF scope_version IS NOT NULL AND scope_version ~ '^[0-9]+$' THEN
+          legacy_suffix := ':project-' || scope_version;
+          IF right(idempotency_key_value, length(legacy_suffix))=legacy_suffix THEN
+            RETURN left(idempotency_key_value, length(idempotency_key_value)-length(legacy_suffix));
+          END IF;
+        END IF;
+        RETURN idempotency_key_value;
+      END $$`,
     `CREATE OR REPLACE FUNCTION qm_claim_run_idempotency_family() RETURNS trigger LANGUAGE plpgsql AS $$
       DECLARE
         family_key_value TEXT;
@@ -73,10 +94,14 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
         claimed_run_id TEXT;
       BEGIN
         IF NEW.idempotency_key IS NULL THEN RETURN NEW; END IF;
-        family_key_value := regexp_replace(NEW.idempotency_key, ':project-[0-9]+$', '');
+        family_key_value := qm_run_idempotency_family(
+          NEW.idempotency_key,
+          NEW.idempotency_family_key,
+          NEW.request
+        );
         PERFORM pg_advisory_xact_lock(hashtext(family_key_value));
         SELECT id INTO existing_run_id FROM runs
-          WHERE regexp_replace(idempotency_key, ':project-[0-9]+$', '')=family_key_value
+          WHERE qm_run_idempotency_family(idempotency_key, idempotency_family_key, request)=family_key_value
           ORDER BY created_at, seq LIMIT 1;
         IF existing_run_id IS NOT NULL AND existing_run_id<>NEW.id THEN
           RAISE EXCEPTION 'idempotency family is already claimed' USING ERRCODE='23505';
@@ -95,7 +120,11 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
         family_key_value TEXT;
       BEGIN
         IF OLD.idempotency_key IS NULL THEN RETURN OLD; END IF;
-        family_key_value := regexp_replace(OLD.idempotency_key, ':project-[0-9]+$', '');
+        family_key_value := qm_run_idempotency_family(
+          OLD.idempotency_key,
+          OLD.idempotency_family_key,
+          OLD.request
+        );
         PERFORM pg_advisory_xact_lock(hashtext(family_key_value));
         DELETE FROM run_idempotency_families WHERE family_key=family_key_value AND run_id=OLD.id;
         RETURN OLD;
@@ -103,14 +132,6 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
     `DO $$
       BEGIN
         LOCK TABLE runs IN SHARE ROW EXCLUSIVE MODE;
-        IF EXISTS (
-          SELECT 1 FROM run_idempotency_families f
-          LEFT JOIN runs r ON r.id=f.run_id
-          WHERE r.id IS NULL
-             OR regexp_replace(r.idempotency_key, ':project-[0-9]+$', '')<>f.family_key
-        ) THEN
-          RAISE EXCEPTION 'run idempotency family mapping is inconsistent';
-        END IF;
         IF NOT EXISTS (
           SELECT 1 FROM pg_trigger
           WHERE tgrelid='runs'::regclass AND tgname='trg_runs_claim_idempotency_family'
@@ -127,13 +148,14 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
         END IF;
         IF EXISTS (
           SELECT 1 FROM runs WHERE idempotency_key IS NOT NULL
-          GROUP BY regexp_replace(idempotency_key, ':project-[0-9]+$', '')
+          GROUP BY qm_run_idempotency_family(idempotency_key, idempotency_family_key, request)
           HAVING count(*) > 1 AND bool_or(status IN ('pending','running'))
         ) THEN
           RAISE EXCEPTION 'active legacy project idempotency duplicates require reconciliation';
         END IF;
+        DELETE FROM run_idempotency_families;
         INSERT INTO run_idempotency_families(family_key, run_id)
-          SELECT regexp_replace(idempotency_key, ':project-[0-9]+$', ''), id
+          SELECT qm_run_idempotency_family(idempotency_key, idempotency_family_key, request), id
           FROM runs WHERE idempotency_key IS NOT NULL ORDER BY created_at, seq
           ON CONFLICT (family_key) DO NOTHING;
         IF NOT EXISTS (
@@ -262,8 +284,10 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
         let inserted: Record<string, unknown>[] = [];
         try {
           ({ rows: inserted } = await q(
-            `INSERT INTO runs(id, session_id, status, request, idempotency_key, attempts, max_attempts, created_at)
-             VALUES ($1,$2,'pending',$3,$4,0,$5,$6)
+            `INSERT INTO runs(
+               id, session_id, status, request, idempotency_key, idempotency_family_key,
+               attempts, max_attempts, created_at
+             ) VALUES ($1,$2,'pending',$3,$4,$4,0,$5,$6)
              ON CONFLICT (idempotency_key) DO NOTHING RETURNING *`,
             [id, sessionId, JSON.stringify(request), dedupKey ?? null, maxAttempts, Date.now()],
           ));
@@ -271,7 +295,7 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
           if (!dedupKey || !isUniqueViolation(error)) throw error;
         }
         if (inserted[0]) return { run: rowToRun(inserted[0]), deduped: false, conflict: false };
-        const row = dedupKey ? await findFamily(dedupKey.replace(/:project-[0-9]+$/u, "")) : undefined;
+        const row = dedupKey ? await findFamily(dedupKey) : undefined;
         if (!row) throw new Error("idempotency conflict did not resolve to a durable run");
         return {
           run: rowToRun(row),
@@ -293,8 +317,10 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
       }
       try {
         const { rows } = await q(
-          `INSERT INTO runs(id, session_id, status, request, idempotency_key, attempts, max_attempts, created_at)
-           VALUES ($1,$2,'pending',$3,$4,0,$5,$6) RETURNING *`,
+          `INSERT INTO runs(
+             id, session_id, status, request, idempotency_key, idempotency_family_key,
+             attempts, max_attempts, created_at
+           ) VALUES ($1,$2,'pending',$3,$4,$4,0,$5,$6) RETURNING *`,
           [randomUUID(), sessionId, JSON.stringify(request), dedupKey, maxAttempts, Date.now()],
         );
         return { run: rowToRun(rows[0]!), deduped: false, conflict: false };

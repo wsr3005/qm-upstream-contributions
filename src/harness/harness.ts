@@ -61,6 +61,7 @@ export interface HarnessTurnInput {
   attachments?: AttachmentMeta[];
   images?: HarnessImage[];
   model?: string;
+  modelProviderId?: string;
   modelProviderRevision?: number;
   harness?: string;
   thinkingLevel?: string;
