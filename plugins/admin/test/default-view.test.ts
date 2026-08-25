@@ -121,6 +121,17 @@ test("governance posture saves refresh only the saved card", () => {
   assert.match(html, /if \(key === "security-posture" \|\| key === "ambient-policy"\)/);
 });
 
+test("allowed model chip edits immediately enable their save action", () => {
+  assert.match(
+    html,
+    /webuiModelIds = webuiModelIds\.filter[\s\S]*?syncDefault\(\);\s*updateSectionDirty\("webui-models"\)/,
+  );
+  assert.match(
+    html,
+    /addInput\.value = "";[\s\S]*?syncDefault\(\);\s*updateSectionDirty\("webui-models"\)/,
+  );
+});
+
 test("governance presents a scoped effective-state control plane", () => {
   assert.match(html, /class="governance-page-head"/);
   assert.match(html, /id="governance-overview"/);
