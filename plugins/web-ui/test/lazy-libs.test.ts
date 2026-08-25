@@ -43,5 +43,6 @@ test("vite aliases route katex and highlight.js through the lazy facades", () =>
 
 test("the real-library aliases point INTO the packages, never back at the facades", () => {
   assert.match(vite, /find: "katex-real", replacement: here\("node_modules\/katex\/dist\/katex\.mjs"\)/);
+  assert.match(vite, /cpSync\(here\("node_modules\/katex\/dist\/fonts"\), here\("dist-web\/assets\/fonts"\)/);
   assert.match(vite, /find: "hljs-real", replacement: here\("node_modules\/highlight\.js\/lib\/core\.js"\)/);
 });

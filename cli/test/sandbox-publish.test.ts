@@ -43,7 +43,7 @@ const args = process.argv.slice(2);
 fs.appendFileSync(${JSON.stringify(log)}, args.join(" ") + "\\n");
 const joined = args.join(" ");
 if (joined.startsWith("buildx imagetools inspect")) {
-  if (!fs.existsSync(${JSON.stringify(join(dir, "fly-authenticated"))})) process.exit(3);
+  if (args[3].startsWith("registry.fly.io/") && !fs.existsSync(${JSON.stringify(join(dir, "fly-authenticated"))})) process.exit(3);
   console.log("Name: " + args[3] + "\\nMediaType: application/vnd.oci.image.index.v1+json\\nDigest: ${BASE_DIGEST}\\n");
   process.exit(0);
 }
@@ -60,7 +60,8 @@ if (joined.startsWith("image inspect")) {
   process.exit(0);
 }
 if (joined.startsWith("buildx build")) {
-  if (!fs.existsSync(${JSON.stringify(join(dir, "fly-authenticated"))})) process.exit(3);
+  const tag = args[args.indexOf("-t") + 1];
+  if (tag.startsWith("registry.fly.io/") && !fs.existsSync(${JSON.stringify(join(dir, "fly-authenticated"))})) process.exit(3);
   const metadata = args[args.indexOf("--metadata-file") + 1];
   fs.writeFileSync(metadata, JSON.stringify({ "containerimage.digest": "${PUSH_DIGEST}" }));
   fs.appendFileSync(${JSON.stringify(log)}, "DOCKERFILE " + JSON.stringify(fs.readFileSync(args[args.indexOf("--file") + 1], "utf8")) + "\\n");
@@ -149,6 +150,49 @@ test("sandbox publish pins the base, reads the pushed digest, and records the pi
     else process.env.FLY_SANDBOX_API_TOKEN = priorSandboxToken;
     if (priorFlyToken === undefined) delete process.env.FLY_API_TOKEN;
     else process.env.FLY_API_TOKEN = priorFlyToken;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Docker local sandbox publish keeps the configured registry and skips Fly authentication", () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-publish-local-"));
+  const priorPath = process.env.PATH;
+  const log = console.log,
+    warn = console.warn;
+  console.log = (): void => {};
+  console.warn = console.log;
+  try {
+    const configPath = join(dir, CONFIG_FILENAME);
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        contract: 1,
+        orgId: "local-publish",
+        publicUrl: "http://localhost:8080",
+        target: "docker",
+        services: ["core"],
+        sandbox: {
+          app: "local-sandboxes",
+          backend: "local",
+          image: `registry.example.test/qm/sandbox@sha256:${"a".repeat(64)}`,
+        },
+      }),
+    );
+    mkdirSync(join(dir, "sandbox"), { recursive: true });
+    writeFileSync(join(dir, "sandbox", "Dockerfile"), "FROM scratch\n");
+    const dockerLog = fakeDocker(dir);
+    const flyLog = join(dir, "fly.log");
+    process.env.PATH = `${dir}:${priorPath}`;
+    const { config } = loadConfigAt(configPath);
+    const published = runSandboxPublish({ sandboxDir: join(dir, "sandbox"), config, configPath });
+    assert.deepEqual(published, { image: `registry.example.test/qm/sandbox@${PUSH_DIGEST}` });
+    assert.match(readFileSync(dockerLog, "utf8"), /-t registry\.example\.test\/qm\/sandbox:latest/);
+    assert.equal(readFileSync(flyLog, "utf8"), "");
+    assert.equal(loadConfigAt(configPath).config.sandbox?.image, `registry.example.test/qm/sandbox@${PUSH_DIGEST}`);
+  } finally {
+    console.log = log;
+    console.warn = warn;
+    process.env.PATH = priorPath;
     rmSync(dir, { recursive: true, force: true });
   }
 });
