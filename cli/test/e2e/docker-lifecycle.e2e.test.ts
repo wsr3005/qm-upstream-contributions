@@ -163,6 +163,8 @@ test(
       });
 
       await t.test("down --purge removes containers, the network, and the volumes", () => {
+        execFileSync("docker", ["network", "create", "--label", `qm.org=${org}`, `qm-net-${org}-sandbox`]);
+        execFileSync("docker", ["volume", "create", "--label", `qm.org=${org}`, `qm-home-${org}-sandbox`]);
         const r = runCli(["down", "--purge"], { cwd: dep });
         assert.equal(r.code, 0, r.out);
         assert.match(r.out, /purging/);

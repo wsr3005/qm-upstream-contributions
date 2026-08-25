@@ -10,6 +10,29 @@ import {
 import { CliError, errMessage, step, warn } from "../log.ts";
 import { capture, deploymentSecretValue, flyBin, isInvalidSecret, readEnvFile, which } from "../util.ts";
 import { computedSecrets } from "../secrets.ts";
+import { localDockerSocket } from "./docker.ts";
+
+export function manifestIncludesLinuxAmd64(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(manifestIncludesLinuxAmd64);
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  if (
+    (record.os === "linux" && record.architecture === "amd64") ||
+    (record.Os === "linux" && record.Architecture === "amd64")
+  )
+    return true;
+  return Object.values(record).some(manifestIncludesLinuxAmd64);
+}
+
+function requireLinuxAmd64(raw: string, label: string): void {
+  let manifest: unknown;
+  try {
+    manifest = JSON.parse(raw);
+  } catch {
+    throw new CliError(`${label} is not valid JSON`);
+  }
+  if (!manifestIncludesLinuxAmd64(manifest)) throw new CliError(`${label} does not include linux/amd64`);
+}
 
 export function slackManifestBotScopes(manifest: string): string[] {
   try {
@@ -145,6 +168,27 @@ export async function doctorCommon(
   }
   if (config.target === "aws") {
     step("AWS Lambda MicroVM sandbox: configured");
+  } else if (config.sandbox?.backend === "local") {
+    if (!which("docker")) throw new CliError("docker not found on PATH (the local sandbox backend requires Docker)");
+    try {
+      localDockerSocket();
+      capture("docker", ["version", "-f", "{{.Server.Version}}"]);
+      let localImage: string | undefined;
+      try {
+        localImage = capture("docker", ["image", "inspect", "--format", "{{json .}}", config.sandbox.image!]);
+      } catch {
+        localImage = undefined;
+      }
+      if (localImage !== undefined) {
+        requireLinuxAmd64(localImage, `local image ${config.sandbox.image}`);
+      } else {
+        const raw = capture("docker", ["manifest", "inspect", "--verbose", config.sandbox.image!]);
+        requireLinuxAmd64(raw, `registry manifest for ${config.sandbox.image}`);
+      }
+    } catch (e) {
+      throw new CliError(`Docker local sandbox is unavailable: ${errMessage(e)}`);
+    }
+    step(`Docker local sandbox image ${config.sandbox.image}: ok`);
   } else if (config.sandbox?.app) {
     requireFlyAuth();
     try {

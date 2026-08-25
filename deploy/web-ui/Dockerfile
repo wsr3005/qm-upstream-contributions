@@ -6,6 +6,7 @@ COPY plugins/web-ui/package.json plugins/web-ui/package-lock.json ./
 RUN npm ci
 COPY plugins/web-ui/index.html plugins/web-ui/vite.config.ts plugins/web-ui/tsconfig.json ./
 COPY plugins/web-ui/src ./src
+COPY plugins/web-ui/scripts ./scripts
 COPY plugins/chassis/src /chassis/src
 RUN npm run build
 
