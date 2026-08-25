@@ -439,3 +439,33 @@ test("workers reject historical custom model runs without Provider bindings", as
     await built.runtime.stop();
   }
 });
+
+test("non-Web custom model turns persist Provider bindings before enqueue", async () => {
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "custom-provider-dingtalk-bound-")) }));
+  await built.customProviders.upsert(
+    {
+      id: "dingtalk-gateway",
+      name: "DingTalk Gateway",
+      protocol: "openai",
+      baseUrl: "https://dingtalk.example.com/v1",
+      models: [{ id: "dingtalk-model" }],
+    },
+    "sk-dingtalk",
+    "admin-alice@default-org",
+  );
+  const revision = (await built.customProviders.statuses())[0]!.revision;
+  const queued = await built.app.turn({
+    surface: "dingtalk",
+    actor: { externalId: "alice" },
+    conversation: { kind: "dm", threadRef: "dingtalk:alice:custom-provider-bound" },
+    text: "hello",
+    model: "dingtalk-model",
+    async: true,
+  });
+  assert.equal(queued.status, "queued");
+  if (queued.status !== "queued") return;
+  assert.ok(queued.runId);
+  const run = await built.runs.get(queued.runId);
+  assert.equal(run?.request.modelProviderId, "dingtalk-gateway");
+  assert.equal(run?.request.modelProviderRevision, revision);
+});

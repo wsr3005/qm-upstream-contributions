@@ -67,6 +67,9 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
         family_key TEXT PRIMARY KEY,
         run_id TEXT UNIQUE NOT NULL REFERENCES runs(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
       )`,
+    `CREATE TABLE IF NOT EXISTS run_idempotency_family_schema(
+        version INT PRIMARY KEY CHECK(version=1)
+      )`,
     `CREATE OR REPLACE FUNCTION qm_run_idempotency_family(
         idempotency_key_value TEXT,
         explicit_family_key TEXT,
@@ -146,18 +149,40 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
           CREATE TRIGGER trg_runs_release_idempotency_family AFTER DELETE ON runs
             FOR EACH ROW EXECUTE FUNCTION qm_release_run_idempotency_family();
         END IF;
-        IF EXISTS (
-          SELECT 1 FROM runs WHERE idempotency_key IS NOT NULL
-          GROUP BY qm_run_idempotency_family(idempotency_key, idempotency_family_key, request)
-          HAVING count(*) > 1 AND bool_or(status IN ('pending','running'))
-        ) THEN
-          RAISE EXCEPTION 'active legacy project idempotency duplicates require reconciliation';
+        IF EXISTS (SELECT 1 FROM run_idempotency_family_schema WHERE version=1) THEN
+          IF EXISTS (
+            SELECT 1 FROM run_idempotency_families f
+            LEFT JOIN runs r ON r.id=f.run_id
+            WHERE r.id IS NULL
+               OR qm_run_idempotency_family(r.idempotency_key, r.idempotency_family_key, r.request)<>f.family_key
+          ) OR EXISTS (
+            SELECT 1 FROM (
+              SELECT
+                qm_run_idempotency_family(idempotency_key, idempotency_family_key, request) AS family_key,
+                (array_agg(id ORDER BY created_at, seq))[1] AS expected_run_id
+              FROM runs WHERE idempotency_key IS NOT NULL
+              GROUP BY qm_run_idempotency_family(idempotency_key, idempotency_family_key, request)
+            ) expected
+            LEFT JOIN run_idempotency_families f ON f.family_key=expected.family_key
+            WHERE f.run_id IS DISTINCT FROM expected.expected_run_id
+          ) THEN
+            RAISE EXCEPTION 'run idempotency family mapping is inconsistent';
+          END IF;
+        ELSE
+          IF EXISTS (
+            SELECT 1 FROM runs WHERE idempotency_key IS NOT NULL
+            GROUP BY qm_run_idempotency_family(idempotency_key, idempotency_family_key, request)
+            HAVING count(*) > 1 AND bool_or(status IN ('pending','running'))
+          ) THEN
+            RAISE EXCEPTION 'active legacy project idempotency duplicates require reconciliation';
+          END IF;
+          DELETE FROM run_idempotency_families;
+          INSERT INTO run_idempotency_families(family_key, run_id)
+            SELECT qm_run_idempotency_family(idempotency_key, idempotency_family_key, request), id
+            FROM runs WHERE idempotency_key IS NOT NULL ORDER BY created_at, seq
+            ON CONFLICT (family_key) DO NOTHING;
+          INSERT INTO run_idempotency_family_schema(version) VALUES (1);
         END IF;
-        DELETE FROM run_idempotency_families;
-        INSERT INTO run_idempotency_families(family_key, run_id)
-          SELECT qm_run_idempotency_family(idempotency_key, idempotency_family_key, request), id
-          FROM runs WHERE idempotency_key IS NOT NULL ORDER BY created_at, seq
-          ON CONFLICT (family_key) DO NOTHING;
         IF NOT EXISTS (
           SELECT 1 FROM pg_constraint
           WHERE conrelid='run_idempotency_families'::regclass

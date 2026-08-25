@@ -13,7 +13,7 @@ before(async () => {
   const pg = (await import("pg")).default;
   const p = new pg.Pool({ connectionString: URL });
   await p.query(
-    "DROP TABLE IF EXISTS sessions, session_entries, participants, session_leases, session_tape, session_llm_requests, runs, tool_calls, run_idempotency_families CASCADE",
+    "DROP TABLE IF EXISTS sessions, session_entries, participants, session_leases, session_tape, session_llm_requests, runs, tool_calls, run_idempotency_families, run_idempotency_family_schema CASCADE",
   );
   await p.end();
 });
@@ -1583,6 +1583,7 @@ test("pg run store readiness rejects active duplicates written while migration w
     await raw.query("DROP TRIGGER IF EXISTS trg_runs_claim_idempotency_family ON runs");
     await raw.query("DROP TRIGGER IF EXISTS trg_runs_release_idempotency_family ON runs");
     await raw.query("DELETE FROM run_idempotency_families");
+    await raw.query("DELETE FROM run_idempotency_family_schema");
     await writer.query("BEGIN");
     await writer.query(
       `INSERT INTO runs(id, session_id, status, request, idempotency_key, attempts, max_attempts, created_at)
@@ -1615,6 +1616,32 @@ test("pg run store readiness rejects active duplicates written while migration w
     const repaired = createPostgresRunStore(URL!);
     await repaired.ready();
     await repaired.close();
+    await raw.end();
+  }
+});
+
+test("pg run store readiness rejects a corrupted migrated family mapping", { skip }, async () => {
+  const first = createPostgresRunStore(URL!);
+  await first.ready();
+  const inserted = await first.runs.enqueue({
+    sessionId: "mapping-corruption",
+    request: turn("mapping corruption"),
+    dedupKey: "mapping-corruption-key",
+  });
+  await first.close();
+  const pg = (await import("pg")).default;
+  const raw = new pg.Pool({ connectionString: URL });
+  try {
+    await raw.query("DELETE FROM run_idempotency_families WHERE run_id=$1", [inserted.run.id]);
+    const corrupted = createPostgresRunStore(URL!);
+    await assert.rejects(corrupted.ready(), /run idempotency family mapping is inconsistent/);
+    await corrupted.close().catch(() => undefined);
+    await raw.query("DELETE FROM run_idempotency_family_schema");
+    const repaired = createPostgresRunStore(URL!);
+    await repaired.ready();
+    await repaired.close();
+  } finally {
+    await raw.query("DELETE FROM runs WHERE session_id='mapping-corruption'");
     await raw.end();
   }
 });

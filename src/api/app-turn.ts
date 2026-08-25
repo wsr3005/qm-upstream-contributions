@@ -240,6 +240,49 @@ export function createTurnMethods(
           webTurnRuntimeModelRefusal(runtime.modelId, orgRuntime.modelId, configuredWebuiModels);
         if (invalidModelOption) return { status: "refused", reason: invalidModelOption };
       }
+      if (req.surface !== "web") {
+        const fallbackHarness = isHarnessId(deps.harnessId) ? deps.harnessId : "pi";
+        const runtimeFallback = deps.runtimeFallback ?? {
+          harnessId: fallbackHarness,
+          modelId: defaultModelForHarness(fallbackHarness),
+        };
+        let runtime;
+        try {
+          runtime = await resolveRuntimeChoiceDurable(
+            deps.config,
+            orgRuntimeScope,
+            turnRuntimeScope,
+            runtimeFallback,
+            {
+              ...(req.harness && isHarnessId(req.harness) ? { harnessId: req.harness } : {}),
+              ...(req.model ? { modelId: req.model } : {}),
+            },
+          );
+        } catch (error) {
+          return { status: "refused", reason: errMessage(error) };
+        }
+        const providerId = resolveModel(runtime.modelId)?.provider;
+        const active = providerId && deps.customProviders ? await deps.customProviders.resolveActive(String(providerId)) : null;
+        if (active) {
+          modelProviderBinding = { providerId: String(providerId), revision: active.revision };
+          if (
+            req.modelProviderRevision !== undefined &&
+            (req.modelProviderId !== providerId ||
+              active.revision !== req.modelProviderRevision ||
+              !active.provider.models.some((candidate) => candidate.id === runtime.modelId))
+          ) {
+            return {
+              status: "refused",
+              reason: "custom model provider changed; refresh the model configuration and retry",
+            };
+          }
+        } else if (req.modelProviderRevision !== undefined) {
+          return {
+            status: "refused",
+            reason: "custom model provider changed; refresh the model configuration and retry",
+          };
+        }
+      }
 
       const rawAudience = req.conversation.audience ?? [req.actor];
       const audience: Principal[] =
