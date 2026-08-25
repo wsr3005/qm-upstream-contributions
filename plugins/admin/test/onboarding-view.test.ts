@@ -34,8 +34,32 @@ function renderCustomProviderTestResult(data: object, target: object): string {
   return vm.runInContext(`${src}\ncustomProviderTestResultText(data, target);`, context);
 }
 
+function onboardingProviderStatus(
+  provider: string,
+  builtIn: object[],
+  custom: object[],
+  ready = true,
+): { provider: string; configured: boolean; source: string } | undefined {
+  const src = slice("function onboardingStatusForProvider(", "function renderOnboardingProviderOptions");
+  const context = vm.createContext({
+    provider,
+    onboardingModelStatuses: builtIn,
+    onboardingCustomProviderStatuses: custom,
+    onboardingCustomProvidersReady: ready,
+  });
+  const status = vm.runInContext(`${src}\nonboardingStatusForProvider(provider);`, context);
+  return status ? JSON.parse(JSON.stringify(status)) : undefined;
+}
+
+function onboardingModelProvider(modelId: string, models: object, custom: object[]): string {
+  const src = slice("function onboardingProviderForModel(", "function onboardingStatusForProvider");
+  const context = vm.createContext({ modelId, onboardingModels: models, onboardingCustomProviderStatuses: custom });
+  return vm.runInContext(`${src}\nonboardingProviderForModel(modelId);`, context);
+}
+
 type ApiResponse = { ok: boolean; status?: number; data?: Record<string, unknown> };
 type ApiHandler = (method: string, path: string, body?: unknown) => Promise<ApiResponse>;
+type OnboardingOutcome = { committed: boolean; customProvidersLoaded: boolean };
 
 const TEST_MODEL_EVIDENCE = {
   requestedModel: "gpt-5.6-luna",
@@ -161,6 +185,10 @@ function createCustomProviderUi(
   initialApi: ApiHandler,
   retryStorage = new Map<string, string>(),
   storageFailure: { get?: boolean; remove?: boolean; set?: boolean } = {},
+  reloadOnboarding: (customProviderSnapshot?: unknown) => Promise<OnboardingOutcome> = async () => ({
+    committed: true,
+    customProvidersLoaded: true,
+  }),
 ) {
   const elements = new Map<string, FakeElement>();
   const element = (id: string, tagName = "div") => {
@@ -215,6 +243,17 @@ function createCustomProviderUi(
         retryStorage.set(key, value);
       },
     },
+    loadOnboarding: reloadOnboarding,
+    renderOnboardingModelUnavailable: () => {
+      element("onboarding-model-badge").textContent = "Unknown";
+      element("onboarding-model-summary").textContent = "Model readiness could not be confirmed. Try again.";
+    },
+    setOnboardingModelStatus: (_owner: string, message: string, kind: string, sticky = false) => {
+      const target = element("st-onboarding-model");
+      target.textContent = message;
+      target.className = "status " + (kind || "");
+      statuses.push({ id: "st-onboarding-model", message, kind, sticky });
+    },
     orgScope: () => "org:acme",
     clearTimeout: (id: number) => timers.delete(id),
     setTimeout: (callback: () => void) => {
@@ -237,7 +276,9 @@ function createCustomProviderUi(
     });`,
     context,
   ) as {
-    loadCustomProviders(): Promise<boolean>;
+    loadCustomProviders(): Promise<
+      false | { status: "loaded" | "superseded"; generation: number; providers: object[] }
+    >;
     runTest(): Promise<void>;
     saveProvider(): Promise<void>;
   };
@@ -259,6 +300,8 @@ function createCustomProviderUi(
     providerStatus: element("st-custom-provider"),
     testStatus: element("st-custom-provider-test"),
     providerRows: element("custom-provider-rows"),
+    onboardingBadge: element("onboarding-model-badge"),
+    onboardingSummary: element("onboarding-model-summary"),
     retryStorage,
     statuses,
     fireTimers() {
@@ -281,20 +324,285 @@ function createCustomProviderUi(
 
 async function onboardingCustomProviderLoadsWhenSetupFails(apiHandler: ApiHandler): Promise<number> {
   let customProviderLoads = 0;
-  const source = slice("async function loadOnboarding() {", '$("onboarding-model-provider").onchange');
+  const source = slice("async function loadOnboarding(", '$("onboarding-model-provider").onchange');
   const context = vm.createContext({
     api: apiHandler,
     encodeURIComponent,
     loadCustomProviders: async () => {
       customProviderLoads += 1;
-      return true;
+      return { generation: 0, providers: [] };
     },
+    customProvidersLoad: 0,
+    onboardingLoad: 0,
     orgScope: () => "org:acme",
+    renderOnboardingModelUnavailable: () => undefined,
     renderOnboardingProviderOptions: () => undefined,
+    setOnboardingModelStatus: () => undefined,
+    clearOnboardingLoaderStatus: () => undefined,
     setStatus: () => undefined,
   });
   await (vm.runInContext(`${source}\nloadOnboarding();`, context) as Promise<void>);
   return customProviderLoads;
+}
+
+async function onboardingLatestLoadWins(customProviderSnapshot: object | null = null): Promise<{
+  summary: string;
+  customProviderLoads: number;
+}> {
+  const elements = new Map<string, FakeElement>();
+  const element = (id: string) => {
+    if (!elements.has(id)) elements.set(id, fakeElement());
+    return elements.get(id)!;
+  };
+  const pending = [0, 1].map(() => new Map<string, (value: ApiResponse) => void>());
+  let wave = -1;
+  let customProviderLoads = 0;
+  const api = (_method: string, path: string) => {
+    if (path === "/api/model-providers") wave += 1;
+    const current = wave;
+    return new Promise<ApiResponse>((resolve) => pending[current]!.set(path, resolve));
+  };
+  const source = slice("async function loadOnboarding(", '$("onboarding-model-provider").onchange');
+  const context = vm.createContext({
+    $: element,
+    api,
+    encodeURIComponent,
+    loadCustomProviders: async () => {
+      customProviderLoads += 1;
+      return { generation: 0, providers: [] };
+    },
+    customProvidersLoad: 0,
+    orgScope: () => "org:acme",
+    onboardingLoad: 0,
+    onboardingModelStatuses: [],
+    onboardingModels: {},
+    onboardingProviderForModel: () => "openai",
+    onboardingStatusForProvider: () => ({ configured: true, source: "admin" }),
+    onboardingBadge: () => undefined,
+    renderOnboardingProviderOptions: () => undefined,
+    renderOnboardingModelOptions: () => undefined,
+    setOnboardingModelStatus: () => undefined,
+    clearOnboardingLoaderStatus: () => undefined,
+    setStatus: () => undefined,
+    connectorName: (provider: string) => provider,
+    MODEL_PROVIDER_LABELS: { openai: "OpenAI" },
+    viewLoadedAt: {},
+  });
+  const loadOnboarding = vm.runInContext(`${source}\nloadOnboarding;`, context) as (
+    customProviderSnapshot?: object | null,
+  ) => Promise<void>;
+  const first = loadOnboarding(customProviderSnapshot);
+  const second = loadOnboarding(customProviderSnapshot);
+  const resolveWave = (index: number, baseModel: string) => {
+    pending[index]!.get("/api/model-providers")!({ ok: true, data: { providers: [], models: [] } });
+    pending[index]!.get("/api/slack-installation")!({ ok: true, data: { configured: false } });
+    pending[index]!.get("/api/connector-catalog")!({ ok: true, data: { catalog: [] } });
+    pending[index]!.get("/api/scopes/org%3Aacme")!({ ok: true, data: { baseModel } });
+  };
+  resolveWave(1, "new-model");
+  await second;
+  resolveWave(0, "old-model");
+  await first;
+  return { summary: element("onboarding-model-summary").textContent, customProviderLoads };
+}
+
+async function onboardingReplacesStaleCustomProviderSnapshot(): Promise<{
+  summary: string;
+  customProviderLoads: number;
+}> {
+  const elements = new Map<string, FakeElement>();
+  const element = (id: string) => {
+    if (!elements.has(id)) elements.set(id, fakeElement());
+    return elements.get(id)!;
+  };
+  let customProviderLoads = 0;
+  const source = slice("async function loadOnboarding(", '$("onboarding-model-provider").onchange');
+  const context = vm.createContext({
+    $: element,
+    api: async (_method: string, path: string): Promise<ApiResponse> => {
+      if (path === "/api/model-providers") return { ok: true, data: { providers: [], models: [] } };
+      if (path === "/api/slack-installation") return { ok: true, data: { configured: false } };
+      if (path === "/api/connector-catalog") return { ok: true, data: { catalog: [] } };
+      return { ok: true, data: { baseModel: "luna" } };
+    },
+    encodeURIComponent,
+    loadCustomProviders: async () => {
+      customProviderLoads += 1;
+      if (customProviderLoads === 1) {
+        context.customProvidersLoad += 2;
+        return false;
+      }
+      context.customProvidersLoad += 1;
+      return Object.freeze({
+        generation: context.customProvidersLoad,
+        providers: Object.freeze([{ ...customProvider(2), published: true, disabled: true }]),
+      });
+    },
+    orgScope: () => "org:acme",
+    onboardingLoad: 0,
+    onboardingModelStatuses: [],
+    onboardingModels: {},
+    onboardingProviderForModel: (_modelId: string, statuses: Array<Record<string, unknown>>) => statuses[0]?.id || "",
+    onboardingStatusForProvider: (provider: string, statuses: Array<Record<string, unknown>>, ready: boolean) => {
+      const status = statuses.find((item) => item.id === provider);
+      return status
+        ? {
+            configured: Boolean(ready && status.hasKey && status.published && !status.disabled),
+            source: "admin",
+          }
+        : undefined;
+    },
+    onboardingBadge: () => undefined,
+    renderOnboardingProviderOptions: () => undefined,
+    renderOnboardingModelOptions: () => undefined,
+    setOnboardingModelStatus: () => undefined,
+    clearOnboardingLoaderStatus: () => undefined,
+    setStatus: () => undefined,
+    connectorName: (provider: string) => provider,
+    MODEL_PROVIDER_LABELS: {},
+    viewLoadedAt: {},
+    customProvidersLoad: 2,
+  });
+  const loadOnboarding = vm.runInContext(`${source}\nloadOnboarding;`, context) as (
+    customProviderSnapshot: object,
+  ) => Promise<void>;
+  const staleReadySnapshot = Object.freeze({
+    generation: 1,
+    providers: Object.freeze([{ ...customProvider(1), published: true, disabled: false }]),
+  });
+  await loadOnboarding(staleReadySnapshot);
+  return { summary: element("onboarding-model-summary").textContent, customProviderLoads };
+}
+
+async function onboardingSetupFailureClearsReady(
+  throws: boolean,
+  staleCustomProviderSnapshot = false,
+): Promise<{
+  badge: string;
+  summary: string;
+  outcome: OnboardingOutcome;
+}> {
+  const elements = new Map<string, FakeElement>();
+  const element = (id: string) => {
+    if (!elements.has(id)) elements.set(id, fakeElement());
+    return elements.get(id)!;
+  };
+  element("onboarding-model-badge").textContent = "Ready";
+  element("onboarding-model-summary").textContent = "luna · admin-managed key";
+  const unavailableSource = slice(
+    "function renderOnboardingModelUnavailable() {",
+    "function onboardingProviderForModel",
+  );
+  const onboardingSource = slice("async function loadOnboarding(", '$("onboarding-model-provider").onchange');
+  const context = vm.createContext({
+    $: element,
+    api: async (_method: string, path: string): Promise<ApiResponse> => {
+      if (path === "/api/slack-installation") {
+        if (throws) throw new Error("offline");
+        return { ok: false, data: {} };
+      }
+      return { ok: true, data: {} };
+    },
+    encodeURIComponent,
+    loadCustomProviders: async () => {
+      context.customProvidersLoad += 1;
+      return false;
+    },
+    orgScope: () => "org:acme",
+    onboardingLoad: 0,
+    onboardingModelStatuses: [{ provider: "openai", configured: true }],
+    onboardingModels: { openai: [{ id: "luna" }] },
+    onboardingBadge: (id: string, text: string) => {
+      element(id).textContent = text;
+    },
+    renderOnboardingProviderOptions: () => undefined,
+    setOnboardingModelStatus: () => undefined,
+    clearOnboardingLoaderStatus: () => undefined,
+    setStatus: () => undefined,
+    customProvidersLoad: staleCustomProviderSnapshot ? 2 : 1,
+  });
+  const loadOnboarding = vm.runInContext(`${unavailableSource}\n${onboardingSource}\nloadOnboarding;`, context) as (
+    customProviderSnapshot: object,
+  ) => Promise<OnboardingOutcome>;
+  const outcome = await loadOnboarding({ generation: 1, providers: [] });
+  return {
+    badge: element("onboarding-model-badge").textContent,
+    summary: element("onboarding-model-summary").textContent,
+    outcome: JSON.parse(JSON.stringify(outcome)),
+  };
+}
+
+async function onboardingLoaderErrorClearsAfterRecovery(): Promise<{
+  badge: string;
+  status: string;
+  concurrentActionStatus: string;
+}> {
+  const elements = new Map<string, FakeElement>();
+  const element = (id: string) => {
+    if (!elements.has(id)) elements.set(id, fakeElement());
+    return elements.get(id)!;
+  };
+  let fails = true;
+  let statusOwner: string | null = null;
+  const unavailableSource = slice(
+    "function renderOnboardingModelUnavailable() {",
+    "function onboardingProviderForModel",
+  );
+  const onboardingSource = slice("async function loadOnboarding(", '$("onboarding-model-provider").onchange');
+  const context = vm.createContext({
+    $: element,
+    api: async (_method: string, path: string): Promise<ApiResponse> => {
+      if (fails && path === "/api/slack-installation") return { ok: false, data: {} };
+      if (path === "/api/model-providers") return { ok: true, data: { providers: [], models: [] } };
+      if (path === "/api/slack-installation") return { ok: true, data: { configured: false } };
+      if (path === "/api/connector-catalog") return { ok: true, data: { catalog: [] } };
+      return { ok: true, data: { baseModel: "luna" } };
+    },
+    encodeURIComponent,
+    loadCustomProviders: async () => ({ generation: 1, providers: [] }),
+    orgScope: () => "org:acme",
+    onboardingLoad: 0,
+    onboardingModelStatuses: [],
+    onboardingModels: {},
+    onboardingProviderForModel: () => "gateway",
+    onboardingStatusForProvider: () => ({ configured: true, source: "admin" }),
+    onboardingBadge: (id: string, text: string) => {
+      element(id).textContent = text;
+    },
+    renderOnboardingProviderOptions: () => undefined,
+    renderOnboardingModelOptions: () => undefined,
+    setOnboardingModelStatus: (owner: string, message: string) => {
+      statusOwner = owner;
+      element("st-onboarding-model").textContent = message;
+    },
+    clearOnboardingLoaderStatus: () => {
+      if (statusOwner !== "loader") return;
+      statusOwner = null;
+      element("st-onboarding-model").textContent = "";
+    },
+    setStatus: (id: string, message: string) => {
+      element(id).textContent = message;
+    },
+    connectorName: (provider: string) => provider,
+    MODEL_PROVIDER_LABELS: {},
+    viewLoadedAt: {},
+    customProvidersLoad: 1,
+  });
+  const loadOnboarding = vm.runInContext(`${unavailableSource}\n${onboardingSource}\nloadOnboarding;`, context) as (
+    customProviderSnapshot: object,
+  ) => Promise<OnboardingOutcome>;
+  await loadOnboarding({ generation: 1, providers: [] });
+  assert.equal(element("st-onboarding-model").textContent, "Setup status could not be loaded. Try again.");
+  fails = false;
+  await loadOnboarding({ generation: 1, providers: [] });
+  const status = element("st-onboarding-model").textContent;
+  context.setOnboardingModelStatus("action", "Validating with gateway…");
+  await loadOnboarding({ generation: 1, providers: [] });
+  return {
+    badge: element("onboarding-model-badge").textContent,
+    status,
+    concurrentActionStatus: element("st-onboarding-model").textContent,
+  };
 }
 
 test("onboarding is a navigable view", () => {
@@ -311,6 +619,58 @@ test("?view=onboarding resolves to the onboarding view", () => {
 
 test("unknown views still fall back to the default view", () => {
   assert.equal(resolveView("/admin/no-such-view", ""), "history");
+});
+
+test("onboarding treats a keyed custom base model provider as ready", () => {
+  assert.deepEqual(
+    onboardingProviderStatus(
+      "enterprise-responses",
+      [],
+      [{ id: "enterprise-responses", hasKey: true, published: true, disabled: false, testable: true }],
+    ),
+    { provider: "enterprise-responses", configured: true, source: "admin" },
+  );
+});
+
+test("onboarding keeps a keyless custom base model provider not ready", () => {
+  assert.deepEqual(
+    onboardingProviderStatus(
+      "enterprise-responses",
+      [],
+      [{ id: "enterprise-responses", hasKey: false, published: true, disabled: false, testable: true }],
+    ),
+    { provider: "enterprise-responses", configured: false, source: "admin" },
+  );
+});
+
+test("onboarding preserves built-in provider credential status", () => {
+  const builtIn = { provider: "openai", configured: true, source: "environment" };
+  assert.deepEqual(onboardingProviderStatus("openai", [builtIn], [{ id: "openai", hasKey: false }]), builtIn);
+});
+
+test("onboarding keeps staged and disabled custom providers not ready", () => {
+  const staged = { id: "enterprise-responses", hasKey: true, published: false, disabled: false, testable: true };
+  const disabled = { id: "enterprise-responses", hasKey: true, published: true, disabled: true, testable: true };
+  assert.equal(onboardingProviderStatus("enterprise-responses", [], [staged])?.configured, false);
+  assert.equal(onboardingProviderStatus("enterprise-responses", [], [disabled])?.configured, false);
+});
+
+test("onboarding fails closed when custom provider status loading fails", () => {
+  const stale = { id: "enterprise-responses", hasKey: true, published: true, disabled: false, testable: true };
+  assert.equal(onboardingProviderStatus("enterprise-responses", [], [stale], false)?.configured, false);
+});
+
+test("onboarding resolves a saved custom model owner outside the selectable catalog", () => {
+  assert.equal(
+    onboardingModelProvider("enterprise-responses/gpt-5.6-luna", {}, [
+      { id: "enterprise-responses", models: [{ id: "enterprise-responses/gpt-5.6-luna" }] },
+    ]),
+    "enterprise-responses",
+  );
+});
+
+test("onboarding does not attribute an unknown base model to a configured built-in provider", () => {
+  assert.equal(onboardingModelProvider("enterprise-responses/gpt-5.6-luna", {}, []), "");
 });
 
 test("custom provider setup exposes an explicit paid generation test", () => {
@@ -371,6 +731,50 @@ test("custom providers load once when an unrelated onboarding request fails", as
     return { ok: true, data: {} };
   });
   assert.equal(networkFailureLoads, 1);
+});
+
+test("a stale onboarding request cannot overwrite a newer render", async () => {
+  assert.equal((await onboardingLatestLoadWins()).summary, "new-model · admin-managed key");
+});
+
+test("a mutation readiness refresh reuses the successful custom provider snapshot", async () => {
+  const result = await onboardingLatestLoadWins({ generation: 0, providers: [] });
+  assert.equal(result.summary, "new-model · admin-managed key");
+  assert.equal(result.customProviderLoads, 0);
+});
+
+test("a stale mutation snapshot is replaced before onboarding commits its badge", async () => {
+  const result = await onboardingReplacesStaleCustomProviderSnapshot();
+  assert.equal(result.customProviderLoads, 2);
+  assert.equal(result.summary, "luna cannot run until its gateway key is configured.");
+});
+
+test("onboarding clears a previous Ready state when setup throws", async () => {
+  const result = await onboardingSetupFailureClearsReady(true);
+  assert.equal(result.badge, "Unknown");
+  assert.equal(result.summary, "Model readiness could not be confirmed. Try again.");
+  assert.deepEqual(result.outcome, { committed: true, customProvidersLoaded: true });
+});
+
+test("onboarding clears a previous Ready state when setup returns a failure", async () => {
+  const result = await onboardingSetupFailureClearsReady(false);
+  assert.equal(result.badge, "Unknown");
+  assert.equal(result.summary, "Model readiness could not be confirmed. Try again.");
+  assert.deepEqual(result.outcome, { committed: true, customProvidersLoaded: true });
+});
+
+test("onboarding setup failure still resolves a stale provider snapshot to its current failure", async () => {
+  const result = await onboardingSetupFailureClearsReady(true, true);
+  assert.equal(result.badge, "Unknown");
+  assert.equal(result.summary, "Model readiness could not be confirmed. Try again.");
+  assert.deepEqual(result.outcome, { committed: true, customProvidersLoaded: false });
+});
+
+test("onboarding clears its loader error after a current successful recovery", async () => {
+  const result = await onboardingLoaderErrorClearsAfterRecovery();
+  assert.equal(result.badge, "Ready");
+  assert.equal(result.status, "");
+  assert.equal(result.concurrentActionStatus, "Validating with gateway…");
 });
 
 test("custom provider paid test stays locked across refresh and rejects a duplicate run", async () => {
@@ -458,7 +862,11 @@ test("custom provider load errors clear after a successful refresh", async () =>
   assert.equal(await harness.ui.loadCustomProviders(), false);
   assert.equal(harness.providerStatus.textContent, "temporary failure");
   fails = false;
-  assert.equal(await harness.ui.loadCustomProviders(), true);
+  assert.deepEqual(JSON.parse(JSON.stringify(await harness.ui.loadCustomProviders())), {
+    status: "loaded",
+    generation: 2,
+    providers: [{ ...customProvider(1), verifiedTargets: [] }],
+  });
   assert.equal(harness.providerStatus.textContent, "");
   assert.equal(harness.testButton.disabled, false);
 });
@@ -473,6 +881,8 @@ test("custom provider save does not overwrite a failed refresh with a success", 
     return { ok: false, data: { message: "refresh failed" } };
   });
   harness.setProviderForm();
+  harness.onboardingBadge.textContent = "Ready";
+  harness.onboardingSummary.textContent = "luna · admin-managed key";
 
   await harness.ui.saveProvider();
 
@@ -486,8 +896,13 @@ test("custom provider save does not overwrite a failed refresh with a success", 
       inputModalities: ["text", "image"],
     },
   ]);
-  assert.equal(harness.providerStatus.textContent, "refresh failed");
+  assert.equal(
+    harness.providerStatus.textContent,
+    "Provider saved, but its current status could not be refreshed. Try again.",
+  );
   assert.equal(harness.providerStatus.className, "status err");
+  assert.equal(harness.onboardingBadge.textContent, "Unknown");
+  assert.equal(harness.onboardingSummary.textContent, "Model readiness could not be confirmed. Try again.");
 });
 
 test("custom provider removal does not overwrite a failed refresh with a success", async () => {
@@ -500,6 +915,8 @@ test("custom provider removal does not overwrite a failed refresh with a success
       : { ok: false, data: { message: "refresh failed" } };
   });
   await harness.ui.loadCustomProviders();
+  harness.onboardingBadge.textContent = "Ready";
+  harness.onboardingSummary.textContent = "luna · admin-managed key";
   const row = harness.providerRows.children[0];
   const actions = row?.children.at(-1);
   const remove = actions?.children.at(-1);
@@ -507,7 +924,176 @@ test("custom provider removal does not overwrite a failed refresh with a success
 
   await remove.onclick();
 
-  assert.equal(harness.providerStatus.textContent, "refresh failed");
+  assert.equal(
+    harness.providerStatus.textContent,
+    "Provider removed, but its current status could not be refreshed. Try again.",
+  );
+  assert.equal(harness.providerStatus.className, "status err");
+  assert.equal(harness.onboardingBadge.textContent, "Unknown");
+  assert.equal(harness.onboardingSummary.textContent, "Model readiness could not be confirmed. Try again.");
+});
+
+test("a superseded mutation refresh converges instead of replacing newer Ready with Unknown", async () => {
+  let listingCalls = 0;
+  let resolveMutationRefresh!: (response: ApiResponse) => void;
+  let markMutationRefreshStarted!: () => void;
+  const mutationRefresh = new Promise<ApiResponse>((resolve) => {
+    resolveMutationRefresh = resolve;
+  });
+  const mutationRefreshStarted = new Promise<void>((resolve) => {
+    markMutationRefreshStarted = resolve;
+  });
+  let onboardingReloads = 0;
+  const listing = { ok: true, data: { providers: [customProvider(1)] } };
+  const harness = createCustomProviderUi(
+    async (method) => {
+      if (method === "DELETE") return { ok: true, data: {} };
+      listingCalls += 1;
+      if (listingCalls === 2) {
+        markMutationRefreshStarted();
+        return mutationRefresh;
+      }
+      return listing;
+    },
+    new Map(),
+    {},
+    async () => {
+      onboardingReloads += 1;
+      return { committed: true, customProvidersLoaded: true };
+    },
+  );
+  await harness.ui.loadCustomProviders();
+  harness.onboardingBadge.textContent = "Ready";
+  harness.onboardingSummary.textContent = "luna · admin-managed key";
+  const remove = harness.providerRows.children[0]?.children.at(-1)?.children.at(-1)?.onclick?.();
+  await mutationRefreshStarted;
+  await harness.ui.loadCustomProviders();
+  resolveMutationRefresh(listing);
+  await remove;
+
+  assert.equal(onboardingReloads, 1);
+  assert.equal(harness.providerStatus.textContent, "Provider removed.");
+  assert.equal(harness.onboardingBadge.textContent, "Ready");
+  assert.equal(harness.onboardingSummary.textContent, "luna · admin-managed key");
+});
+
+test("custom provider publish exposes an immediate refresh failure and clears Ready", async () => {
+  let listingCalls = 0;
+  const provider = {
+    ...customProvider(1),
+    published: false,
+    verifiedTargets: ["pi", "opencode", "codex"].map((harnessId) => ({
+      modelId: "luna",
+      harnessId,
+      revision: 1,
+    })),
+  };
+  const harness = createCustomProviderUi(async (method) => {
+    if (method === "POST") return { ok: true, data: {} };
+    listingCalls += 1;
+    return listingCalls === 1
+      ? { ok: true, data: { providers: [provider] } }
+      : { ok: false, data: { message: "refresh failed" } };
+  });
+  await harness.ui.loadCustomProviders();
+  harness.onboardingBadge.textContent = "Ready";
+  harness.onboardingSummary.textContent = "luna · admin-managed key";
+
+  await harness.providerRows.children[0]?.children.at(-1)?.children[1]?.onclick?.();
+
+  assert.equal(
+    harness.providerStatus.textContent,
+    "Provider opened, but its current status could not be refreshed. Try again.",
+  );
+  assert.equal(harness.providerStatus.className, "status err");
+  assert.equal(harness.onboardingBadge.textContent, "Unknown");
+  assert.equal(harness.onboardingSummary.textContent, "Model readiness could not be confirmed. Try again.");
+});
+
+test("custom provider mutations refresh onboarding readiness immediately", async () => {
+  let reloads = 0;
+  const preloadGenerations: number[] = [];
+  const provider = {
+    ...customProvider(1),
+    published: false,
+    testable: true,
+    verifiedTargets: ["pi", "opencode", "codex"].map((harnessId) => ({
+      modelId: "luna",
+      harnessId,
+      revision: 1,
+    })),
+  };
+  const harness = createCustomProviderUi(
+    async (method) => (method === "GET" ? { ok: true, data: { providers: [provider] } } : { ok: true, data: {} }),
+    new Map(),
+    {},
+    async (customProviderSnapshot) => {
+      reloads += 1;
+      preloadGenerations.push((customProviderSnapshot as { generation: number }).generation);
+      return { committed: true, customProvidersLoaded: true };
+    },
+  );
+  await harness.ui.loadCustomProviders();
+  let actions = harness.providerRows.children[0]?.children.at(-1);
+  const publish = actions?.children[1];
+  assert.ok(publish?.onclick);
+  await publish.onclick();
+  assert.equal(harness.providerStatus.textContent, "Verified provider opened to employees.");
+  harness.setProviderForm();
+  await harness.ui.saveProvider();
+  assert.equal(
+    harness.providerStatus.textContent,
+    "Provider saved as staged. Verify every supported Harness, then open it to employees.",
+  );
+  actions = harness.providerRows.children[0]?.children.at(-1);
+  const remove = actions?.children.at(-1);
+  assert.ok(remove?.onclick);
+  await remove.onclick();
+  assert.equal(harness.providerStatus.textContent, "Provider removed.");
+  assert.equal(reloads, 3);
+  assert.deepEqual(preloadGenerations, [2, 3, 4]);
+});
+
+test("custom provider mutations disclose a failed current-status refresh", async () => {
+  const provider = {
+    ...customProvider(1),
+    published: false,
+    testable: true,
+    verifiedTargets: ["pi", "opencode", "codex"].map((harnessId) => ({
+      modelId: "luna",
+      harnessId,
+      revision: 1,
+    })),
+  };
+  const harness = createCustomProviderUi(
+    async (method) => (method === "GET" ? { ok: true, data: { providers: [provider] } } : { ok: true, data: {} }),
+    new Map(),
+    {},
+    async () => ({ committed: true, customProvidersLoaded: false }),
+  );
+  await harness.ui.loadCustomProviders();
+  let actions = harness.providerRows.children[0]?.children.at(-1);
+  await actions?.children[1]?.onclick?.();
+  assert.equal(
+    harness.providerStatus.textContent,
+    "Provider opened, but its current status could not be refreshed. Try again.",
+  );
+  assert.equal(harness.providerStatus.className, "status err");
+
+  harness.setProviderForm();
+  await harness.ui.saveProvider();
+  assert.equal(
+    harness.providerStatus.textContent,
+    "Provider saved, but its current status could not be refreshed. Try again.",
+  );
+  assert.equal(harness.providerStatus.className, "status err");
+
+  actions = harness.providerRows.children[0]?.children.at(-1);
+  await actions?.children.at(-1)?.onclick?.();
+  assert.equal(
+    harness.providerStatus.textContent,
+    "Provider removed, but its current status could not be refreshed. Try again.",
+  );
   assert.equal(harness.providerStatus.className, "status err");
 });
 

@@ -7244,6 +7244,19 @@
 
       let onboardingModels = {};
       let onboardingModelStatuses = [];
+      let onboardingCustomProviderStatuses = [];
+      let onboardingCustomProvidersReady = false;
+      let onboardingLoad = 0;
+      let onboardingModelStatusOwner = null;
+      function setOnboardingModelStatus(owner, message, kind, sticky = false) {
+        onboardingModelStatusOwner = owner;
+        setStatus("st-onboarding-model", message, kind, sticky);
+      }
+      function clearOnboardingLoaderStatus() {
+        if (onboardingModelStatusOwner !== "loader") return;
+        onboardingModelStatusOwner = null;
+        setStatus("st-onboarding-model", "", "", true);
+      }
       function onboardingBadge(id, text, ready, optional = false) {
         const el = $(id);
         el.textContent = text;
@@ -7254,16 +7267,42 @@
         openai: "OpenAI",
         openrouter: "OpenRouter — hosted open models",
       };
-      function onboardingProviderForModel(modelId) {
+      function renderOnboardingModelUnavailable() {
+        onboardingModelStatuses = [];
+        onboardingModels = {};
+        onboardingBadge("onboarding-model-badge", "Unknown", false);
+        $("onboarding-model-summary").textContent = "Model readiness could not be confirmed. Try again.";
+        renderOnboardingProviderOptions();
+      }
+      function onboardingProviderForModel(modelId, customProviderStatuses = onboardingCustomProviderStatuses) {
         const owning = Object.entries(onboardingModels).find(([, models]) =>
           models.some((model) => model.id === modelId),
         )?.[0];
         if (owning) return owning;
-        return (
-          onboardingModelStatuses.find((item) => item.configured)?.provider ||
-          onboardingModelStatuses[0]?.provider ||
-          ""
-        );
+        const custom = customProviderStatuses.find((provider) => provider.models.some((model) => model.id === modelId));
+        return custom?.id || "";
+      }
+      function onboardingStatusForProvider(
+        provider,
+        customProviderStatuses = onboardingCustomProviderStatuses,
+        customProvidersReady = onboardingCustomProvidersReady,
+      ) {
+        const builtIn = onboardingModelStatuses.find((item) => item.provider === provider);
+        if (builtIn) return builtIn;
+        const custom = customProviderStatuses.find((item) => item.id === provider);
+        return custom
+          ? {
+              provider,
+              configured: Boolean(
+                customProvidersReady &&
+                custom.hasKey &&
+                custom.published &&
+                !custom.disabled &&
+                custom.testable !== false,
+              ),
+              source: "admin",
+            }
+          : undefined;
       }
       function renderOnboardingProviderOptions(preferred) {
         const select = $("onboarding-model-provider");
@@ -7297,28 +7336,43 @@
           ? "•••• set — enter a replacement"
           : "Write-only API key";
       }
-      async function loadOnboarding() {
-        const customProviders = loadCustomProviders();
-        let setup;
-        try {
-          setup = await Promise.all([
-            api("GET", "/api/model-providers"),
-            api("GET", "/api/slack-installation"),
-            api("GET", "/api/connector-catalog"),
-            api("GET", "/api/scopes/" + encodeURIComponent(orgScope())),
-          ]);
-        } catch {
-          await customProviders;
-          setStatus("st-onboarding-model", "Setup status could not be loaded. Try again.", "err", true);
-          renderOnboardingProviderOptions();
-          return;
+      async function loadOnboarding(customProviderSnapshot = null) {
+        const load = ++onboardingLoad;
+        const customProviderGeneration = customProviderSnapshot?.generation ?? customProvidersLoad + 1;
+        const customProviders = customProviderSnapshot
+          ? Promise.resolve(customProviderSnapshot)
+          : loadCustomProviders();
+        const setup = await Promise.all([
+          api("GET", "/api/model-providers"),
+          api("GET", "/api/slack-installation"),
+          api("GET", "/api/connector-catalog"),
+          api("GET", "/api/scopes/" + encodeURIComponent(orgScope())),
+        ]).catch(() => null);
+        let currentCustomProviderSnapshot = await customProviders;
+        if (
+          currentCustomProviderSnapshot?.generation !== customProvidersLoad &&
+          (currentCustomProviderSnapshot || customProviderGeneration !== customProvidersLoad)
+        ) {
+          while (true) {
+            const requestedGeneration = customProvidersLoad + 1;
+            currentCustomProviderSnapshot = await loadCustomProviders();
+            if (currentCustomProviderSnapshot?.generation === customProvidersLoad) break;
+            if (!currentCustomProviderSnapshot && requestedGeneration === customProvidersLoad) break;
+          }
         }
-        await customProviders;
+        if (load !== onboardingLoad) {
+          return { committed: false, customProvidersLoaded: Boolean(currentCustomProviderSnapshot) };
+        }
+        if (!setup) {
+          setOnboardingModelStatus("loader", "Setup status could not be loaded. Try again.", "err", true);
+          renderOnboardingModelUnavailable();
+          return { committed: true, customProvidersLoaded: Boolean(currentCustomProviderSnapshot) };
+        }
         const [models, slack, catalog, config] = setup;
         if (!models.ok || !slack.ok || !catalog.ok || !config.ok) {
-          setStatus("st-onboarding-model", "Setup status could not be loaded. Try again.", "err", true);
-          renderOnboardingProviderOptions();
-          return;
+          setOnboardingModelStatus("loader", "Setup status could not be loaded. Try again.", "err", true);
+          renderOnboardingModelUnavailable();
+          return { committed: true, customProvidersLoaded: Boolean(currentCustomProviderSnapshot) };
         }
         onboardingModelStatuses = models.data.providers || [];
         onboardingModels = {};
@@ -7326,8 +7380,18 @@
           (onboardingModels[model.provider] ||= []).push(model);
         });
         const baseModel = config.data.baseModel || config.data.baseModelDefault || "";
-        const baseProvider = onboardingProviderForModel(baseModel);
-        const baseStatus = onboardingModelStatuses.find((item) => item.provider === baseProvider);
+        const customProviderStatuses = currentCustomProviderSnapshot?.providers || [];
+        const baseProvider = onboardingProviderForModel(baseModel, customProviderStatuses);
+        if (baseModel && !baseProvider && !currentCustomProviderSnapshot) {
+          setOnboardingModelStatus("loader", "Custom provider status could not be loaded. Try again.", "err", true);
+          renderOnboardingModelUnavailable();
+          return { committed: true, customProvidersLoaded: false };
+        }
+        const baseStatus = onboardingStatusForProvider(
+          baseProvider,
+          customProviderStatuses,
+          Boolean(currentCustomProviderSnapshot),
+        );
         onboardingBadge(
           "onboarding-model-badge",
           baseStatus?.configured ? "Ready" : "Needs a key",
@@ -7365,7 +7429,9 @@
         $("onboarding-oauth-summary").textContent = configured.length
           ? configured.map((item) => connectorName(item.provider)).join(", ") + " available in the web UI."
           : "Add Google, GitHub, Notion, or other OAuth clients to make those connectors available.";
+        clearOnboardingLoaderStatus();
         viewLoadedAt.onboarding = Date.now();
+        return { committed: true, customProvidersLoaded: Boolean(currentCustomProviderSnapshot) };
       }
       $("onboarding-model-provider").onchange = () => renderOnboardingModelOptions();
       $("onboarding-model-save").onclick = async () => {
@@ -7373,23 +7439,23 @@
         const apiKey = $("onboarding-model-key").value.trim();
         const modelId = $("onboarding-model-id").value;
         if (!apiKey) {
-          setStatus("st-onboarding-model", "Enter the provider API key.", "err");
+          setOnboardingModelStatus("action", "Enter the provider API key.", "err");
           return;
         }
         $("onboarding-model-save").disabled = true;
-        setStatus("st-onboarding-model", "Validating with " + connectorName(provider) + "…", "saving", true);
+        setOnboardingModelStatus("action", "Validating with " + connectorName(provider) + "…", "saving", true);
         const saved = await api("PUT", "/api/model-providers/" + encodeURIComponent(provider), { apiKey });
         if (!saved.ok) {
           $("onboarding-model-save").disabled = false;
-          setStatus("st-onboarding-model", saved.data?.message || "The provider rejected this key.", "err", true);
+          setOnboardingModelStatus("action", saved.data?.message || "The provider rejected this key.", "err", true);
           return;
         }
         const selected = await api("PUT", "/api/scopes/" + encodeURIComponent(orgScope()) + "/base-model", { modelId });
         $("onboarding-model-save").disabled = false;
         $("onboarding-model-key").value = "";
         await loadOnboarding();
-        setStatus(
-          "st-onboarding-model",
+        setOnboardingModelStatus(
+          "action",
           selected.ok ? "Key and base model saved." : "Key saved, but the base model could not be changed.",
           selected.ok ? "ok" : "err",
           !selected.ok,
@@ -7405,13 +7471,18 @@
           return;
         const removed = await api("DELETE", "/api/model-providers/" + encodeURIComponent(provider));
         if (!removed.ok) {
-          setStatus("st-onboarding-model", removed.data?.message || "Could not disable this provider.", "err");
+          setOnboardingModelStatus("action", removed.data?.message || "Could not disable this provider.", "err");
           return;
         }
         await loadOnboarding();
-        setStatus("st-onboarding-model", "Provider disabled.", "ok");
+        setOnboardingModelStatus("action", "Provider disabled.", "ok");
       };
       let customProvidersLoaded = [];
+      function renderCustomProviderMutationRefreshFailure(message) {
+        setStatus("st-custom-provider", message, "err", true);
+        setOnboardingModelStatus("loader", "Custom provider status could not be loaded. Try again.", "err", true);
+        renderOnboardingModelUnavailable();
+      }
       let customProviderTestTargets = [];
       let customProviderTestFingerprint = null;
       let customProviderTestRun = 0;
@@ -7725,19 +7796,26 @@
       async function loadCustomProviders() {
         const load = ++customProvidersLoad;
         customProvidersReady = false;
+        onboardingCustomProvidersReady = false;
         syncCustomProviderTestControls();
         let res;
         try {
           res = await api("GET", "/api/custom-providers");
         } catch {
-          if (load !== customProvidersLoad) return false;
+          if (load !== customProvidersLoad) {
+            return Object.freeze({ status: "superseded", generation: load, providers: Object.freeze([]) });
+          }
+          onboardingCustomProviderStatuses = [];
           clearCustomProviderTestResult();
           customProviderLoadFailed = true;
           setStatus("st-custom-provider", "Custom model providers could not be loaded. Try again.", "err", true);
           return false;
         }
-        if (load !== customProvidersLoad) return false;
+        if (load !== customProvidersLoad) {
+          return Object.freeze({ status: "superseded", generation: load, providers: Object.freeze([]) });
+        }
         if (!res.ok) {
+          onboardingCustomProviderStatuses = [];
           clearCustomProviderTestResult();
           customProviderLoadFailed = true;
           setStatus(
@@ -7752,7 +7830,18 @@
           setStatus("st-custom-provider", "", "", true);
           customProviderLoadFailed = false;
         }
-        const nextProviders = (res.data?.providers || []).filter((provider) => provider.testable !== false);
+        onboardingCustomProviderStatuses = (res.data?.providers || []).map((provider) =>
+          Object.freeze({
+            ...provider,
+            models: Object.freeze((provider.models || []).map((model) => Object.freeze({ ...model }))),
+            verifiedTargets: Object.freeze(
+              (provider.verifiedTargets || []).map((target) => Object.freeze({ ...target })),
+            ),
+          }),
+        );
+        Object.freeze(onboardingCustomProviderStatuses);
+        onboardingCustomProvidersReady = true;
+        const nextProviders = onboardingCustomProviderStatuses.filter((provider) => provider.testable !== false);
         const nextFingerprint = JSON.stringify(nextProviders);
         if (customProviderTestFingerprint !== null && customProviderTestFingerprint !== nextFingerprint) {
           clearCustomProviderTestResult();
@@ -7824,8 +7913,21 @@
               return;
             }
             clearCustomProviderTestResult();
-            if (await loadCustomProviders()) {
-              setStatus("st-custom-provider", "Provider removed.", "ok");
+            const snapshot = await loadCustomProviders();
+            if (snapshot) {
+              const onboarding = await loadOnboarding(snapshot);
+              setStatus(
+                "st-custom-provider",
+                onboarding.customProvidersLoaded
+                  ? "Provider removed."
+                  : "Provider removed, but its current status could not be refreshed. Try again.",
+                onboarding.customProvidersLoaded ? "ok" : "err",
+                true,
+              );
+            } else {
+              renderCustomProviderMutationRefreshFailure(
+                "Provider removed, but its current status could not be refreshed. Try again.",
+              );
             }
           };
           actions.appendChild(edit);
@@ -7852,8 +7954,21 @@
               setStatus("st-custom-provider", opened.data?.message || "Could not open this provider.", "err");
               return;
             }
-            if (await loadCustomProviders()) {
-              setStatus("st-custom-provider", "Verified provider opened to employees.", "ok");
+            const snapshot = await loadCustomProviders();
+            if (snapshot) {
+              const onboarding = await loadOnboarding(snapshot);
+              setStatus(
+                "st-custom-provider",
+                onboarding.customProvidersLoaded
+                  ? "Verified provider opened to employees."
+                  : "Provider opened, but its current status could not be refreshed. Try again.",
+                onboarding.customProvidersLoaded ? "ok" : "err",
+                true,
+              );
+            } else {
+              renderCustomProviderMutationRefreshFailure(
+                "Provider opened, but its current status could not be refreshed. Try again.",
+              );
             }
           };
           actions.appendChild(publish);
@@ -7867,7 +7982,7 @@
           );
         });
         syncCustomProviderTestControls();
-        return true;
+        return Object.freeze({ status: "loaded", generation: load, providers: onboardingCustomProviderStatuses });
       }
       function customProviderTestEvidenceText(data) {
         const testedRevision = Number.isSafeInteger(data?.providerRevision)
@@ -8034,11 +8149,20 @@
         }
         $("custom-provider-key").value = "";
         clearCustomProviderTestResult();
-        if (await loadCustomProviders()) {
+        const snapshot = await loadCustomProviders();
+        if (snapshot) {
+          const onboarding = await loadOnboarding(snapshot);
           setStatus(
             "st-custom-provider",
-            "Provider saved as staged. Verify every supported Harness, then open it to employees.",
-            "ok",
+            onboarding.customProvidersLoaded
+              ? "Provider saved as staged. Verify every supported Harness, then open it to employees."
+              : "Provider saved, but its current status could not be refreshed. Try again.",
+            onboarding.customProvidersLoaded ? "ok" : "err",
+            true,
+          );
+        } else {
+          renderCustomProviderMutationRefreshFailure(
+            "Provider saved, but its current status could not be refreshed. Try again.",
           );
         }
       };
