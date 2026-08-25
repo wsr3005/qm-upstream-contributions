@@ -5,8 +5,9 @@ import {
   type PersistedApprovedHarnesses,
   type PersistedBaseModel,
 } from "../src/resolution/config-store.ts";
-import { resolveRuntimeChoice, resolveRuntimeChoiceDurable } from "../src/harness/harness-router.ts";
+import { createHarnessRouter, resolveRuntimeChoice, resolveRuntimeChoiceDurable } from "../src/harness/harness-router.ts";
 import { createMemoryMap } from "../src/persistence/durable-map.ts";
+import type { Harness, HarnessTurnInput } from "../src/harness/harness.ts";
 
 const ORG = "org:default-org" as const;
 const PERSONAL = "personal:alice" as const;
@@ -117,4 +118,32 @@ test("a listener that throws cannot break the write that notified it", async () 
   config.setApprovedHarnesses(["pi"]);
   await config.setRuntimeSelectionLatest(ORG, { harnessId: "pi", modelId: "claude-opus-4-8" });
   assert.equal((await config.getRuntimeSelectionDurable(ORG))?.modelId, "claude-opus-4-8");
+});
+
+test("the routed turn guard encloses adapter execution", async () => {
+  let guardActive = false;
+  const adapter = {
+    turns: {
+      async runTurn() {
+        assert.equal(guardActive, true);
+        return { reply: "ok" };
+      },
+    },
+  } as unknown as Harness;
+  const router = createHarnessRouter(
+    new Map([["pi", adapter]]),
+    adapter,
+    async () => ({ harnessId: "pi", modelId: "claude-opus-4-8" }),
+    async (_input, _choice, execute) => {
+      guardActive = true;
+      try {
+        return await execute();
+      } finally {
+        guardActive = false;
+      }
+    },
+  );
+  const result = await router.turns.runTurn({ session: { id: "guarded" } } as HarnessTurnInput);
+  assert.equal(result.reply, "ok");
+  assert.equal(guardActive, false);
 });

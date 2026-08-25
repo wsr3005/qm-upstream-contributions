@@ -1,7 +1,7 @@
 import type { ScopedConfigStore } from "../resolution/config-store.ts";
 import { defaultModelForHarness, isHarnessId, modelSupportedByHarness, type HarnessId } from "../model/pi-models.ts";
 import type { ScopeId } from "../types.ts";
-import type { Harness, HarnessTurnInput } from "./harness.ts";
+import type { Harness, HarnessTurnInput, HarnessTurnResult } from "./harness.ts";
 import { NonRetryableTurnError } from "../core/turn-error.ts";
 
 export interface RuntimeChoice {
@@ -100,6 +100,11 @@ export function createHarnessRouter(
   adapters: ReadonlyMap<HarnessId, Harness>,
   utility: Harness,
   resolve: (input: HarnessTurnInput) => RuntimeChoice | Promise<RuntimeChoice>,
+  runTurn?: (
+    input: HarnessTurnInput,
+    choice: RuntimeChoice,
+    execute: () => Promise<HarnessTurnResult>,
+  ) => Promise<HarnessTurnResult>,
 ): Harness {
   const lastHarness = new Map<string, HarnessId>();
   return {
@@ -111,13 +116,16 @@ export function createHarnessRouter(
         const choice = await resolve(input);
         const adapter = adapters.get(choice.harnessId);
         if (!adapter) throw new Error(`harness ${choice.harnessId} is unavailable`);
-        const prior = lastHarness.get(input.session.id);
-        if (prior && prior !== choice.harnessId) {
-          await adapters.get(prior)?.turns.resetSession?.(input.session.id);
-          await adapter.turns.resetSession?.(input.session.id);
-        }
-        lastHarness.set(input.session.id, choice.harnessId);
-        return adapter.turns.runTurn({ ...input, harness: choice.harnessId, model: choice.modelId });
+        const execute = async (): Promise<HarnessTurnResult> => {
+          const prior = lastHarness.get(input.session.id);
+          if (prior && prior !== choice.harnessId) {
+            await adapters.get(prior)?.turns.resetSession?.(input.session.id);
+            await adapter.turns.resetSession?.(input.session.id);
+          }
+          lastHarness.set(input.session.id, choice.harnessId);
+          return adapter.turns.runTurn({ ...input, harness: choice.harnessId, model: choice.modelId });
+        };
+        return runTurn ? runTurn(input, choice, execute) : execute();
       },
       async resetSession(sessionId) {
         lastHarness.delete(sessionId);

@@ -919,11 +919,14 @@ export function buildApp(
   const judgeModelId = (): string => config.judgeModelId ?? auxiliaryModelFor(orgBaseModelId() ?? fallback.modelId);
   const harness = createHarnessRouter(adapters, adapters.get(fallbackHarness)!, async (input) => {
     await refreshCustomProviders();
-    const choice = await resolveRuntimeChoiceDurable(configStore, runtimeOrgScope, input.scopeLabel, fallback, {
+    return resolveRuntimeChoiceDurable(configStore, runtimeOrgScope, input.scopeLabel, fallback, {
       ...(input.harness ? { harnessId: input.harness as HarnessId } : {}),
       ...(input.model ? { modelId: input.model } : {}),
     });
-    if (input.modelProviderRevision !== undefined) {
+  }, async (input, choice, execute) => {
+    if (input.modelProviderRevision === undefined) return execute();
+    return advisoryLock.withLock("custom-model-providers", async () => {
+      await refreshCustomProviders();
       const providerId = resolveModel(choice.modelId)?.provider;
       const active = providerId ? await customProviders.resolveActive(String(providerId)) : null;
       if (
@@ -933,8 +936,8 @@ export function buildApp(
       ) {
         throw new NonRetryableTurnError("custom model provider changed; refresh the model configuration and retry");
       }
-    }
-    return choice;
+      return execute();
+    });
   });
   const customProviderHarnessTest: CustomProviderHarnessTestRunner = async (input) => {
     const initialState = input.draft
