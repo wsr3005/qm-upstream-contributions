@@ -148,6 +148,7 @@ function customProvider(updatedAt: number, models = ["luna"]): Record<string, un
     baseUrl: "https://models.example/v1",
     hasKey: true,
     disabled: false,
+    revision: updatedAt,
     updatedAt,
     updatedBy: "admin",
     models: models.map((id) => ({ id, upstreamId: "gpt-5.6-" + id })),
@@ -844,6 +845,31 @@ test("custom provider paid tests fail closed when request receipt storage cannot
   assert.equal(posts, 0);
   assert.equal(harness.testButton.disabled, true);
   assert.match(harness.testStatus.textContent, /No model request was sent/);
+});
+
+test("custom provider paid tests consume an injected revision-bound receipt", async () => {
+  const retryStorage = new Map([
+    [
+      "qm-custom-provider-test-retry:org%3Aacme:gateway:luna:pi",
+      JSON.stringify({
+        identity: JSON.stringify(["gateway", "luna", "pi", "openai-responses", 7]),
+        requestId: "qa-pre-reserved",
+        createdAt: Date.now(),
+        expiresAt: Date.now() + 300_000,
+        retryAt: Date.now(),
+      }),
+    ],
+  ]);
+  const requestIds: string[] = [];
+  const harness = createCustomProviderUi(async (method, _path, body) => {
+    if (method === "GET") return { ok: true, data: { providers: [customProvider(7)] } };
+    requestIds.push((body as { requestId: string }).requestId);
+    return successfulHarnessResponse(requestIds.at(-1)!, { providerRevision: 7 });
+  }, retryStorage);
+
+  await harness.ui.loadCustomProviders();
+  await harness.ui.runTest();
+  assert.deepEqual(requestIds, ["qa-pre-reserved"]);
 });
 
 test("custom provider paid tests stay disabled after reload when request receipt storage cannot be read", async () => {

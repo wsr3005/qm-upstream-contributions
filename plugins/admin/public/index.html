@@ -7469,6 +7469,7 @@
               providerId: provider.id,
               providerName: provider.name,
               protocol: provider.protocol,
+              providerRevision: provider.revision,
               providerUpdatedAt: provider.updatedAt,
               modelId: model.id,
               upstreamModelId: model.upstreamId || model.id,
@@ -7605,7 +7606,13 @@
         }
       }
       function customProviderTestIdentity(target, harness) {
-        return JSON.stringify([target.providerId, target.modelId, harness, target.protocol, target.providerUpdatedAt]);
+        return JSON.stringify([
+          target.providerId,
+          target.modelId,
+          harness,
+          target.protocol,
+          target.providerRevision ?? target.providerUpdatedAt,
+        ]);
       }
       function customProviderTestRetryBlocked() {
         const target = customProviderTestTargets[Number($("custom-provider-test-model").value)];
