@@ -208,17 +208,31 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
       legacyDedupKeyPrefix,
       maxAttempts = 3,
     }: EnqueueInput): Promise<EnqueueResult> {
+      const findFamily = async (familyKey: string): Promise<Record<string, unknown> | undefined> => {
+        const { rows } = await q(
+          `SELECT runs.* FROM run_idempotency_families
+           JOIN runs ON runs.id=run_idempotency_families.run_id
+           WHERE family_key=$1`,
+          [familyKey],
+        );
+        return rows[0];
+      };
       if (!dedupKey || !legacyDedupKeyPrefix) {
         const id = randomUUID();
-        const { rows: inserted } = await q(
-          `INSERT INTO runs(id, session_id, status, request, idempotency_key, attempts, max_attempts, created_at)
-           VALUES ($1,$2,'pending',$3,$4,0,$5,$6)
-           ON CONFLICT (idempotency_key) DO NOTHING RETURNING *`,
-          [id, sessionId, JSON.stringify(request), dedupKey ?? null, maxAttempts, Date.now()],
-        );
+        let inserted: Record<string, unknown>[] = [];
+        try {
+          ({ rows: inserted } = await q(
+            `INSERT INTO runs(id, session_id, status, request, idempotency_key, attempts, max_attempts, created_at)
+             VALUES ($1,$2,'pending',$3,$4,0,$5,$6)
+             ON CONFLICT (idempotency_key) DO NOTHING RETURNING *`,
+            [id, sessionId, JSON.stringify(request), dedupKey ?? null, maxAttempts, Date.now()],
+          ));
+        } catch (error) {
+          if (!dedupKey || !isUniqueViolation(error)) throw error;
+        }
         if (inserted[0]) return { run: rowToRun(inserted[0]), deduped: false, conflict: false };
-        const { rows } = await q("SELECT * FROM runs WHERE idempotency_key = $1", [dedupKey]);
-        const row = rows[0]!;
+        const row = dedupKey ? await findFamily(dedupKey.replace(/:project-[0-9]+$/u, "")) : undefined;
+        if (!row) throw new Error("idempotency conflict did not resolve to a durable run");
         return {
           run: rowToRun(row),
           deduped: true,
@@ -227,16 +241,7 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
             JSON.stringify(JSON.parse(row.request as string)) !== JSON.stringify(request),
         };
       }
-      const findFamily = async (): Promise<Record<string, unknown> | undefined> => {
-        const { rows } = await q(
-          `SELECT runs.* FROM run_idempotency_families
-           JOIN runs ON runs.id=run_idempotency_families.run_id
-           WHERE family_key=$1`,
-          [dedupKey],
-        );
-        return rows[0];
-      };
-      const existing = await findFamily();
+      const existing = await findFamily(dedupKey);
       if (existing) {
         return {
           run: rowToRun(existing),
@@ -255,7 +260,7 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
         return { run: rowToRun(rows[0]!), deduped: false, conflict: false };
       } catch (error) {
         if (!isUniqueViolation(error)) throw error;
-        const raced = await findFamily();
+        const raced = await findFamily(dedupKey);
         if (!raced) throw error;
         return {
           run: rowToRun(raced),
