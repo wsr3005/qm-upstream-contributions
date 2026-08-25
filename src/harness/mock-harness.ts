@@ -751,8 +751,8 @@ export function createMockHarness(): Harness {
         return Promise.resolve(JSON.stringify({ act: false }));
       },
 
-      async screenSecurity({ payload, signal, recordModelCall, recordLlmRequest }) {
-        const model = "mock-security";
+      async screenSecurity({ payload, signal, model: selectedModel, recordModelCall, recordLlmRequest }) {
+        const model = selectedModel ?? "mock-security";
         recordModelCall({
           model,
           inputTokens: countTokens(SECURITY_SCREEN_SYSTEM_PROMPT) + countTokens(payload),
@@ -782,6 +782,10 @@ export function createMockHarness(): Harness {
       },
 
       generateTitle(input): Promise<string | undefined> {
+        if (input.transcript.includes("!title-none")) {
+          input.recordModelCall?.({ model: "mock-title", inputTokens: countTokens(input.transcript), entryCount: 1 });
+          return Promise.resolve(undefined);
+        }
         const line = input.transcript
           .split("\n")
           .map((l) => l.trim())

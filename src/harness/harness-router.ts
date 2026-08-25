@@ -1,7 +1,13 @@
 import type { ScopedConfigStore } from "../resolution/config-store.ts";
 import { defaultModelForHarness, isHarnessId, modelSupportedByHarness, type HarnessId } from "../model/pi-models.ts";
 import type { ScopeId } from "../types.ts";
-import type { Harness, HarnessTitleInput, HarnessTurnInput, HarnessTurnResult } from "./harness.ts";
+import type {
+  Harness,
+  HarnessSecurityScreenInput,
+  HarnessTitleInput,
+  HarnessTurnInput,
+  HarnessTurnResult,
+} from "./harness.ts";
 import { NonRetryableTurnError } from "../core/turn-error.ts";
 
 export interface RuntimeChoice {
@@ -15,7 +21,7 @@ type RuntimeInput = Pick<
 >;
 
 type RuntimeExecution = <T>(
-  input: RuntimeInput & { runtimeOperation: "turn" | "title" },
+  input: RuntimeInput & { runtimeOperation: "turn" | "title" | "security-screen" },
   choice: RuntimeChoice,
   execute: () => Promise<T>,
 ) => Promise<T>;
@@ -118,6 +124,16 @@ export function createHarnessRouter(
     profile: utility.profile,
     models: {
       ...utility.models,
+      screenSecurity: async (input: HarnessSecurityScreenInput) => {
+        const choice = await resolve(input);
+        const adapter = adapters.get(choice.harnessId);
+        if (!adapter) throw new Error(`harness ${choice.harnessId} is unavailable`);
+        const execute = async () =>
+          adapter.models.screenSecurity?.({ ...input, harness: choice.harnessId, model: choice.modelId });
+        return runWithChoice
+          ? runWithChoice({ ...input, runtimeOperation: "security-screen" }, choice, execute)
+          : execute();
+      },
       generateTitle: async (input: HarnessTitleInput) => {
         const choice = await resolve(input);
         const adapter = adapters.get(choice.harnessId);

@@ -1328,13 +1328,14 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
         }
       },
       judge: single,
-      screenSecurity: async ({ payload, signal, recordModelCall, recordLlmRequest }) =>
+      screenSecurity: async ({ payload, signal, model, recordModelCall, recordLlmRequest }) =>
         parseSecurityScreenVerdict(
           await single(
             SECURITY_SCREEN_SYSTEM_PROMPT,
             payload,
             { recordModelCall, ...(recordLlmRequest ? { recordLlmRequest } : {}) },
             signal,
+            model,
           ),
         ),
       generateTitle: async (input) =>

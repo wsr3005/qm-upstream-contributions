@@ -41,9 +41,14 @@ export interface HarnessLlmRequestRecord {
   usage?: LlmCallUsage | null;
 }
 
-interface HarnessSecurityScreenInput {
+export interface HarnessSecurityScreenInput {
   payload: string;
   signal: AbortSignal;
+  scopeLabel: ScopeId;
+  harness?: string;
+  model?: string;
+  modelProviderId?: string;
+  modelProviderRevision?: number;
   recordModelCall(rec: { model: string; inputTokens: number; entryCount: number }): void;
   recordLlmRequest?(rec: HarnessLlmRequestRecord): void | Promise<void>;
 }

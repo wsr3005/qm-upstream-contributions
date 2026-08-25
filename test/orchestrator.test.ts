@@ -2320,6 +2320,20 @@ test("Auto screens only the external event envelope and records classifier usage
   assert.ok(built.modelGateway.audit().some((rec) => rec.model === "mock-security"));
 });
 
+test("Auto security screening inherits the selected turn model", async () => {
+  const built = freshApp();
+  const result = await built.app.turn(
+    dm("summarize this", {
+      model: "claude-opus-4-8",
+      surface: "webhook",
+      triggered: true,
+      securityScreenData: "ordinary external event",
+    }),
+  );
+  assert.equal(result.status, "ok");
+  assert.equal(built.modelGateway.audit().filter((call) => call.model === "claude-opus-4-8").length, 1);
+});
+
 test("proxy shadow telemetry correlates its verdict with the authoritative model without enforcing it", async () => {
   const calls: Array<{ metadata?: Readonly<Record<string, unknown>>; requestId?: string }> = [];
   const screener: SecurityScreener = {

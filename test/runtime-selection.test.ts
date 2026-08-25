@@ -213,6 +213,64 @@ test("title generation resolves the selected Harness and runs inside the same gu
   assert.equal(guardActive, false);
 });
 
+test("security screening resolves the selected Harness and Provider fence", async () => {
+  let guardActive = false;
+  const calls: Array<{ harness: string; model?: string; provider?: string; revision?: number }> = [];
+  const adapter = (harness: string): Harness =>
+    ({
+      models: {
+        async screenSecurity(input) {
+          assert.equal(guardActive, true);
+          calls.push({
+            harness,
+            ...(input.model ? { model: input.model } : {}),
+            ...(input.modelProviderId ? { provider: input.modelProviderId } : {}),
+            ...(input.modelProviderRevision !== undefined ? { revision: input.modelProviderRevision } : {}),
+          });
+          return { decision: "auto" };
+        },
+      },
+    }) as Harness;
+  const adapters = new Map([
+    ["pi", adapter("pi")],
+    ["opencode", adapter("opencode")],
+    ["codex", adapter("codex")],
+  ] as const);
+  const router = createHarnessRouter(
+    adapters,
+    adapters.get("pi")!,
+    async (input) => ({
+      harnessId: (input.harness ?? "pi") as "pi" | "opencode" | "codex",
+      modelId: input.model ?? "org/default",
+    }),
+    async (input, choice, execute) => {
+      assert.equal(input.runtimeOperation, "security-screen");
+      assert.equal(input.modelProviderId, choice.modelId === "gateway/luna" ? "gateway" : undefined);
+      guardActive = true;
+      try {
+        return await execute();
+      } finally {
+        guardActive = false;
+      }
+    },
+  );
+
+  const verdict = await router.models.screenSecurity!({
+    payload: "external content",
+    signal: new AbortController().signal,
+    scopeLabel: ORG,
+    harness: "opencode",
+    model: "gateway/luna",
+    modelProviderId: "gateway",
+    modelProviderRevision: 7,
+    recordModelCall() {},
+  });
+
+  assert.deepEqual(verdict, { decision: "auto" });
+  assert.deepEqual(calls, [{ harness: "opencode", model: "gateway/luna", provider: "gateway", revision: 7 }]);
+  assert.equal(guardActive, false);
+});
+
 test("an aborted title releases the shared execution guard for the next turn", async () => {
   const lock = createMemoryAdvisoryLock();
   const adapter = {

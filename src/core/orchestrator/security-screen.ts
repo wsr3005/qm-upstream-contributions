@@ -27,6 +27,10 @@ export type SecurityClassifier = (
     surface?: string;
     origin?: TurnOrigin["kind"];
     requestId?: string;
+    harness?: string;
+    model?: string;
+    modelProviderId?: string;
+    modelProviderRevision?: number;
   },
 ) => Promise<SecurityScreenVerdict | undefined>;
 
@@ -43,6 +47,13 @@ export function createSecurityClassifier(deps: OrchestratorDeps): SecurityClassi
         deps.harness.models.screenSecurity?.({
           payload,
           signal: abort.signal,
+          scopeLabel,
+          ...(context.harness ? { harness: context.harness } : {}),
+          ...(context.model ? { model: context.model } : {}),
+          ...(context.modelProviderId ? { modelProviderId: context.modelProviderId } : {}),
+          ...(context.modelProviderRevision !== undefined
+            ? { modelProviderRevision: context.modelProviderRevision }
+            : {}),
           recordModelCall: (rec) => {
             deps.modelGateway.recordCall({ at: Date.now(), scopeLabel, ...rec });
             void deps.budget?.record(actorId, estimateCostUsd(rec.inputTokens));

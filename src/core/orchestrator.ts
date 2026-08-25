@@ -431,6 +431,12 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
 
     async handleTurn(input: OrchestratorInput): Promise<TurnResult> {
       const { actor, conversation } = input;
+      const securityRuntime = {
+        ...(input.harness ? { harness: input.harness } : {}),
+        ...(input.model ? { model: input.model } : {}),
+        ...(input.modelProviderId ? { modelProviderId: input.modelProviderId } : {}),
+        ...(input.modelProviderRevision !== undefined ? { modelProviderRevision: input.modelProviderRevision } : {}),
+      };
       const automatedTurn = input.origin.kind === "automation";
       const ambientTurn = input.origin.kind === "ambient";
       const humanTurn = input.origin.kind === "human";
@@ -665,6 +671,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
               hook: "user_input",
               surface: input.surface,
               origin: input.origin.kind,
+              ...securityRuntime,
             })
           : undefined;
         let unscreenableCause: "unscreenable-attachment" | "oversize-input" | "no-screener" | undefined;
@@ -2060,6 +2067,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                         hook: "tool_response",
                         surface: "inbound_file",
                         origin: input.origin.kind,
+                        ...securityRuntime,
                       })
                   : undefined,
               )
@@ -2413,6 +2421,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                             hook: "tool_response",
                             surface: toolLabel,
                             origin: input.origin.kind,
+                            ...securityRuntime,
                           })
                         : undefined;
                     if (verdict?.decision === "auto" && !verdict.unscreened) return true;
@@ -2457,6 +2466,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                       hook: "tool_response",
                       surface: tool,
                       origin: input.origin.kind,
+                      ...securityRuntime,
                     }),
                 }
               : {}),
@@ -2971,7 +2981,8 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                 }
               }
             }
-            if (!pausing && turnCompleted && !session.title && !(earlyTitleGen && (await earlyTitleGen))) {
+            if (earlyTitleGen) await earlyTitleGen;
+            if (!pausing && turnCompleted && !session.title && !earlyTitleGen) {
               await generateAndStoreTitle(
                 session.id,
                 scopeId,

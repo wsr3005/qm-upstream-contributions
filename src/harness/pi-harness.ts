@@ -2227,9 +2227,9 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
         });
       },
 
-      async screenSecurity({ payload, signal, recordModelCall, recordLlmRequest }) {
+      async screenSecurity({ payload, signal, model: requestedModel, recordModelCall, recordLlmRequest }) {
         try {
-          const modelId = detectModelId();
+          const modelId = requestedModel ?? detectModelId();
           const providerRuntime = await resolveProviderRuntime();
           const model = modelForRuntime(modelId, providerRuntime);
           if (!keyForModel(providerRuntime.keys, model)) return undefined;
@@ -2238,17 +2238,12 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
             inputTokens: countTokens(SECURITY_SCREEN_SYSTEM_PROMPT) + countTokens(payload),
             entryCount: 1,
           });
-          await recordLlmRequest?.({
-            turnSeq: null,
-            step: -1,
-            model: modelId,
-            promptEnvelope: { system: SECURITY_SCREEN_SYSTEM_PROMPT, messages: [{ role: "user", content: payload }] },
-            truncated: false,
-          });
           return parseSecurityScreenVerdict(
             await oneShot("pi-security-screen", model, providerRuntime.keys, SECURITY_SCREEN_SYSTEM_PROMPT, payload, {
               signal,
               customProviders: providerRuntime.customProviders,
+              recordModelId: modelId,
+              ...(recordLlmRequest ? { recordLlmRequest } : {}),
             }),
           );
         } catch (e) {

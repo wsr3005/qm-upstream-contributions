@@ -1156,12 +1156,18 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
         }
       },
       judge: (system, prompt) => single(system, prompt, undefined, undefined, judgeModelId),
-      screenSecurity: async ({ payload, signal, recordModelCall, recordLlmRequest }) =>
+      screenSecurity: async ({ payload, signal, model, recordModelCall, recordLlmRequest }) =>
         parseSecurityScreenVerdict(
-          await single(SECURITY_SCREEN_SYSTEM_PROMPT, payload, signal, {
-            recordModelCall,
-            ...(recordLlmRequest ? { recordLlmRequest } : {}),
-          }),
+          await single(
+            SECURITY_SCREEN_SYSTEM_PROMPT,
+            payload,
+            signal,
+            {
+              recordModelCall,
+              ...(recordLlmRequest ? { recordLlmRequest } : {}),
+            },
+            model,
+          ),
         ),
       generateTitle: async (input) =>
         sanitizeTitle(

@@ -941,12 +941,12 @@ export function buildApp(
           executeOutside = true;
           return;
         }
-        const unboundInternalTitle =
-          input.runtimeOperation === "title" &&
+        const unboundInternalModelCall =
+          (input.runtimeOperation === "title" || input.runtimeOperation === "security-screen") &&
           input.modelProviderId === undefined &&
           input.modelProviderRevision === undefined;
         if (
-          (!unboundInternalTitle &&
+          (!unboundInternalModelCall &&
             (input.modelProviderId !== String(providerId) ||
               input.modelProviderRevision === undefined ||
               active.revision !== input.modelProviderRevision)) ||

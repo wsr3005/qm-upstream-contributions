@@ -39,6 +39,14 @@ test("the title is generated ONCE — a later turn does not rewrite it", async (
   assert.equal((await app.getSession(sid))?.session.title, first);
 });
 
+test("a failed early title attempt is not repeated at the end of the same paid turn", async () => {
+  const { app, modelGateway } = freshApp();
+  const result = await app.turn(dm("!title-none", "web:U1:title-none"));
+  assert.equal(result.status, "ok");
+  assert.equal((await app.getSession(result.sessionId!))?.session.title, undefined);
+  assert.equal(modelGateway.audit().filter((call) => call.model === "mock-title").length, 1);
+});
+
 test("the title ignores assembled-turn boilerplate (conversation header / manifests)", async () => {
   const { app } = freshApp();
   const r = await app.turn({

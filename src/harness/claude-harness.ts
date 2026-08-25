@@ -916,12 +916,18 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
       },
       oneShot: (system, prompt) => single(system, prompt),
       judge: (system, prompt) => single(system, prompt, undefined, undefined, judgeModelId),
-      screenSecurity: async ({ payload, signal, recordModelCall, recordLlmRequest }) =>
+      screenSecurity: async ({ payload, signal, model, recordModelCall, recordLlmRequest }) =>
         parseSecurityScreenVerdict(
-          await single(SECURITY_SCREEN_SYSTEM_PROMPT, payload, signal, {
-            recordModelCall,
-            ...(recordLlmRequest ? { recordLlmRequest } : {}),
-          }),
+          await single(
+            SECURITY_SCREEN_SYSTEM_PROMPT,
+            payload,
+            signal,
+            {
+              recordModelCall,
+              ...(recordLlmRequest ? { recordLlmRequest } : {}),
+            },
+            model,
+          ),
         ),
       generateTitle: async (input) => {
         if (input.model && !modelSupportedByHarness(input.model, "claude")) {
