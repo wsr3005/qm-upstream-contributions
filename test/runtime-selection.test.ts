@@ -271,6 +271,75 @@ test("security screening resolves the selected Harness and Provider fence", asyn
   assert.equal(guardActive, false);
 });
 
+test("tool-result screening reuses its turn Provider fence without re-entering the guard", async () => {
+  let guardActive = false;
+  let guardCalls = 0;
+  let screenCalls = 0;
+  const adapter = {
+    models: {
+      async screenSecurity() {
+        assert.equal(guardActive, true);
+        screenCalls += 1;
+        return { decision: "auto" as const };
+      },
+    },
+    turns: {
+      async runTurn(input: HarnessTurnInput) {
+        assert.equal(guardActive, true);
+        assert.equal(await input.screenToolResult!("read", "safe", false), true);
+        assert.deepEqual(await input.screenExternalContent!({ content: "safe", tool: "read", source: "tool" }), {
+          decision: "auto",
+        });
+        return { reply: "ok" };
+      },
+    },
+  } as unknown as Harness;
+  const router = createHarnessRouter(
+    new Map([["pi", adapter]]),
+    adapter,
+    async () => ({ harnessId: "pi", modelId: "gateway/luna" }),
+    async (_input, _choice, execute) => {
+      guardCalls += 1;
+      assert.equal(guardActive, false, "the Provider guard must not be re-entered");
+      guardActive = true;
+      try {
+        return await execute();
+      } finally {
+        guardActive = false;
+      }
+    },
+  );
+  const classify = (runtime?: {
+    harness: string;
+    model: string;
+    modelProviderId?: string;
+    modelProviderRevision?: number;
+    providerFenceAlreadyHeld: true;
+  }) =>
+    router.models.screenSecurity!({
+      payload: "safe",
+      signal: new AbortController().signal,
+      scopeLabel: ORG,
+      ...(runtime ?? {}),
+      recordModelCall() {},
+    });
+
+  const result = await router.turns.runTurn({
+    session: { id: "nested-screen" },
+    scopeLabel: ORG,
+    orgScopeId: ORG,
+    modelProviderId: "gateway",
+    modelProviderRevision: 7,
+    screenToolResult: async (_tool, _result, _unscreenable, runtime) => (await classify(runtime))?.decision === "auto",
+    screenExternalContent: async (_external, runtime) => classify(runtime),
+  } as HarnessTurnInput);
+
+  assert.equal(result.reply, "ok");
+  assert.equal(screenCalls, 2);
+  assert.equal(guardCalls, 1);
+  assert.equal(guardActive, false);
+});
+
 test("an aborted title releases the shared execution guard for the next turn", async () => {
   const lock = createMemoryAdvisoryLock();
   const adapter = {

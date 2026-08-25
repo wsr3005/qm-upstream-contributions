@@ -130,7 +130,7 @@ export function createHarnessRouter(
         if (!adapter) throw new Error(`harness ${choice.harnessId} is unavailable`);
         const execute = async () =>
           adapter.models.screenSecurity?.({ ...input, harness: choice.harnessId, model: choice.modelId });
-        return runWithChoice
+        return runWithChoice && !input.providerFenceAlreadyHeld
           ? runWithChoice({ ...input, runtimeOperation: "security-screen" }, choice, execute)
           : execute();
       },
@@ -156,7 +156,31 @@ export function createHarnessRouter(
             await adapter.turns.resetSession?.(input.session.id);
           }
           lastHarness.set(input.session.id, choice.harnessId);
-          return adapter.turns.runTurn({ ...input, harness: choice.harnessId, model: choice.modelId });
+          const runtime = {
+            harness: choice.harnessId,
+            model: choice.modelId,
+            ...(input.modelProviderId ? { modelProviderId: input.modelProviderId } : {}),
+            ...(input.modelProviderRevision !== undefined
+              ? { modelProviderRevision: input.modelProviderRevision }
+              : {}),
+            providerFenceAlreadyHeld: true as const,
+          };
+          return adapter.turns.runTurn({
+            ...input,
+            harness: choice.harnessId,
+            model: choice.modelId,
+            ...(input.screenToolResult
+              ? {
+                  screenToolResult: (tool, result, unscreenable) =>
+                    input.screenToolResult!(tool, result, unscreenable, runtime),
+                }
+              : {}),
+            ...(input.screenExternalContent
+              ? {
+                  screenExternalContent: (external) => input.screenExternalContent!(external, runtime),
+                }
+              : {}),
+          });
         };
         return runWithChoice ? runWithChoice({ ...input, runtimeOperation: "turn" }, choice, execute) : execute();
       },

@@ -55,7 +55,7 @@ import {
   isValidCapabilityTimezone,
   type CapabilityClaims,
 } from "../auth/capability-token.ts";
-import type { GapWork, HarnessLlmRequestRecord } from "../harness/harness.ts";
+import type { GapWork, HarnessLlmRequestRecord, HarnessRuntimeContext } from "../harness/harness.ts";
 import { forModelContext } from "../harness/context-compaction.ts";
 import {
   renderSecurityPolicyPrompt,
@@ -2404,6 +2404,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                     tool: string,
                     result: string,
                     unscreenable: boolean,
+                    runtime?: HarnessRuntimeContext,
                   ): Promise<boolean | "unscreened"> => {
                     const toolLabel = tool.replace(/[^A-Za-z0-9_-]/g, "_");
                     const bounded = unscreenable
@@ -2422,6 +2423,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                             surface: toolLabel,
                             origin: input.origin.kind,
                             ...securityRuntime,
+                            ...(runtime ?? {}),
                           })
                         : undefined;
                     if (verdict?.decision === "auto" && !verdict.unscreened) return true;
@@ -2461,12 +2463,16 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             ...(securityPolicy.inboundScreening === "external" &&
             (deps.securityScreener || deps.harness.models.screenSecurity)
               ? {
-                  screenExternalContent: ({ content, tool }: { content: string; tool: string; source: string }) =>
+                  screenExternalContent: (
+                    { content, tool }: { content: string; tool: string; source: string },
+                    runtime?: HarnessRuntimeContext,
+                  ) =>
                     classifySecurityData(content, actor.id, scopeId, undefined, {
                       hook: "tool_response",
                       surface: tool,
                       origin: input.origin.kind,
                       ...securityRuntime,
+                      ...(runtime ?? {}),
                     }),
                 }
               : {}),

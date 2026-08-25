@@ -49,6 +49,7 @@ export interface HarnessSecurityScreenInput {
   model?: string;
   modelProviderId?: string;
   modelProviderRevision?: number;
+  providerFenceAlreadyHeld?: boolean;
   recordModelCall(rec: { model: string; inputTokens: number; entryCount: number }): void;
   recordLlmRequest?(rec: HarnessLlmRequestRecord): void | Promise<void>;
 }
@@ -93,11 +94,14 @@ export interface HarnessTurnInput {
   history: SessionEntry[];
   tools: ToolContext;
   credentialExecServices?: readonly { service: string; binary: string }[];
-  screenExternalContent?(input: {
-    content: string;
-    tool: string;
-    source: string;
-  }): Promise<SecurityScreenVerdict | undefined>;
+  screenExternalContent?(
+    input: {
+      content: string;
+      tool: string;
+      source: string;
+    },
+    runtime?: HarnessRuntimeContext,
+  ): Promise<SecurityScreenVerdict | undefined>;
   toolApprovalGate?(tool: string): boolean;
   emit(entry: NewEntry): Promise<SessionEntry>;
   tape?(rec: NewTapeRecord): Promise<unknown>;
@@ -112,7 +116,20 @@ export interface HarnessTurnInput {
   onGapWork?(sink: (work: GapWork) => void): void;
   onDelta?(chunk: string): void;
   onTextBlockStart?(): void;
-  screenToolResult?(tool: string, result: string, unscreenable: boolean): Promise<boolean | "unscreened">;
+  screenToolResult?(
+    tool: string,
+    result: string,
+    unscreenable: boolean,
+    runtime?: HarnessRuntimeContext,
+  ): Promise<boolean | "unscreened">;
+}
+
+export interface HarnessRuntimeContext {
+  harness: string;
+  model: string;
+  modelProviderId?: string;
+  modelProviderRevision?: number;
+  providerFenceAlreadyHeld: true;
 }
 
 export interface HarnessTurnResult {
