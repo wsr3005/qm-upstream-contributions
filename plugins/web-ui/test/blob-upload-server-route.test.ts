@@ -15,6 +15,7 @@ type TurnBody = {
   text?: string;
   harness?: string;
   model?: string;
+  modelProviderId?: string;
   modelProviderRevision?: number;
   idempotencyKey?: string;
 };
@@ -139,6 +140,7 @@ test("POST /api/turn forwards blobId attachments to core as references (no inlin
       threadRef: "web:alice:t1",
       harness: "codex",
       model: "gpt-5.6-sol",
+      modelProviderId: "enterprise-responses",
       modelProviderRevision: 7,
       idempotencyKey: "qa-codex-attachment-1",
       attachments: [
@@ -156,6 +158,7 @@ test("POST /api/turn forwards blobId attachments to core as references (no inlin
   assert.equal((atts[0] as Record<string, unknown>).contentBase64, undefined, "no inline bytes ride the turn body");
   assert.equal(lastTurnBody!.harness, "codex", "the selected harness reaches core");
   assert.equal(lastTurnBody!.model, "gpt-5.6-sol", "the selected model reaches core");
+  assert.equal(lastTurnBody!.modelProviderId, "enterprise-responses", "the reserved Provider identity reaches core");
   assert.equal(lastTurnBody!.modelProviderRevision, 7, "the reserved Provider revision reaches core");
   assert.match(
     lastTurnBody!.idempotencyKey ?? "",
@@ -183,6 +186,7 @@ test("the same external key deduplicates different turn bodies for one user with
         threadRef: `web:${user}:qa`,
         harness: "pi",
         model: "gpt-5.6-luna",
+        modelProviderId: "enterprise-openai",
         modelProviderRevision: 7,
         idempotencyKey: "qa-shared-1",
       }),
@@ -229,8 +233,30 @@ test("POST /api/turn requires a positive Provider revision for an external test 
         threadRef: "web:alice:t-provider-revision",
         harness: "pi",
         model: "enterprise-openai/gpt-5.6-luna",
+        modelProviderId: "enterprise-openai",
         idempotencyKey: "qa-provider-revision-1",
         ...(modelProviderRevision !== undefined ? { modelProviderRevision } : {}),
+      }),
+    });
+    assert.equal(r.status, 400);
+    assert.equal(lastTurnBody, null);
+  }
+});
+
+test("POST /api/turn requires a valid Provider identity for an external test key", async () => {
+  for (const modelProviderId of [undefined, "", "contains spaces", 7]) {
+    setTurnBody(null);
+    const r = await fetch(`${base}/api/turn`, {
+      method: "POST",
+      headers: { ...IDENTITY, "content-type": "application/json" },
+      body: JSON.stringify({
+        text: "msg",
+        threadRef: "web:alice:t-provider-id",
+        harness: "pi",
+        model: "enterprise-openai/gpt-5.6-luna",
+        modelProviderRevision: 7,
+        idempotencyKey: "qa-provider-id-1",
+        ...(modelProviderId !== undefined ? { modelProviderId } : {}),
       }),
     });
     assert.equal(r.status, 400);
