@@ -9,7 +9,7 @@
   },
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "build": "vite build && node scripts/check-katex-fonts.mjs",
     "serve": "node --env-file-if-exists=.env server/index.ts",
     "start": "npm run build && npm run serve",
     "test": "NODE_ENV=test ALLOW_UNSIGNED_TEST_IDENTITY=1 node --test \"test/**/*.test.ts\"",
