@@ -615,6 +615,8 @@ export async function dockerUp(
       ctx.network,
       "--network-alias",
       p.name,
+      "--network-alias",
+      `${p.name}.internal`,
       "--restart",
       "no",
     ];

@@ -90,6 +90,16 @@ test(
         assert.equal(got, sentinel);
       });
 
+      await t.test("plugins receive an explicit private-network alias", () => {
+        const widget = suffix(deploymentContainers(org), "widget")!;
+        const aliases = JSON.parse(
+          execFileSync("docker", ["inspect", "--format", "{{json .NetworkSettings.Networks}}", widget], {
+            encoding: "utf8",
+          }),
+        ) as Record<string, { Aliases: string[] }>;
+        assert.ok(Object.values(aliases).some(({ Aliases }) => Aliases.includes("widget.internal")));
+      });
+
       await t.test("the configured bot identity reaches the core container and only the core container", () => {
         const names = deploymentContainers(org);
         const printenv = (container: string, name: string): string =>
