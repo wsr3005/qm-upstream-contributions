@@ -182,6 +182,15 @@ test("the Fly tokens belong to a Fly target, and the publisher token only to a F
 
 test("the sprites token is a catalog secret when the sandbox backend is sprites", () => {
   assert.ok(
+    secretByName(
+      makeConfig({
+        sandbox: { backend: "local", app: "acme-sb", image: `registry.example/sandbox@sha256:${"a".repeat(64)}` },
+        env: { core: { SANDBOX_SECONDARY_BACKEND: "sprites" } },
+      }),
+      "SPRITES_TOKEN",
+    ).required,
+  );
+  assert.ok(
     secretByName(makeConfig({ target: "aws", sandbox: { backend: "sprites", app: "acme-sb" } }), "SPRITES_TOKEN")
       .required,
   );
@@ -367,6 +376,18 @@ test("an explicit sandbox.backend wins, and non-fly targets keep their own defau
     },
   });
   assert.equal(sandboxCoreEnv(docker).env.SANDBOX_BACKEND, undefined);
+});
+
+test("a Docker local sandbox binds Core to the digest-pinned local image", () => {
+  const image = "registry.example.test/sandbox@sha256:4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d";
+  const config = makeConfig({
+    target: "docker",
+    sandbox: { app: "local-sandboxes", backend: "local", image },
+  });
+  assert.deepEqual(sandboxCoreEnv(config).env, {
+    LOCAL_SANDBOX_IMAGE: image,
+    SANDBOX_BACKEND: "local",
+  });
 });
 
 test("the .env.example catalog names every secret exactly once", () => {
