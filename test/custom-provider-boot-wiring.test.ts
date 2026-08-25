@@ -257,3 +257,70 @@ test("web turns refresh durable custom providers before runtime validation", asy
 
   assert.equal(turn.status, "queued");
 });
+
+test("paid web turns bind the provider revision through queued execution", async () => {
+  const built = buildApp(
+    testConfig({ dataDir: mkdtempSync(join(tmpdir(), "custom-provider-revision-bound-")), maxAttempts: 1 }),
+  );
+  await built.customProviders.upsert(
+    {
+      id: "bound-gateway",
+      name: "Bound Gateway",
+      protocol: "openai",
+      baseUrl: "https://llm.example.com/v1",
+      models: [{ id: "bound-model" }],
+    },
+    "sk-bound",
+    "admin-alice@default-org",
+  );
+  const revision = (await built.customProviders.statuses())[0]!.revision;
+  const invalid = await built.app.turn({
+    surface: "web",
+    actor: { externalId: "alice" },
+    conversation: { kind: "dm", threadRef: "web:alice:custom-provider-invalid-revision" },
+    text: "hello",
+    model: "bound-model",
+    modelProviderRevision: revision + 1,
+    async: true,
+  });
+  assert.deepEqual(invalid, {
+    status: "refused",
+    reason: "custom model provider changed; refresh the model configuration and retry",
+  });
+
+  const queued = await built.app.turn({
+    surface: "web",
+    actor: { externalId: "alice" },
+    conversation: { kind: "dm", threadRef: "web:alice:custom-provider-revision" },
+    text: "hello",
+    model: "bound-model",
+    modelProviderRevision: revision,
+    async: true,
+  });
+  assert.equal(queued.status, "queued");
+  if (queued.status !== "queued") return;
+  assert.ok(queued.runId);
+  await built.customProviders.upsert(
+    {
+      id: "bound-gateway",
+      name: "Bound Gateway Changed",
+      protocol: "openai",
+      baseUrl: "https://llm.example.com/v2",
+      models: [{ id: "bound-model" }],
+    },
+    "sk-bound-changed",
+    "admin-alice@default-org",
+  );
+  await built.runtime.ready();
+  built.runtime.start();
+  try {
+    const run = await built.runs.waitFor(queued.runId, 5_000);
+    assert.equal(run.status, "failed");
+    assert.match(
+      run.result?.status === "failed" ? (run.result.reason ?? "") : "",
+      /custom model provider changed; refresh the model configuration and retry/,
+    );
+  } finally {
+    await built.runtime.stop();
+  }
+});

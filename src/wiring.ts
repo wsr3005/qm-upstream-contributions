@@ -919,10 +919,22 @@ export function buildApp(
   const judgeModelId = (): string => config.judgeModelId ?? auxiliaryModelFor(orgBaseModelId() ?? fallback.modelId);
   const harness = createHarnessRouter(adapters, adapters.get(fallbackHarness)!, async (input) => {
     await refreshCustomProviders();
-    return resolveRuntimeChoiceDurable(configStore, runtimeOrgScope, input.scopeLabel, fallback, {
+    const choice = await resolveRuntimeChoiceDurable(configStore, runtimeOrgScope, input.scopeLabel, fallback, {
       ...(input.harness ? { harnessId: input.harness as HarnessId } : {}),
       ...(input.model ? { modelId: input.model } : {}),
     });
+    if (input.modelProviderRevision !== undefined) {
+      const providerId = resolveModel(choice.modelId)?.provider;
+      const active = providerId ? await customProviders.resolveActive(String(providerId)) : null;
+      if (
+        !active ||
+        active.revision !== input.modelProviderRevision ||
+        !active.provider.models.some((candidate) => candidate.id === choice.modelId)
+      ) {
+        throw new NonRetryableTurnError("custom model provider changed; refresh the model configuration and retry");
+      }
+    }
+    return choice;
   });
   const customProviderHarnessTest: CustomProviderHarnessTestRunner = async (input) => {
     const initialState = input.draft
@@ -986,6 +998,7 @@ export function buildApp(
       : createMemoryRunStore({ maxClaims: config.maxClaims });
   const runs: RunStore = runStore.runs;
   const ledger = runStore.ledger;
+  let runStoreReady = false;
 
   let processes: ProcessRegistry | undefined;
   if (supportsProcessSessions(sandbox)) {
@@ -1592,8 +1605,12 @@ export function buildApp(
       )
     : null;
   const runtime: Runtime = {
-    ready: () => drain.ready(),
-    readyForTraffic: () => drain.readyForTraffic(),
+    async ready() {
+      await runStore.ready();
+      await drain.ready();
+      runStoreReady = true;
+    },
+    readyForTraffic: () => runStoreReady && drain.readyForTraffic(),
     start() {
       drain.start();
       if (!config.backgroundWorkEnabled) return;

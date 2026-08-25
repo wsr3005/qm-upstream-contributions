@@ -2331,6 +2331,9 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             ...(extras.images?.length ? { images: extras.images } : {}),
             ...(input.harness ? { harness: input.harness } : {}),
             ...(input.model ? { model: input.model } : {}),
+            ...(input.modelProviderRevision !== undefined
+              ? { modelProviderRevision: input.modelProviderRevision }
+              : {}),
             ...(input.thinkingLevel ? { thinkingLevel: input.thinkingLevel } : {}),
             ...(typeof effectiveFastMode === "boolean" ? { fastMode: effectiveFastMode } : {}),
             ...(strictReadOnly ? { readOnly: true } : {}),

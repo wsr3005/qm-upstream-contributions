@@ -12,6 +12,7 @@ import type { LedgerBegin, ToolLedger } from "./tool-ledger.ts";
 export interface PostgresRuntime {
   runs: RunStore;
   ledger: ToolLedger;
+  ready(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -62,7 +63,8 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
     `CREATE INDEX IF NOT EXISTS idx_runs_session_active_created
         ON runs(session_id, created_at DESC) WHERE status IN ('pending','running')`,
     `CREATE TABLE IF NOT EXISTS run_idempotency_families(
-        family_key TEXT PRIMARY KEY, run_id TEXT UNIQUE NOT NULL
+        family_key TEXT PRIMARY KEY,
+        run_id TEXT UNIQUE NOT NULL REFERENCES runs(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
       )`,
     `CREATE OR REPLACE FUNCTION qm_claim_run_idempotency_family() RETURNS trigger LANGUAGE plpgsql AS $$
       DECLARE
@@ -72,7 +74,13 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
       BEGIN
         IF NEW.idempotency_key IS NULL THEN RETURN NEW; END IF;
         family_key_value := regexp_replace(NEW.idempotency_key, ':project-[0-9]+$', '');
-        SELECT id INTO existing_run_id FROM runs WHERE idempotency_key=NEW.idempotency_key;
+        PERFORM pg_advisory_xact_lock(hashtext(family_key_value));
+        SELECT id INTO existing_run_id FROM runs
+          WHERE regexp_replace(idempotency_key, ':project-[0-9]+$', '')=family_key_value
+          ORDER BY created_at, seq LIMIT 1;
+        IF existing_run_id IS NOT NULL AND existing_run_id<>NEW.id THEN
+          RAISE EXCEPTION 'idempotency family is already claimed' USING ERRCODE='23505';
+        END IF;
         INSERT INTO run_idempotency_families(family_key, run_id)
           VALUES (family_key_value, COALESCE(existing_run_id, NEW.id))
           ON CONFLICT (family_key) DO NOTHING;
@@ -82,11 +90,41 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
         END IF;
         RETURN NEW;
       END $$`,
-    `DROP TRIGGER IF EXISTS trg_runs_claim_idempotency_family ON runs`,
-    `CREATE TRIGGER trg_runs_claim_idempotency_family BEFORE INSERT ON runs
-      FOR EACH ROW EXECUTE FUNCTION qm_claim_run_idempotency_family()`,
+    `CREATE OR REPLACE FUNCTION qm_release_run_idempotency_family() RETURNS trigger LANGUAGE plpgsql AS $$
+      DECLARE
+        family_key_value TEXT;
+      BEGIN
+        IF OLD.idempotency_key IS NULL THEN RETURN OLD; END IF;
+        family_key_value := regexp_replace(OLD.idempotency_key, ':project-[0-9]+$', '');
+        PERFORM pg_advisory_xact_lock(hashtext(family_key_value));
+        DELETE FROM run_idempotency_families WHERE family_key=family_key_value AND run_id=OLD.id;
+        RETURN OLD;
+      END $$`,
     `DO $$
       BEGIN
+        LOCK TABLE runs IN SHARE ROW EXCLUSIVE MODE;
+        IF EXISTS (
+          SELECT 1 FROM run_idempotency_families f
+          LEFT JOIN runs r ON r.id=f.run_id
+          WHERE r.id IS NULL
+             OR regexp_replace(r.idempotency_key, ':project-[0-9]+$', '')<>f.family_key
+        ) THEN
+          RAISE EXCEPTION 'run idempotency family mapping is inconsistent';
+        END IF;
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_trigger
+          WHERE tgrelid='runs'::regclass AND tgname='trg_runs_claim_idempotency_family'
+        ) THEN
+          CREATE TRIGGER trg_runs_claim_idempotency_family BEFORE INSERT ON runs
+            FOR EACH ROW EXECUTE FUNCTION qm_claim_run_idempotency_family();
+        END IF;
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_trigger
+          WHERE tgrelid='runs'::regclass AND tgname='trg_runs_release_idempotency_family'
+        ) THEN
+          CREATE TRIGGER trg_runs_release_idempotency_family AFTER DELETE ON runs
+            FOR EACH ROW EXECUTE FUNCTION qm_release_run_idempotency_family();
+        END IF;
         IF EXISTS (
           SELECT 1 FROM runs WHERE idempotency_key IS NOT NULL
           GROUP BY regexp_replace(idempotency_key, ':project-[0-9]+$', '')
@@ -94,19 +132,21 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
         ) THEN
           RAISE EXCEPTION 'active legacy project idempotency duplicates require reconciliation';
         END IF;
+        INSERT INTO run_idempotency_families(family_key, run_id)
+          SELECT regexp_replace(idempotency_key, ':project-[0-9]+$', ''), id
+          FROM runs WHERE idempotency_key IS NOT NULL ORDER BY created_at, seq
+          ON CONFLICT (family_key) DO NOTHING;
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conrelid='run_idempotency_families'::regclass
+            AND contype='f'
+            AND conname='run_idempotency_families_run_id_fkey'
+        ) THEN
+          ALTER TABLE run_idempotency_families
+            ADD CONSTRAINT run_idempotency_families_run_id_fkey
+            FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED;
+        END IF;
       END $$`,
-    `INSERT INTO run_idempotency_families(family_key, run_id)
-      SELECT regexp_replace(idempotency_key, ':project-[0-9]+$', ''), id
-      FROM runs WHERE idempotency_key IS NOT NULL ORDER BY created_at, seq
-      ON CONFLICT (family_key) DO NOTHING`,
-    `CREATE OR REPLACE FUNCTION qm_release_run_idempotency_family() RETURNS trigger LANGUAGE plpgsql AS $$
-      BEGIN
-        DELETE FROM run_idempotency_families WHERE run_id=OLD.id;
-        RETURN OLD;
-      END $$`,
-    `DROP TRIGGER IF EXISTS trg_runs_release_idempotency_family ON runs`,
-    `CREATE TRIGGER trg_runs_release_idempotency_family AFTER DELETE ON runs
-      FOR EACH ROW EXECUTE FUNCTION qm_release_run_idempotency_family()`,
     `DROP INDEX IF EXISTS idx_runs_status_priority_created`,
     `UPDATE runs SET status='pending', lease_token=NULL, lease_expires_at=NULL, worker_id=NULL
       WHERE status='running' AND id IN (
@@ -489,5 +529,5 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
     },
   };
 
-  return { runs, ledger, close: () => runs.close!() };
+  return { runs, ledger, ready: async () => void (await pg.pool()), close: () => runs.close!() };
 }

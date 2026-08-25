@@ -7,6 +7,7 @@ import type { LedgerBegin, ToolLedger } from "./tool-ledger.ts";
 export interface MemoryRuntime {
   runs: RunStore;
   ledger: ToolLedger;
+  ready(): Promise<void>;
 }
 
 export function createMemoryRunStore(opts?: { maxClaims?: number }): MemoryRuntime {
@@ -281,5 +282,5 @@ export function createMemoryRunStore(opts?: { maxClaims?: number }): MemoryRunti
     },
   };
 
-  return { runs: store, ledger: toolLedger };
+  return { runs: store, ledger: toolLedger, ready: async () => undefined };
 }

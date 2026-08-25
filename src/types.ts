@@ -424,6 +424,7 @@ export interface TurnRequest {
   attachments?: IncomingAttachment[];
   inboundNotes?: string[];
   model?: string;
+  modelProviderRevision?: number;
   harness?: string;
   thinkingLevel?: string;
   fastMode?: boolean;

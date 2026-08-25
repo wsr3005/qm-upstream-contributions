@@ -976,6 +976,38 @@ test("pg run store: enqueue dedup, atomic one-per-session claim, fencing, ledger
       assert.equal(familyCount.rows[0].count, 1);
       assert.equal(await runs.withdraw(stable.run.id), true);
       assert.equal(await runs.withdraw(newResult.run.id), true);
+
+      const withdrawRace = await runs.enqueue({
+        sessionId: "sWithdrawRace",
+        request: turn("withdraw race"),
+        dedupKey: "withdraw-race-key",
+      });
+      const deleting = await oldWriter.connect();
+      try {
+        await deleting.query("BEGIN");
+        await deleting.query("DELETE FROM runs WHERE id=$1", [withdrawRace.run.id]);
+        let insertSettled = false;
+        const reinsert = oldWriter
+          .query(
+            `INSERT INTO runs(id, session_id, status, request, idempotency_key, attempts, max_attempts, created_at)
+             VALUES ($1,$2,'pending',$3,$4,0,3,$5) RETURNING id`,
+            ["withdraw-race-reinsert", "sWithdrawRace", JSON.stringify(turn("withdraw race")), "withdraw-race-key", Date.now()],
+          )
+          .finally(() => {
+            insertSettled = true;
+          });
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(insertSettled, false);
+        await deleting.query("COMMIT");
+        assert.equal((await reinsert).rows[0]?.id, "withdraw-race-reinsert");
+        const mapping = await oldWriter.query(
+          "SELECT run_id FROM run_idempotency_families WHERE family_key='withdraw-race-key'",
+        );
+        assert.equal(mapping.rows[0]?.run_id, "withdraw-race-reinsert");
+      } finally {
+        await deleting.query("ROLLBACK").catch(() => undefined);
+        deleting.release();
+      }
     } finally {
       await oldWriter.end();
     }
@@ -1491,4 +1523,48 @@ test("pg deleteSessionIfEmpty: a held lease or landed entries refuse the discard
   await raw.end();
   assert.equal(Number(orphans.rows[0].e), 0, "no orphaned entries survive the discard");
   assert.equal(Number(orphans.rows[0].l), 0, "no orphaned lease survives the discard");
+});
+
+test("pg run store readiness rejects active duplicates written while migration waits", { skip }, async () => {
+  const pg = (await import("pg")).default;
+  const raw = new pg.Pool({ connectionString: URL });
+  const writer = await raw.connect();
+  const suffix = `migration-${Date.now()}`;
+  try {
+    await raw.query("DROP TRIGGER IF EXISTS trg_runs_claim_idempotency_family ON runs");
+    await raw.query("DROP TRIGGER IF EXISTS trg_runs_release_idempotency_family ON runs");
+    await raw.query("DELETE FROM run_idempotency_families");
+    await writer.query("BEGIN");
+    await writer.query(
+      `INSERT INTO runs(id, session_id, status, request, idempotency_key, attempts, max_attempts, created_at)
+       VALUES ($1,$2,'pending',$3,$4,0,3,$5),($6,$2,'pending',$3,$7,0,3,$5)`,
+      [
+        `${suffix}-one`,
+        suffix,
+        JSON.stringify(turn("migration duplicate")),
+        `${suffix}:project-1`,
+        Date.now(),
+        `${suffix}-two`,
+        `${suffix}:project-2`,
+      ],
+    );
+    const runtime = createPostgresRunStore(URL!);
+    let settled = false;
+    const readiness = runtime.ready().finally(() => {
+      settled = true;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settled, false);
+    await writer.query("COMMIT");
+    await assert.rejects(readiness, /active legacy project idempotency duplicates require reconciliation/);
+    await runtime.close().catch(() => undefined);
+  } finally {
+    await writer.query("ROLLBACK").catch(() => undefined);
+    writer.release();
+    await raw.query("DELETE FROM runs WHERE session_id=$1", [suffix]);
+    const repaired = createPostgresRunStore(URL!);
+    await repaired.ready();
+    await repaired.close();
+    await raw.end();
+  }
 });

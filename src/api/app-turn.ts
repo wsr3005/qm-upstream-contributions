@@ -61,6 +61,12 @@ export function createTurnMethods(
       if (!deps.identity.isInternal(actor)) {
         return { status: "refused", reason: "internal-only: non-internal principals cannot interact" };
       }
+      if (
+        req.modelProviderRevision !== undefined &&
+        (!Number.isInteger(req.modelProviderRevision) || req.modelProviderRevision <= 0)
+      ) {
+        return { status: "refused", reason: "model provider revision must be a positive integer" };
+      }
       await deps.refreshCustomProviders?.();
       let projectAudience: Principal[] | undefined;
       let projectName: string | undefined;
@@ -185,6 +191,20 @@ export function createTurnMethods(
             reason: "that model isn't available on this deployment (its provider isn't configured)",
           };
         }
+        if (req.modelProviderRevision !== undefined) {
+          const providerId = resolveModel(runtime.modelId)?.provider;
+          const active = providerId && deps.customProviders ? await deps.customProviders.resolveActive(String(providerId)) : null;
+          if (
+            !active ||
+            active.revision !== req.modelProviderRevision ||
+            !active.provider.models.some((candidate) => candidate.id === runtime.modelId)
+          ) {
+            return {
+              status: "refused",
+              reason: "custom model provider changed; refresh the model configuration and retry",
+            };
+          }
+        }
         const configuredWebuiModels = await deps.config.getWebuiModelsDurable(org);
         let enabledWebuiModels: string[] | null = null;
         if (configuredWebuiModels?.length) {
@@ -254,6 +274,7 @@ export function createTurnMethods(
         ...(req.inboundNotes?.length ? { inboundNotes: req.inboundNotes } : {}),
         ...(req.harness ? { harness: req.harness } : {}),
         ...(req.model ? { model: req.model } : {}),
+        ...(req.modelProviderRevision !== undefined ? { modelProviderRevision: req.modelProviderRevision } : {}),
         ...turnModelOptions(req),
         ...(req.readOnly ? { readOnly: true } : {}),
         ...(req.skipMemory ? { skipMemory: true } : {}),
