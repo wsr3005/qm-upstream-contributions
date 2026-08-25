@@ -16,6 +16,11 @@ test("core deploy image includes git", () => {
   );
   assert.match(
     dockerfile,
+    /\bapk\s+add\b[\s\S]*\bdocker-cli\b/,
+    "the Docker local sandbox backend shells out to the Docker CLI from Core",
+  );
+  assert.match(
+    dockerfile,
     /npm audit --omit=dev --audit-level=moderate/,
     "the production dependency threshold is a build gate",
   );
