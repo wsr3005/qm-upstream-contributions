@@ -15,6 +15,7 @@ type TurnBody = {
   text?: string;
   harness?: string;
   model?: string;
+  modelProviderRevision?: number;
   idempotencyKey?: string;
 };
 let lastTurnBody: TurnBody | null = null;
@@ -138,6 +139,7 @@ test("POST /api/turn forwards blobId attachments to core as references (no inlin
       threadRef: "web:alice:t1",
       harness: "codex",
       model: "gpt-5.6-sol",
+      modelProviderRevision: 7,
       idempotencyKey: "qa-codex-attachment-1",
       attachments: [
         { name: "big.bin", mimetype: "application/octet-stream", sizeBytes: 5242880, blobId: "blob-abc123" },
@@ -154,6 +156,7 @@ test("POST /api/turn forwards blobId attachments to core as references (no inlin
   assert.equal((atts[0] as Record<string, unknown>).contentBase64, undefined, "no inline bytes ride the turn body");
   assert.equal(lastTurnBody!.harness, "codex", "the selected harness reaches core");
   assert.equal(lastTurnBody!.model, "gpt-5.6-sol", "the selected model reaches core");
+  assert.equal(lastTurnBody!.modelProviderRevision, 7, "the reserved Provider revision reaches core");
   assert.match(
     lastTurnBody!.idempotencyKey ?? "",
     /^web-qa:alice:qa-codex-attachment-1$/u,
@@ -180,6 +183,7 @@ test("the same external key deduplicates different turn bodies for one user with
         threadRef: `web:${user}:qa`,
         harness: "pi",
         model: "gpt-5.6-luna",
+        modelProviderRevision: 7,
         idempotencyKey: "qa-shared-1",
       }),
     });
@@ -212,6 +216,26 @@ test("POST /api/turn requires an explicit Harness and model for an external test
   });
   assert.equal(r.status, 400);
   assert.equal(lastTurnBody, null);
+});
+
+test("POST /api/turn requires a positive Provider revision for an external test key", async () => {
+  for (const modelProviderRevision of [undefined, 0, 1.5, "7"]) {
+    setTurnBody(null);
+    const r = await fetch(`${base}/api/turn`, {
+      method: "POST",
+      headers: { ...IDENTITY, "content-type": "application/json" },
+      body: JSON.stringify({
+        text: "msg",
+        threadRef: "web:alice:t-provider-revision",
+        harness: "pi",
+        model: "enterprise-openai/gpt-5.6-luna",
+        idempotencyKey: "qa-provider-revision-1",
+        ...(modelProviderRevision !== undefined ? { modelProviderRevision } : {}),
+      }),
+    });
+    assert.equal(r.status, 400);
+    assert.equal(lastTurnBody, null);
+  }
 });
 
 test("POST /api/turn drops an attachment with no blobId rather than forwarding junk", async () => {

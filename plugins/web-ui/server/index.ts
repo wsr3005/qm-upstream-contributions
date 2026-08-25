@@ -1706,6 +1706,7 @@ const apiRoutes: readonly WebRoute[] = [
       let text = "";
       let threadRef = `${ownPrefix}default`;
       let model: string | undefined;
+      let modelProviderRevision: number | undefined;
       let harness: string | undefined;
       let thinkingLevel: string | undefined;
       let fastMode: boolean | undefined;
@@ -1714,6 +1715,7 @@ const apiRoutes: readonly WebRoute[] = [
       let channelName: string | undefined;
       let idempotencyKey: string | undefined;
       let invalidIdempotencyKey = false;
+      let invalidModelProviderRevision = false;
       const attachments: CoreAttachment[] = [];
       let approval: { requestId: string; approved: boolean; scope?: string } | undefined;
       let proactiveOpener = false;
@@ -1734,6 +1736,13 @@ const apiRoutes: readonly WebRoute[] = [
         if (typeof p.scopeId === "string" && p.scopeId) scope = p.scopeId;
         if (typeof p.channelName === "string" && p.channelName.trim()) channelName = p.channelName.trim().slice(0, 200);
         if (typeof p.model === "string" && p.model) model = p.model;
+        if (p.modelProviderRevision !== undefined) {
+          if (Number.isInteger(p.modelProviderRevision) && p.modelProviderRevision > 0) {
+            modelProviderRevision = p.modelProviderRevision;
+          } else {
+            invalidModelProviderRevision = true;
+          }
+        }
         if (typeof p.harness === "string") harness = p.harness;
         if (typeof p.thinkingLevel === "string") thinkingLevel = p.thinkingLevel;
         if (typeof p.fastMode === "boolean") fastMode = p.fastMode;
@@ -1762,7 +1771,9 @@ const apiRoutes: readonly WebRoute[] = [
         if (e instanceof PayloadTooLargeError) throw e;
       }
       if (invalidIdempotencyKey) return json(res, 400, { error: "invalid_idempotency_key" });
-      if (idempotencyKey && (!harness || !model)) return json(res, 400, { error: "missing_test_runtime" });
+      if (invalidModelProviderRevision) return json(res, 400, { error: "invalid_model_provider_revision" });
+      if (idempotencyKey && (!harness || !model || modelProviderRevision === undefined))
+        return json(res, 400, { error: "missing_test_runtime" });
       if (!text.trim() && attachments.length === 0 && !approval && !proactiveOpener)
         return json(res, 400, { error: "empty message" });
 
@@ -1791,6 +1802,7 @@ const apiRoutes: readonly WebRoute[] = [
         text,
         ...(harness ? { harness } : {}),
         ...(model ? { model } : {}),
+        ...(modelProviderRevision !== undefined ? { modelProviderRevision } : {}),
         ...(thinkingLevel ? { thinkingLevel } : {}),
         ...(typeof fastMode === "boolean" ? { fastMode } : {}),
         ...(timezone ? { timezone } : {}),
