@@ -12,7 +12,7 @@ export default defineConfig({
     {
       name: "katex-fonts",
       closeBundle() {
-        cpSync(here("node_modules/katex/dist/fonts"), here("dist-web/fonts"), { recursive: true });
+        cpSync(here("node_modules/katex/dist/fonts"), here("dist-web/assets/fonts"), { recursive: true });
       },
     },
   ],
