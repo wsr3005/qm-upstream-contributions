@@ -20,7 +20,7 @@ export const CUSTOM_PROVIDER_INPUT_MODALITIES_SCHEMA = 2;
 export const CUSTOM_PROVIDER_INPUT_MODALITIES_CAPABILITY = "custom-provider-input-modalities-v2";
 export const CUSTOM_PROVIDER_PUBLICATION_SCHEMA = 3;
 export const CUSTOM_PROVIDER_PUBLICATION_CAPABILITY = "custom-provider-publication-v3";
-export const CUSTOM_PROVIDER_HARNESS_TEST_CAPABILITY = "custom-provider-harness-test-v2";
+export const CUSTOM_PROVIDER_HARNESS_TEST_CAPABILITY = "custom-provider-harness-test-v3";
 
 export class CustomProviderRuntimeNotReadyError extends Error {}
 

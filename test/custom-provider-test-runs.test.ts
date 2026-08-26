@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import { createMemoryAdvisoryLock } from "../src/persistence/advisory-lock.ts";
 import { createMemoryMap } from "../src/persistence/durable-map.ts";
 import {
   createCustomProviderTestRunStore,
+  customProviderTestRequestFingerprint,
   type CustomProviderTestRunIdentity,
   type StoredCustomProviderTestRun,
 } from "../src/model/custom-provider-test-runs.ts";
@@ -16,6 +18,27 @@ const IDENTITY: CustomProviderTestRunIdentity = {
   providerRevision: 3,
   rolloutFence: "epoch-7",
 };
+
+test("formal reservations extend fingerprints without invalidating legacy paid-test receipts", () => {
+  const legacyFingerprint = createHash("sha256")
+    .update(
+      JSON.stringify([
+        IDENTITY.scopeId,
+        IDENTITY.providerId,
+        IDENTITY.modelId,
+        IDENTITY.harnessId,
+        IDENTITY.providerRevision,
+        IDENTITY.rolloutFence,
+        null,
+      ]),
+    )
+    .digest("hex");
+  assert.equal(customProviderTestRequestFingerprint(IDENTITY), legacyFingerprint);
+  assert.notEqual(
+    customProviderTestRequestFingerprint({ ...IDENTITY, reservationFingerprint: "signed-reservation" }),
+    legacyFingerprint,
+  );
+});
 
 test("custom provider paid tests admit one owner and replay its durable result", async () => {
   const now = 1_000;

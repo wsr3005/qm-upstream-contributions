@@ -105,7 +105,7 @@ export function customProviderTestRequestFingerprint(identity: CustomProviderTes
     identity.providerRevision,
     identity.rolloutFence,
     identity.configurationFingerprint ?? null,
-    identity.reservationFingerprint ?? null,
+    ...(identity.reservationFingerprint === undefined ? [] : [identity.reservationFingerprint]),
   ]);
 }
 

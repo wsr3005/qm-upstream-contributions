@@ -138,6 +138,7 @@ test("serverDeps wires the custom-provider store and resolves a custom boot defa
 });
 
 test("production harness testing returns a stable fence only when every live runtime advertises the B protocol", async () => {
+  assert.equal(CUSTOM_PROVIDER_HARNESS_TEST_CAPABILITY, "custom-provider-harness-test-v3");
   let allCapable = false;
   const checked: string[] = [];
   const built = buildApp(
