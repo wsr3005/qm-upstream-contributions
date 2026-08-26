@@ -852,15 +852,16 @@ test("sandbox shape errors: object, app non-empty string, env string-map, secret
   const cases: Array<{ sandbox: unknown; rx: RegExp }> = [
     { sandbox: "x", rx: /"sandbox" must be an object/ },
     { sandbox: ["x"], rx: /"sandbox" must be an object/ },
-    { sandbox: { app: "" }, rx: /"sandbox.app" must be a non-empty string/ },
-    { sandbox: { app: 5 }, rx: /"sandbox.app" must be a non-empty string/ },
+    { sandbox: { app: "" }, rx: /"sandbox.app" must be a non-empty/ },
+    { sandbox: { app: 5 }, rx: /"sandbox.app" must be a non-empty/ },
     { sandbox: { env: { TZ: 5 } }, rx: /"sandbox.env.TZ" must be a string/ },
     { sandbox: { env: { "1BAD": "x" } }, rx: /"sandbox.env" key .* is not a valid env var name/ },
     { sandbox: { secretEnv: "X" }, rx: /"sandbox.secretEnv" must be an array of strings/ },
     { sandbox: { secretEnv: ["1BAD"] }, rx: /not a valid env var name/ },
-    { sandbox: { backend: "k8s", app: "acme-sandboxes" }, rx: /"sandbox.backend" must be "sprites".*or "aws"/ },
-    { sandbox: { backend: "fly", app: "acme-sandboxes" }, rx: /"sandbox.backend" must be "sprites".*or "aws"/ },
+    { sandbox: { backend: "k8s", app: "acme-sandboxes" }, rx: /"sandbox.backend" must be "sprites".*or "local"/ },
+    { sandbox: { backend: "fly", app: "acme-sandboxes" }, rx: /"sandbox.backend" must be "sprites".*or "local"/ },
     { sandbox: { backend: "sprites" }, rx: /"sandbox.backend": "sprites" requires "sandbox.app"/ },
+    { sandbox: { backend: "local" }, rx: /"sandbox.backend": "local" requires digest-pinned/ },
     {
       sandbox: { backend: "aws", app: "acme-sandboxes" },
       rx: /"sandbox.backend": "aws" \(Lambda MicroVM sandboxes\) requires target "aws"/,
@@ -869,6 +870,86 @@ test("sandbox shape errors: object, app non-empty string, env string-map, secret
   for (const { sandbox, rx } of cases) {
     withConfig({ sandbox }, ({ path }) =>
       assert.throws(() => loadConfigAt(path), rx, `expected ${JSON.stringify(sandbox)} rejected`),
+    );
+  }
+});
+
+test("docker accepts an explicit local sandbox with a digest-pinned image", () => {
+  withConfig(
+    {
+      target: "docker",
+      sandbox: {
+        app: "local-sandboxes",
+        backend: "local",
+        image: `registry.example.test/sandbox@sha256:${"a".repeat(64)}`,
+      },
+    },
+    ({ path }) => assert.equal(loadConfigAt(path).config.sandbox?.backend, "local"),
+  );
+});
+
+test("docker local rejects sandbox env declarations it cannot deliver", () => {
+  for (const sandbox of [
+    {
+      app: "local-sandboxes",
+      backend: "local",
+      image: `registry.example.test/sandbox@sha256:${"a".repeat(64)}`,
+      env: { REGION: "test" },
+    },
+    {
+      app: "local-sandboxes",
+      backend: "local",
+      image: `registry.example.test/sandbox@sha256:${"a".repeat(64)}`,
+      secretEnv: ["TOOL_TOKEN"],
+    },
+  ]) {
+    withConfig({ target: "docker", sandbox }, ({ path }) => {
+      assert.throws(() => loadConfigAt(path), /does not support sandbox.env or sandbox.secretEnv/);
+    });
+  }
+});
+
+test("docker local rejects Core overrides of its backend and image contract", () => {
+  const sandbox = {
+    app: "local-sandboxes",
+    backend: "local",
+    image: `registry.example.test/sandbox@sha256:${"a".repeat(64)}`,
+  };
+  for (const config of [
+    { target: "docker", sandbox, env: { core: { SANDBOX_BACKEND: "sprites" } } },
+    { target: "docker", sandbox, env: { core: { LOCAL_SANDBOX_IMAGE: "mutable.invalid/sandbox:latest" } } },
+    { target: "docker", sandbox, secretEnv: { core: { LOCAL_SANDBOX_IMAGE: "IMAGE_SECRET" } } },
+    { target: "docker", sandbox, secretEnv: { core: { SANDBOX_BACKEND: "BACKEND_SECRET" } } },
+    { target: "docker", sandbox, env: { core: { DOCKER_HOST: "tcp://remote.example:2375" } } },
+    { target: "docker", sandbox, secretEnv: { core: { DOCKER_CONTEXT: "DOCKER_CONTEXT_SECRET" } } },
+    { target: "docker", sandbox, env: { core: { DOCKER_TLS_VERIFY: "1" } } },
+    { target: "docker", sandbox, secretEnv: { core: { DOCKER_CERT_PATH: "DOCKER_CERT_PATH_SECRET" } } },
+    { target: "docker", sandbox, env: { core: { DOCKER_CONFIG: "/tmp/remote-docker" } } },
+  ]) {
+    withConfig(config, ({ path }) => assert.throws(() => loadConfigAt(path), /conflicts|managed by/));
+  }
+});
+
+test("docker rejects local as a secondary sandbox because it cannot mount that runtime contract", () => {
+  for (const sandbox of [
+    {
+      backend: "sprites",
+      app: "acme-sandboxes",
+      image: `registry.example/sandbox@sha256:${"a".repeat(64)}`,
+    },
+    {
+      backend: "local",
+      app: "acme-sandboxes",
+      image: `registry.example/sandbox@sha256:${"a".repeat(64)}`,
+    },
+  ]) {
+    withConfig(
+      {
+        target: "docker",
+        sandbox,
+        env: { core: { SANDBOX_SECONDARY_BACKEND: "local" } },
+      },
+      ({ path }) => assert.throws(() => loadConfigAt(path), /does not support a secondary local sandbox/),
     );
   }
 });
