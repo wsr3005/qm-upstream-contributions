@@ -386,13 +386,16 @@ export function sanitizeTitle(out: string | undefined): string | undefined {
   if (!out) return undefined;
   let t = (out.trim().split("\n")[0] ?? "").trim();
   if (!t || /^none$/i.test(t)) return undefined;
+  t = t.replace(/^\*\*(.+)\*\*$/, "$1").trim();
+  t = t.replace(/^__(.+)__$/, "$1").trim();
+  t = t.replace(/^#{1,6}\s+/, "").trim();
   t = t.replace(/^(?:title|chat title)\s*[:-]\s*/i, "");
   t = t.replace(/^["'“”‘’`]+|["'“”‘’`]+$/g, "").trim();
   t = t.replace(/[\s.,;:!?]+$/g, "").trim();
-  if (!t) return undefined;
+  if (!t || /^none$/i.test(t) || /^[#*_`~\s-]+$/.test(t)) return undefined;
   // Reject reply-shaped output — the model answered the transcript instead of titling it.
   if (t.length > 90 || t.split(/\s+/).length > 12) return undefined;
-  if (/\*\*|^#/.test(t)) return undefined;
+  if (/\*\*|__|^#/.test(t)) return undefined;
   if (/^(?:i|i['’]\w+|sorry|unfortunately|sure|okay|ok|here['’]?s|as an ai)\b/i.test(t)) return undefined;
   return t.length > MAX_TITLE_CHARS ? `${t.slice(0, MAX_TITLE_CHARS).trimEnd()}…` : t;
 }
