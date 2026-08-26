@@ -2843,7 +2843,6 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         });
         const turnCompleted = outcome.completed;
         const pausing = outcome.paused;
-        if (input.runId && !pausing && reply && reply.trim()) deps.turnStream?.markReplyDone(input.runId);
         const turnUserSeq = emittedEntries.find((e) => e.type === "user")?.seq;
         let metricProvisionMs: number | undefined;
         if (box.provisionMs !== undefined) metricProvisionMs = box.provisionMs;
@@ -3069,6 +3068,15 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             ...(sourceAssistantEntrySeq !== undefined ? { sourceAssistantEntrySeq } : {}),
           };
         }
+
+        if (
+          input.runId &&
+          finalResult.status === "ok" &&
+          !finalResult.stopped &&
+          finalResult.reply &&
+          finalResult.reply.trim()
+        )
+          deps.turnStream?.markReplyDone(input.runId, finalResult.reply);
 
         if (input.background && box.used && box.handle && finalResult.status === "ok") {
           tailOwnsCleanup = true;

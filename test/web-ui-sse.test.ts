@@ -95,6 +95,28 @@ test("SSE streams partial frames then a terminal done frame carrying the reply",
   assert.equal(d.replyComplete, true, "done frame flags the reply as final");
 });
 
+test("SSE publishes a harness final reply when the harness emitted no deltas", async () => {
+  const submit = (await (
+    await fetch(`${webBase}/api/turn`, asUser("alice", { method: "POST", body: JSON.stringify({ text: "!nostream" }) }))
+  ).json()) as { runId?: string };
+  assert.ok(submit.runId);
+
+  const res = await fetch(
+    `${webBase}/api/runs/${encodeURIComponent(submit.runId)}/events`,
+    asUser("alice", { signal: AbortSignal.timeout(20_000) }),
+  );
+  assert.equal(res.status, 200);
+  const events = parseSse(await res.text());
+  const partial = events.find((event) => event.event === "partial");
+  const done = events.find((event) => event.event === "done");
+
+  assert.equal((partial?.data as { partial?: string } | undefined)?.partial, "complete non-streaming answer");
+  assert.ok(done);
+  const data = done.data as { partial?: string; replyComplete?: boolean };
+  assert.equal(data.partial, "complete non-streaming answer");
+  assert.equal(data.replyComplete, true);
+});
+
 test("SSE relays tool activity frames and folds them into the done frame", async () => {
   const submit = (await (
     await fetch(

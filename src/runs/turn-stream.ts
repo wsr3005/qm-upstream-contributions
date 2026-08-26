@@ -9,7 +9,7 @@ export interface TurnStream {
   markSurfacePosted(runId: string): void;
   surfacePosted(runId: string): boolean;
   snapshot(runId: string): string | null;
-  markReplyDone(runId: string): void;
+  markReplyDone(runId: string, reply?: string): void;
   isReplyDone(runId: string): boolean;
   end(runId: string): void;
   subscribe(runId: string, listener: TurnStreamListener): () => void;
@@ -143,10 +143,10 @@ export function createTurnStream(opts: TurnStreamOptions = {}): TurnStream {
       return text ? text : null;
     },
 
-    markReplyDone(runId) {
-      const entry = runs.get(runId);
-      if (entry) entry.replyDone = true;
-      else runs.set(runId, makeEntry({ replyDone: true }));
+    markReplyDone(runId, reply) {
+      const entry = ensure(runId);
+      if (reply && !entry.text) entry.text = reply.slice(0, maxChars);
+      entry.replyDone = true;
     },
 
     isReplyDone(runId) {

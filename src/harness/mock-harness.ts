@@ -103,6 +103,7 @@ export function createMockHarness(): Harness {
         const addressedCmd = /<addressed-messages[^>]*>\s*<message[^>]*>\s*(![^<\n]+)/.exec(turn.input)?.[1]?.trim();
         const cmd = firstLine.startsWith("<") ? (whyCmd ?? addressedCmd ?? turn.input) : turn.input;
         const command0 = cmd.split("\n")[0]?.trim() ?? "";
+        const streamReply = command0 !== "!nostream";
         const cacheMiss = command0 === "!cachemiss";
         const systemPromptTokens = countTokens(turn.systemPrompt);
         const prefixTokens = cacheMiss ? Math.max(2048, systemPromptTokens) : Math.max(1, systemPromptTokens);
@@ -251,6 +252,8 @@ export function createMockHarness(): Harness {
           reply = turn.systemPrompt;
         } else if (command0 === "!wallclock") {
           reply = `wallclock:${turn.turnWallClockMs ?? 0}`;
+        } else if (command0 === "!nostream") {
+          reply = "complete non-streaming answer";
         } else if (command0.startsWith("!askagent ")) {
           const rest = command0.slice("!askagent ".length).trim();
           const sp = rest.indexOf(" ");
@@ -669,7 +672,7 @@ export function createMockHarness(): Harness {
         if (turn.images?.length)
           reply += `\n[vision: ${turn.images.length} image(s): ${turn.images.map((i) => i.mimeType).join(", ")}]`;
 
-        if (turn.onDelta) for (const chunk of streamChunks(reply)) turn.onDelta(chunk);
+        if (turn.onDelta && streamReply) for (const chunk of streamChunks(reply)) turn.onDelta(chunk);
 
         await turn.emit({ type: "assistant", payload: { text: reply }, scopeLabel: turn.scopeLabel });
         const modelCalls = usedTool ? 2 : 1;

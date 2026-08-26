@@ -125,6 +125,22 @@ test("markReplyDone flags the reply as final independently of the run lifecycle"
   assert.equal(s.snapshot("r1"), "the answer", "the buffered reply is still readable");
 });
 
+test("markReplyDone publishes a final reply when a harness did not stream deltas", () => {
+  const s = createTurnStream();
+  s.begin("r1");
+  s.markReplyDone("r1", "complete answer");
+  assert.equal(s.snapshot("r1"), "complete answer");
+  assert.equal(s.isReplyDone("r1"), true);
+});
+
+test("markReplyDone preserves text already published by a streaming harness", () => {
+  const s = createTurnStream();
+  s.publish("r1", "partial");
+  s.markReplyDone("r1", "complete answer");
+  assert.equal(s.snapshot("r1"), "partial");
+  assert.equal(s.isReplyDone("r1"), true);
+});
+
 test("a queued run surfaces replyComplete via getRun once the reply is final", async () => {
   const built = buildApp(
     testConfig({

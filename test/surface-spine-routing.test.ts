@@ -178,6 +178,23 @@ test("response debt: a turn that DID post keeps its monologue shed (no double re
   }
 });
 
+test("a surface-tool post never exposes its internal reply through the run stream", async () => {
+  const built = freshApp();
+  built.runtime.start();
+  try {
+    const queued = await built.app.turn(mention("!post the visible reply", "C10", "1000.1"));
+    assert.equal(queued.status, "queued");
+    const finished = await built.runs.waitFor(queued.runId!, 5_000);
+    assert.equal(finished.status, "done");
+    assert.equal(finished.result?.status, "silent");
+    const run = await built.app.getRun(queued.runId!);
+    assert.equal(run?.partial, undefined);
+    assert.equal(run?.replyComplete, undefined);
+  } finally {
+    await built.runtime.stop();
+  }
+});
+
 test("a trigger turn (surfaceTools + triggerDestination, no deliveryTarget) posts to the trigger destination", async () => {
   const built = freshApp();
   built.runtime.start();
