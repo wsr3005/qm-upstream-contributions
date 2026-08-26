@@ -36,6 +36,47 @@ test("durable production instances require a build id for capability registratio
   );
 });
 
+test("formal model test reservation secrets remain isolated from resident secrets", () => {
+  const shared = "shared-formal-reservation-secret-0123456789abcdef";
+  const candidate = "a".repeat(40);
+  const cases = [
+    ["CORE_SIGNING_SECRET", { signingSecret: shared }],
+    ["CAPABILITY_SECRET", { capabilitySecret: shared }],
+    ["PORTAL_IDENTITY_SECRET", { portalIdentitySecret: shared }],
+    ["CONNECTOR_SECRET_KEY", { connectorSecretKey: shared }],
+    ["SKILL_SIGNING_SECRET", { skillSigningSecret: shared }],
+    ["SLACK_SIGNING_SECRET", { slack: { botToken: "xoxb-test", signingSecret: shared } }],
+    ["AWS_DEPLOY_GATE_SECRET", { awsDeploy: { ...testConfig().awsDeploy, gateSecret: shared } }],
+    ["DEPLOY_APPS_SESSION_SECRET", { deployAppsSessionSecret: shared }],
+  ] as const;
+  for (const [name, override] of cases) {
+    assert.throws(
+      () =>
+        buildApp(
+          testConfig({
+            modelTestReservationSecret: shared,
+            modelTestCandidateCommit: candidate,
+            ...override,
+          }),
+        ),
+      new RegExp(`MODEL_TEST_RESERVATION_SECRET must differ from ${name}`),
+    );
+  }
+  assert.doesNotThrow(() =>
+    buildApp(
+      testConfig({
+        modelTestReservationSecret: shared,
+        modelTestCandidateCommit: candidate,
+        signingSecret: "distinct-core-signing-secret",
+        portalIdentitySecret: "distinct-portal-identity-secret",
+        skillSigningSecret: "distinct-skill-signing-secret",
+        awsDeploy: { ...testConfig().awsDeploy, gateSecret: "distinct-deploy-gate-secret" },
+        deployAppsSessionSecret: "distinct-deploy-apps-session-secret",
+      }),
+    ),
+  );
+});
+
 test("serverDeps wires the custom-provider store and resolves a custom boot default lazily", async () => {
   const config = testConfig({
     dataDir: mkdtempSync(join(tmpdir(), "custom-provider-boot-")),
