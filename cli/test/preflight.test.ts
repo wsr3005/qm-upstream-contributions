@@ -76,6 +76,23 @@ test("fly sandbox preflight passes a live token and skips when no token is prese
   assert.deepEqual(skipped, []);
 });
 
+test("Docker local sandbox preflight never probes Fly", async () => {
+  const local = {
+    ...CONFIG,
+    sandbox: {
+      app: "local-sandboxes",
+      backend: "local" as const,
+      image: `registry.example.test/sandbox@sha256:${"a".repeat(64)}`,
+    },
+  };
+  const lines = await quietAsync(() =>
+    flySandboxTokenPreflight(local, new Map([["FLY_SANDBOX_API_TOKEN", "must-not-be-used"]]), (async () => {
+      throw new Error("must not be called");
+    }) as typeof fetch),
+  );
+  assert.deepEqual(lines, []);
+});
+
 test("fly sandbox preflight warns instead of failing when the Fly API is unreachable", async () => {
   const fetchImpl = (async () => {
     throw new Error("network is down");

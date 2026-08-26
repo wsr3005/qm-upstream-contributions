@@ -32,7 +32,7 @@ test("the queue lives in core, not in the browser", () => {
     /const queuedRuns = new Map<string, QueuedRun\[\]>\(\);/,
     "what the composer holds is a view of core's queue, rebuilt from core — not a store",
   );
-  assert.match(composer, /const queued = await queueTurn\(threadRef, text, agent, ctx\.chat\.currentTurnOptions\);/);
+  assert.match(composer, /const queued = await queueTurn\(threadRef, text, agent, \(\) => turnOptions\);/);
   assert.match(
     bridge,
     /export async function queueTurn\([\s\S]{0,600}?api<\{ runId\?: string \}>\("\/api\/turn"/,
@@ -45,8 +45,10 @@ test("a queued turn carries the same model, effort and scope a typed one would",
   const body = bridge.slice(bridge.indexOf("function turnRequestBody"));
   assert.match(body, /thinkingLevel/);
   assert.match(body, /scopeId: turnOptions\.scopeId/);
-  assert.match(bridge, /\.\.\.turnRequestBody\(threadRef, text, model, agent, getTurnOptions, attachments\),/);
-  assert.match(bridge, /turnRequestBody\(threadRef, text, agent\.state\.model, agent, getTurnOptions\)/);
+  assert.match(bridge, /\.\.\.turnRequestBody\(threadRef, text, model, agent, turnOptions, attachments\),/);
+  assert.match(bridge, /turnRequestBody\(threadRef, text, agent\.state\.model, agent, turnOptions\)/);
+  assert.equal((bridge.match(/const turnOptions = getTurnOptions\?\.\(\) \?\? \{\};/g) ?? []).length, 1);
+  assert.match(bridge, /turnOptions = getTurnOptions\?\.\(\) \?\? \{\};/);
 });
 
 // Found in live QA: when the Steer control was swapped in and out of an existing strip, a tab that
