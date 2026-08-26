@@ -179,6 +179,14 @@ test("sanitizeTitle rejects reply-shaped output instead of truncating it into a 
   assert.equal(sanitizeTitle("~~I apologize~~—I cannot help"), undefined);
   assert.equal(sanitizeTitle("_I understand_，but I cannot help"), undefined);
   assert.equal(sanitizeTitle("__**I'm unable**__ to help"), undefined);
+  assert.equal(sanitizeTitle("__i__ cannot help"), undefined);
+  assert.equal(sanitizeTitle("__i__ can’t help"), undefined);
+  assert.equal(sanitizeTitle("__i__ apologize"), undefined);
+  assert.equal(sanitizeTitle("__i__ refuse to help"), undefined);
+  assert.equal(sanitizeTitle("__i__ don’t know the answer"), undefined);
+  assert.equal(sanitizeTitle("__i__ must decline"), undefined);
+  assert.equal(sanitizeTitle("_~~__Sorry__~~_ I cannot help"), undefined);
+  assert.equal(sanitizeTitle("_~~__***Sorry***__~~_ I cannot help"), undefined);
   assert.equal(sanitizeTitle('"__NONE__"'), undefined);
   assert.equal(sanitizeTitle("*****"), undefined);
   assert.equal(sanitizeTitle("_____"), undefined);

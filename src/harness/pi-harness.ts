@@ -405,14 +405,15 @@ export function sanitizeTitle(out: string | undefined): string | undefined {
   if (/(^|\s)\*{2,3}(?![\\/])[^*\n]+\*{2,3}(?=$|[\s\p{P}\p{S}])/u.test(t)) return undefined;
   let replyView = t;
   for (let i = 0; i < 4; i++) {
-    const next = replyView.replace(/^(\*{1,3}|_{1,3}|~{2})(.+?)\1(?=$|[\s\p{P}\p{S}])/u, "$2");
+    const next = replyView.replace(/^(\*{1,3}|_{1,3}|~{2})(.+)\1(?=$|[\s\p{P}\p{S}])/u, "$2");
     if (next === replyView) break;
     replyView = next;
   }
   const plainReply = /^(?:i|i['’]\w+|sorry|unfortunately|sure|okay|ok|here['’]?s|as an ai)\b/i;
   const emphasizedReply = /^(?:sorry|unfortunately|sure|okay|here['’]?s|as an ai)\b/i;
   const emphasizedFirstPersonReply = /^(?:i\b|i['’]\w+\b)/i;
-  const technicalDunderI = /^__i__\s+\S/.test(t);
+  const technicalDunderI =
+    /^__i__\s+(?:variable|identifier|index|field|property|parameter|symbol|type|value|loop)\b/.test(t);
   if (
     (replyView === t && plainReply.test(replyView)) ||
     (replyView !== t &&
