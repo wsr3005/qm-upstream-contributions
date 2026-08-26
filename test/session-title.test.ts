@@ -164,11 +164,15 @@ test("sanitizeTitle rejects reply-shaped output instead of truncating it into a 
   assert.equal(sanitizeTitle("Exclude **/node_modules/**"), "Exclude **/node_modules/**");
   assert.equal(sanitizeTitle("Sync **/src/** trees"), "Sync **/src/** trees");
   assert.equal(sanitizeTitle("Watch **/dist/** changes"), "Watch **/dist/** changes");
+  assert.equal(sanitizeTitle("Exclude **\\node_modules\\**"), "Exclude **\\node_modules\\**");
   assert.equal(sanitizeTitle("__**Sorry**__ I cannot help"), undefined);
   assert.equal(sanitizeTitle("_Sorry_ I cannot help"), undefined);
   assert.equal(sanitizeTitle("~~Sorry~~ I cannot help"), undefined);
   assert.equal(sanitizeTitle("__ok__ result parsing"), "__ok__ result parsing");
   assert.equal(sanitizeTitle("__i__ variable handling"), "__i__ variable handling");
+  assert.equal(sanitizeTitle("__I__—cannot help"), undefined);
+  assert.equal(sanitizeTitle("__I__ can’t help"), undefined);
+  assert.equal(sanitizeTitle("__I'm__ unable to help"), undefined);
   assert.equal(sanitizeTitle('"__NONE__"'), undefined);
   assert.equal(sanitizeTitle("*****"), undefined);
   assert.equal(sanitizeTitle("_____"), undefined);
