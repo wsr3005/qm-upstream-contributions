@@ -188,6 +188,49 @@ test("OpenCode request timeout interrupts a hung session setup after runtime sta
   assert.ok(Date.now() - startedAt < 1_000);
 });
 
+test("OpenCode request timeout aborts a hung prompt after session setup", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-opencode-prompt-timeout-"));
+  const harness = createOpenCodeHarness({
+    binaryPath: fakeSidecar(
+      dir,
+      "hung-prompt-model-test",
+      'if (req.method === "POST" && message) { await readBody(req); await new Promise(() => {}); }',
+    ),
+  });
+  t.after(async () => {
+    await harness.turns.close?.();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const startedAt = Date.now();
+  await assert.rejects(
+    harness.models.testModel!({
+      model: "enterprise/luna",
+      expectedUpstreamModel: "upstream-luna",
+      maxOutputTokens: 128,
+      systemPrompt: "test",
+      prompt: "ping",
+      requestTimeoutMs: 50,
+      customProvider: {
+        apiKey: "secret",
+        spec: {
+          id: "enterprise",
+          name: "Enterprise",
+          protocol: "openai-responses",
+          baseUrl: "http://127.0.0.1:9",
+          models: [{ id: "enterprise/luna", upstreamId: "upstream-luna" }],
+        },
+      },
+    }),
+    (error: Error & { category?: string; attempt?: { upstreamRequests?: number } }) => {
+      assert.equal(error.name, "HarnessModelTestError");
+      assert.equal(error.category, "request_timeout");
+      assert.equal(error.attempt?.upstreamRequests, 0);
+      return true;
+    },
+  );
+  assert.ok(Date.now() - startedAt < 1_000);
+});
+
 function turnInput(entries: SessionEntry[], llmRows: HarnessLlmRequestRecord[]): HarnessTurnInput {
   const scope = { kind: "org", id: "test" } as unknown as ScopeId;
   const session = { id: "session-1" } as Session;

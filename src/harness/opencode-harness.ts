@@ -1157,6 +1157,7 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
       const request = rt.client.session.prompt({
         path: { id: sessionId },
         body: { model, agent: "qm", system: turn.systemPrompt, tools: enabled, parts: promptParts as never },
+        signal: controller.signal,
       });
       const response =
         wallMs > 0
