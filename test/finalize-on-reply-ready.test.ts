@@ -206,6 +206,38 @@ test("background: an error in the detached tail still reclaims the box (no machi
   assert.equal(teardowns, 1, "the box is reclaimed even though the tail failed");
 });
 
+test("initial title generation waits for the main harness turn", async () => {
+  const events: string[] = [];
+  const harness = createMockHarness();
+  const runTurn = harness.turns.runTurn;
+  harness.turns.runTurn = async (input) => {
+    events.push("turn:start");
+    const result = await runTurn(input);
+    events.push("turn:end");
+    return result;
+  };
+  harness.models.generateTitle = async () => {
+    events.push("title");
+    assert.equal(events.at(-2), "turn:end");
+    return "Long harness title";
+  };
+  const g = gatedSandbox();
+  const { orch, sessions } = buildOrchestrator(g.sandbox, undefined, harness);
+
+  const pending = orch.handleTurn({
+    ...dm("dm:U1:title-order", "Explain this long-running task"),
+    origin: { kind: "human" },
+    runId: "title-order",
+  });
+  for (let i = 0; i < 200 && g.teardownStarted === 0; i++) await tick();
+  g.release();
+  const result = await pending;
+
+  assert.equal(result.status, "ok");
+  assert.deepEqual(events, ["turn:start", "turn:end", "title"]);
+  assert.equal((await sessions.get(result.sessionId!))?.title, "Long harness title");
+});
+
 test("blocking path: the turn does NOT return until the tail (teardown) completes", async () => {
   const g = gatedSandbox();
   const { orch } = buildOrchestrator(g.sandbox);

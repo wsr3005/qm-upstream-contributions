@@ -2315,17 +2315,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                 ...(input.displayText?.trim() ? { display: input.displayText } : {}),
               }
             : undefined;
-        const earlyTitleGen: Promise<string | undefined> | undefined =
-          humanTurn && !session.title && !syntheticPrompt && input.text.trim()
-            ? generateAndStoreTitle(
-                session.id,
-                scopeId,
-                `User:\n${stripTurnBoilerplate(input.text)}`,
-                undefined,
-                input,
-                actor.id,
-              )
-            : undefined;
+        const initialHumanTitle = humanTurn && !session.title && !syntheticPrompt && !!input.text.trim();
         const requestedTurnWallClockMs =
           typeof input.turnWallClockMs === "number" && input.turnWallClockMs > 0 ? input.turnWallClockMs : undefined;
         const configuredTurnWallClockSec = await deps.config?.getTurnWallClockSecDurable(resolution.orgScopeId);
@@ -2986,16 +2976,12 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                 }
               }
             }
-            if (earlyTitleGen) await earlyTitleGen;
-            if (!pausing && turnCompleted && !session.title && !earlyTitleGen) {
-              await generateAndStoreTitle(
-                session.id,
-                scopeId,
-                `User:\n${input.text}\n\nAssistant:\n${result.reply}`,
-                undefined,
-                input,
-                actor.id,
-              );
+            if (!session.title && (initialHumanTitle || (!pausing && turnCompleted))) {
+              const transcript =
+                !pausing && turnCompleted
+                  ? `User:\n${stripTurnBoilerplate(input.text)}\n\nAssistant:\n${result.reply}`
+                  : `User:\n${stripTurnBoilerplate(input.text)}`;
+              await generateAndStoreTitle(session.id, scopeId, transcript, undefined, input, actor.id);
             }
           } finally {
             await reclaimBox();

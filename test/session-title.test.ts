@@ -39,7 +39,7 @@ test("the title is generated ONCE — a later turn does not rewrite it", async (
   assert.equal((await app.getSession(sid))?.session.title, first);
 });
 
-test("a failed early title attempt is not repeated at the end of the same paid turn", async () => {
+test("a failed title attempt is not repeated in the same paid turn", async () => {
   const { app, modelGateway } = freshApp();
   const result = await app.turn(dm("!title-none", "web:U1:title-none"));
   assert.equal(result.status, "ok");
@@ -83,7 +83,7 @@ test("regenerateTitle retitles from the visible transcript; a stranger gets null
   assert.equal(await app.regenerateTitle("does-not-exist", "U1"), null);
 });
 
-test("the title lands even when the turn pauses on approval (early titling off the first message)", async () => {
+test("the title lands even when the turn pauses on approval", async () => {
   const { app } = freshApp();
   const r = await app.turn(dm("!paused-approval rm -rf /keys", "web:U1:t5"));
   assert.equal(r.status, "ok", "the preamble reply is still delivered");
