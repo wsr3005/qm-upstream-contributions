@@ -10,6 +10,12 @@ test("model test failures distinguish upstream rejection from response verificat
     modelTestError(signal, { upstreamRequests: 1, upstreamStatus: 401, responseCompleted: true }).category,
     "provider_request_failed",
   );
+  const aborted = new AbortController();
+  aborted.abort();
+  assert.equal(
+    modelTestError(aborted.signal, { upstreamRequests: 1, upstreamStatus: 403, responseCompleted: true }).category,
+    "provider_request_failed",
+  );
   assert.equal(
     modelTestError(signal, { upstreamRequests: 1, upstreamStatus: 200, responseCompleted: true }).category,
     "response_verification_failed",

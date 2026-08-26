@@ -957,6 +957,11 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
       }
     }
     let turnId = "";
+    const turnCancelled = new Error("Codex turn cancelled");
+    let rejectTurnCancelled!: (error: Error) => void;
+    const cancelled = new Promise<never>((_, reject) => {
+      rejectTurnCancelled = reject;
+    });
     const interrupt = async (stopped: boolean) => {
       state.stopped ||= stopped;
       toolAbort.abort();
@@ -965,6 +970,7 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
     state.interrupt = () => interrupt(false);
     const onCancel = () => {
       void interrupt(false);
+      rejectTurnCancelled(turnCancelled);
     };
     if (turn.cancel) {
       if (turn.cancel.aborted) onCancel();
@@ -991,15 +997,18 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
         : null;
     let timer: NodeJS.Timeout | undefined;
     try {
-      const response = await rt.server
-        .request<{ turn: CodexTurn }>("turn/start", {
-          threadId,
-          input,
-          ...(runtimeModel ? { model: runtimeModel } : {}),
-        })
-        .catch((error: unknown) => {
-          throw error instanceof CodexRpcError ? codexProviderFailure(error.message) : error;
-        });
+      const response = await Promise.race([
+        rt.server
+          .request<{ turn: CodexTurn }>("turn/start", {
+            threadId,
+            input,
+            ...(runtimeModel ? { model: runtimeModel } : {}),
+          })
+          .catch((error: unknown) => {
+            throw error instanceof CodexRpcError ? codexProviderFailure(error.message) : error;
+          }),
+        cancelled,
+      ]);
       turnId = response.turn.id;
       if (toolAbort.signal.aborted || turn.cancel?.aborted) await interrupt(false);
       const remainingWallMs = deadline ? Math.max(1, deadline - Date.now()) : 0;
@@ -1007,6 +1016,7 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
         remainingWallMs > 0
           ? await Promise.race([
               completed,
+              cancelled,
               new Promise<never>((_, reject) => {
                 timer = setTimeout(() => {
                   void interrupt(false);
@@ -1014,7 +1024,7 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
                 }, remainingWallMs);
               }),
             ])
-          : await completed;
+          : await Promise.race([completed, cancelled]);
       if (state.modelCalls === 0) {
         state.modelCalls = 1;
         turn.recordModelCall({
@@ -1043,6 +1053,9 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
         modelCalls: state.modelCalls,
         ...(state.tapeWriteFailed ? { tapeWriteFailed: true } : {}),
       };
+    } catch (error) {
+      if (error === turnCancelled) return { reply: "", stopped: true };
+      throw error;
     } finally {
       if (timer) clearTimeout(timer);
       await stopSignals?.();

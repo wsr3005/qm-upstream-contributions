@@ -159,6 +159,27 @@ rl.on("line", (line) => {
   return path;
 }
 
+function hungTurnCodexBinary(dir: string): string {
+  const path = join(dir, "hung-turn-codex");
+  writeFileSync(
+    path,
+    `#!/usr/bin/env node
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin });
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") return send({ id: msg.id, result: {} });
+  if (msg.method === "initialized") return;
+  if (msg.method === "thread/start") return send({ id: msg.id, result: { thread: { id: "thread-hung" } } });
+  if (msg.method === "turn/start") return;
+});
+`,
+  );
+  chmodSync(path, 0o755);
+  return path;
+}
+
 function rotatingProviderCodexBinary(dir: string): string {
   const path = join(dir, "rotating-provider-codex");
   const log = join(dir, "runtime-log");
@@ -402,6 +423,43 @@ test("Codex binds a Responses custom provider without exposing its key in RPC", 
   assert.equal(modelCalls[0]?.model, "gateway/gpt-luna");
   assert.equal(llmRows[0]?.model, "gateway/gpt-luna");
   assert.equal(llmRows[0]?.transport?.modelId, "gpt-5.6-luna");
+});
+
+test("Codex request timeout interrupts a hung turn start after runtime startup", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-codex-model-timeout-"));
+  const harness = createCodexHarness({ binaryPath: hungTurnCodexBinary(dir), env: process.env });
+  t.after(async () => {
+    await harness.turns.close?.();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const startedAt = Date.now();
+  await assert.rejects(
+    harness.models.testModel!({
+      model: "gateway/gpt-luna",
+      expectedUpstreamModel: "gpt-5.6-luna",
+      maxOutputTokens: 128,
+      systemPrompt: "test",
+      prompt: "ping",
+      requestTimeoutMs: 50,
+      customProvider: {
+        apiKey: "secret",
+        spec: {
+          id: "gateway",
+          name: "Gateway",
+          protocol: "openai-responses",
+          baseUrl: "http://127.0.0.1:9",
+          models: [{ id: "gateway/gpt-luna", upstreamId: "gpt-5.6-luna" }],
+        },
+      },
+    }),
+    (error: Error & { category?: string; attempt?: { upstreamRequests?: number } }) => {
+      assert.equal(error.name, "HarnessModelTestError");
+      assert.equal(error.category, "request_timeout");
+      assert.equal(error.attempt?.upstreamRequests, 0);
+      return true;
+    },
+  );
+  assert.ok(Date.now() - startedAt < 1_000);
 });
 
 test("custom Codex runtime identity rotates with endpoint or key and strips built-in credentials", () => {
