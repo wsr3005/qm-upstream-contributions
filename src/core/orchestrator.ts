@@ -648,7 +648,6 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
               : []),
             ...screenedOverheard.map((entry) => ({ source: "overheard", content: renderOverheard(entry) })),
             ...attachmentPromptData,
-            ...(input.inboundNotes ?? []).map((note) => ({ source: "inbound-file-note", content: note })),
           ]
         : [];
       const screenPayload = screenInbound

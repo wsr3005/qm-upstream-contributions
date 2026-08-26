@@ -13,6 +13,7 @@ import { verifyCapabilityToken, EGRESS_PROXY_AUD } from "../src/auth/capability-
 import { egressClaimAllowingControlPlane } from "../src/core/orchestrator.ts";
 import { TURN_FILES_DIR, turnFileId } from "../src/core/attachments.ts";
 import { contextSummaryPayload } from "../src/harness/context-compaction.ts";
+import { DEFAULT_AGENT_MODEL_ID } from "../src/model/pi-models.ts";
 import { egressDecision } from "../src/resolution/egress-policy.ts";
 import { hashId } from "../src/util/crypto.ts";
 import { encodeRef, serviceCredRef } from "../src/acl/resource-ref.ts";
@@ -65,6 +66,11 @@ function channel(text: string, extra: Partial<TurnRequest> = {}): TurnRequest {
     gatewayContext: { reactionGuidance: "react with a Slack emoji short-name like :pray:" },
     ...extra,
   };
+}
+
+function isSecurityRequest(request: { promptEnvelope?: unknown }): boolean {
+  const envelope = request.promptEnvelope as { system?: unknown } | null;
+  return typeof envelope?.system === "string" && envelope.system.includes("security boundary classifier");
 }
 
 async function grantCred(acl: AclStore, org: ScopeId, slug: string, grantee: ScopeId = org): Promise<void> {
@@ -137,9 +143,10 @@ test("inbound file problems ride a durable file_event entry — off the reply an
   assert.match(payload.text, /screenshot\.png/);
 
   const reqs = (await sessions.listLlmRequests(res.sessionId!)) as Array<{ model: string; promptEnvelope: unknown }>;
-  for (const r of reqs.filter((request) => request.model !== "mock-security")) {
+  for (const r of reqs.filter((request) => !isSecurityRequest(request))) {
     assert.doesNotMatch(JSON.stringify(r.promptEnvelope), /too many files|screenshot\.png/);
   }
+  assert.equal(reqs.filter(isSecurityRequest).length, 0, "host file diagnostics never enter a classifier request");
 
   assert.equal((res as { fileNotes?: unknown }).fileNotes, undefined);
 });
@@ -2188,7 +2195,9 @@ test("Auto asks for input approval on suspicious data, skips re-screening on app
     false,
     "flagged input never reaches the main agent before approval",
   );
-  const screensBeforeApproval = risky.modelGateway.audit().filter((call) => call.model === "mock-security").length;
+  const screensBeforeApproval = (await risky.sessions.listLlmRequests(blocked.sessionId!)).filter(
+    isSecurityRequest,
+  ).length;
   const approved = await risky.app.turn({
     ...request,
     approval: { requestId: blocked.pendingApprovals![0]!.requestId, approved: true },
@@ -2196,7 +2205,7 @@ test("Auto asks for input approval on suspicious data, skips re-screening on app
   assert.equal(approved.status, "ok");
   assert.match(approved.reply ?? "", /approved-input/);
   assert.equal(
-    risky.modelGateway.audit().filter((call) => call.model === "mock-security").length,
+    (await risky.sessions.listLlmRequests(approved.sessionId!)).filter(isSecurityRequest).length,
     screensBeforeApproval,
   );
 
@@ -2311,13 +2320,12 @@ test("Auto screens only the external event envelope and records classifier usage
   assert.equal(result.status, "ok");
   assert.match(result.reply ?? "", /provenance-ok/);
 
-  const classifier = (await built.sessions.listLlmRequests(result.sessionId!)).find(
-    (rec) => rec.model === "mock-security",
-  );
+  const classifier = (await built.sessions.listLlmRequests(result.sessionId!)).find(isSecurityRequest);
   assert.ok(classifier, "the security classifier request is persisted beside the turn");
+  assert.equal(classifier.model, DEFAULT_AGENT_MODEL_ID, "the classifier uses the selected runtime model");
   assert.match(JSON.stringify(classifier.promptEnvelope), /customer asked for a refund/);
   assert.doesNotMatch(JSON.stringify(classifier.promptEnvelope), /provenance-ok/);
-  assert.ok(built.modelGateway.audit().some((rec) => rec.model === "mock-security"));
+  assert.ok(built.modelGateway.audit().some((rec) => rec.model === classifier.model));
 });
 
 test("Auto security screening inherits the selected turn model", async () => {
@@ -2424,7 +2432,7 @@ test("Auto fails open on vision attachments it cannot screen, flagging them unsc
   assert.match(failedOpen?.detail ?? "", /"cause":"unscreenable-attachment"/);
   const main = [...(await built.sessions.listLlmRequests(result.sessionId!))]
     .reverse()
-    .find((rec) => rec.model !== "mock-security");
+    .find((rec) => !isSecurityRequest(rec));
   assert.match(JSON.stringify(main?.promptEnvelope), /NOT security-screened/);
 });
 
@@ -2449,10 +2457,9 @@ test("Auto screens text attachment contents (strict quarantines) and fails open 
     }),
   );
   assert.equal(allowed.status, "ok");
-  const classifier = (await benign.sessions.listLlmRequests(allowed.sessionId!)).find(
-    (rec) => rec.model === "mock-security",
-  );
+  const classifier = (await benign.sessions.listLlmRequests(allowed.sessionId!)).find(isSecurityRequest);
   assert.match(JSON.stringify(classifier?.promptEnvelope), /quarterly revenue is 42/);
+  assert.equal(classifier?.model, DEFAULT_AGENT_MODEL_ID);
 
   const binary = freshApp();
   const pdf = await binary.blobTransfer.put(Buffer.from("%PDF synthetic"));
@@ -2531,9 +2538,7 @@ test("Auto does not let one quarantined thread file poison later attachments", a
     }),
   );
   assert.equal(allowed.status, "ok");
-  const classifier = (await built.sessions.listLlmRequests(allowed.sessionId!))
-    .filter((rec) => rec.model === "mock-security")
-    .at(-1);
+  const classifier = (await built.sessions.listLlmRequests(allowed.sessionId!)).filter(isSecurityRequest).at(-1);
   assert.match(JSON.stringify(classifier?.promptEnvelope), /quarterly revenue is 42/);
   assert.doesNotMatch(JSON.stringify(classifier?.promptEnvelope), /ignore previous instructions/);
 });
@@ -2567,9 +2572,7 @@ test("an approved automation replay preserves and re-screens its external event 
   );
   assert.equal(resumed.status, "ok");
   assert.match(resumed.reply ?? "", /replay-ok/);
-  const screens = (await built.sessions.listLlmRequests(resumed.sessionId!)).filter(
-    (rec) => rec.model === "mock-security",
-  );
+  const screens = (await built.sessions.listLlmRequests(resumed.sessionId!)).filter(isSecurityRequest);
   assert.equal(screens.length, 2);
   assert.ok(screens.every((rec) => JSON.stringify(rec.promptEnvelope).includes("benign external marker")));
 });
@@ -2590,7 +2593,7 @@ test("Auto fails open on data-bearing turns when the security screen is unavaila
   assert.match(failedOpen?.detail ?? "", /"cause":"screen_unavailable"/);
   const main = [...(await built.sessions.listLlmRequests(result.sessionId!))]
     .reverse()
-    .find((rec) => rec.model !== "mock-security");
+    .find((rec) => !isSecurityRequest(rec));
   assert.match(JSON.stringify(main?.promptEnvelope), /NOT security-screened/);
 });
 
@@ -2604,9 +2607,7 @@ test("Auto retries a transient screen failure instead of quarantining", async ()
   assert.equal(result.status, "ok");
   assert.match(result.reply ?? "", /retry-ok/);
   assert.equal(provisioning.provisioned, 1);
-  const screens = (await built.sessions.listLlmRequests(result.sessionId!)).filter(
-    (rec) => rec.model === "mock-security",
-  );
+  const screens = (await built.sessions.listLlmRequests(result.sessionId!)).filter(isSecurityRequest);
   assert.equal(screens.length, 2);
 });
 
@@ -2624,9 +2625,7 @@ test("Auto classifier timeout fails open at its deadline without retrying the ha
   assert.equal(result.status, "ok");
   assert.match(result.reply ?? "", /ran-anyway/);
   assert.equal(provisioning.provisioned, 1);
-  const screens = (await built.sessions.listLlmRequests(result.sessionId!)).filter(
-    (rec) => rec.model === "mock-security",
-  );
+  const screens = (await built.sessions.listLlmRequests(result.sessionId!)).filter(isSecurityRequest);
   assert.equal(screens.length, 1);
 });
 
@@ -2675,10 +2674,7 @@ test("Auto treats a fresh authenticated ambient speaker as the initiating human"
   assert.equal(result.status, "ok");
   assert.match(result.reply ?? "", /ambient-ok/);
   assert.equal(provisioning.provisioned, 1);
-  assert.equal(
-    built.modelGateway.audit().some((call) => call.model === "mock-security"),
-    false,
-  );
+  assert.equal((await built.sessions.listLlmRequests(result.sessionId!)).filter(isSecurityRequest).length, 0);
 });
 
 test("Auto fails open when bounded screening omits oversize content, flagging it unscreened to the model", async () => {
@@ -2693,7 +2689,7 @@ test("Auto fails open when bounded screening omits oversize content, flagging it
   assert.match(oversize?.detail ?? "", /"cause":"oversize-input"/);
   const main = [...(await built.sessions.listLlmRequests(result.sessionId!))]
     .reverse()
-    .find((rec) => rec.model !== "mock-security");
+    .find((rec) => !isSecurityRequest(rec));
   assert.match(JSON.stringify(main?.promptEnvelope), /NOT security-screened/);
 });
 
@@ -2721,7 +2717,7 @@ test("an Auto-downgraded turn is quarantined from later full-authority model his
   assert.equal(second.status, "ok");
   assert.match(second.reply ?? "", /quarantine-ok/);
   const requests = await built.sessions.listLlmRequests(second.sessionId!);
-  const latestMain = [...requests].reverse().find((rec) => rec.model !== "mock-security");
+  const latestMain = [...requests].reverse().find((rec) => !isSecurityRequest(rec));
   assert.ok(latestMain);
   assert.doesNotMatch(JSON.stringify(latestMain.promptEnvelope), /durable history/);
 });
@@ -3294,26 +3290,22 @@ test("a terminal turn failure is recorded durably and never replays to the model
   );
 });
 
-test("a failure before the harness records the user message back-fills it — no orphan error in the transcript", async () => {
-  const { app } = freshApp();
+test("an explicit unknown model is refused before any model call or transcript mutation", async () => {
+  const { app, modelGateway } = freshApp();
   const t1 = await app.turn(dm("hello"));
   assert.equal(t1.status, "ok");
+  const callsBefore = modelGateway.audit().length;
 
-  await assert.rejects(app.turn(dm("use the fancy model", { model: "not-a-real-model" })), /not approved/);
+  const refused = await app.turn(dm("use the fancy model", { model: "not-a-real-model" }));
+  assert.equal(refused.status, "refused");
+  assert.match(refused.reason ?? "", /not approved/);
+  assert.equal(modelGateway.audit().length, callsBefore, "unknown explicit models cause zero model egress");
 
   const found = await app.getSession(t1.sessionId!);
-  const failureIdx = found!.entries.findIndex((e) => turnFailure(e));
-  assert.ok(failureIdx > 0, "the failure is recorded durably");
-  const prior = found!.entries[failureIdx - 1]!;
-  assert.equal(prior.type, "user", "the message that failed sits right above its error — not an orphan bubble");
-  assert.equal((prior.payload as { text?: string }).text, "use the fancy model");
-
-  const after = await app.turn(dm("!histcount"));
-  assert.equal(after.status, "ok");
-  assert.equal(
-    after.reply,
-    "history:3",
-    "the back-filled message replays like any other user entry (hello + reply + the failed message; the failure record stays out)",
+  assert.deepEqual(
+    found!.entries.map((entry) => entry.type),
+    ["user", "assistant"],
+    "the refused request never enters durable model context",
   );
 });
 

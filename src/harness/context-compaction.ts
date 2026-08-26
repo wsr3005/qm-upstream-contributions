@@ -74,7 +74,8 @@ export function forModelContext(
       e.type !== "thinking" &&
       e.type !== "text" &&
       e.type !== "soul" &&
-      (e.payload as { kind?: unknown } | null)?.kind !== "turn_failure",
+      (e.payload as { kind?: unknown } | null)?.kind !== "turn_failure" &&
+      (e.payload as { kind?: unknown } | null)?.kind !== "file_event",
   );
   const latest = replayable.findLast((e) => contextSummaryPayload(e));
   const visible = replayable.filter((e) => {

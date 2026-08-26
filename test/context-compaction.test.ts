@@ -24,6 +24,7 @@ import {
   COMPACT_HARD_FRACTION,
   COMPACT_SOFT_FRACTION,
   compactedScopeLabel,
+  compactTranscript,
   contextSummaryPayload,
   createContextSummaryPayload,
   forModelContext,
@@ -45,6 +46,7 @@ const TEAM = scopeId("team", "eng");
 function spyHarness(opts: { withSummarizer?: boolean } = {}) {
   const base = createMockHarness();
   const compactCalls: HarnessCompactInput[] = [];
+  const compactPrompts: string[] = [];
   const resetCalls: string[] = [];
   const harness: Harness = {
     ...base,
@@ -61,10 +63,11 @@ function spyHarness(opts: { withSummarizer?: boolean } = {}) {
   } else {
     harness.models.compactHistory = async (input: HarnessCompactInput) => {
       compactCalls.push(input);
+      compactPrompts.push(compactTranscript(input.history));
       return base.models.compactHistory!(input);
     };
   }
-  return { harness, compactCalls, resetCalls };
+  return { harness, compactCalls, compactPrompts, resetCalls };
 }
 
 function fakeSandbox(): Sandbox {
@@ -591,18 +594,37 @@ test("a DM follow-up after the background pass reuses the summary — no blockin
   assert.equal(res.reply, "history:7", "the follow-up starts on [summary, recent…] with no summarizer call");
 });
 
-test("forModelContext strips thinking/text/soul (never laundered into a durable summary)", () => {
+test("forModelContext strips internal-only entries before every model path", () => {
   const entries: SessionEntry[] = [
     mkEntry({ seq: 0, type: "user" }),
     mkEntry({ seq: 1, type: "thinking", payload: { thinking: "secret reasoning" } }),
     mkEntry({ seq: 2, type: "text", payload: { text: "scaffold" } }),
     mkEntry({ seq: 3, type: "soul", payload: { text: "soul" } }),
-    mkEntry({ seq: 4, type: "assistant" }),
+    mkEntry({ seq: 4, type: "system", payload: { kind: "file_event", text: "host-only-file-marker" } }),
+    mkEntry({ seq: 5, type: "assistant" }),
   ];
   assert.deepEqual(
     forModelContext(entries).map((e) => e.type),
     ["user", "assistant"],
   );
+});
+
+test("file diagnostics stay durable but never enter a forced compaction model call", async () => {
+  const marker = "host-only-file-marker";
+  const { harness, compactCalls, compactPrompts } = spyHarness();
+  const { orch, sessions } = buildOrchestrator(harness, 4);
+  const sid = await seed(sessions, [
+    { payload: { text: "old 0" } },
+    { type: "system", payload: { kind: "file_event", text: marker, issues: [marker] } },
+    ...Array.from({ length: 5 }, (_, i) => ({ payload: { text: `old ${i + 1}` } })),
+  ]);
+
+  const result = await orch.handleTurn(turn("!histcount"));
+  assert.equal(result.status, "ok");
+  assert.ok(compactCalls.length >= 1);
+  assert.ok((await sessions.getEntries(sid)).some((entry) => JSON.stringify(entry.payload).includes(marker)));
+  assert.ok(compactCalls.every((call) => !JSON.stringify(call.history).includes(marker)));
+  assert.ok(compactPrompts.every((prompt) => !prompt.includes(marker)));
 });
 
 test("background compaction excludes thinking entries from the summary batch (Bugbot: history filter)", async () => {
