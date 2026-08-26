@@ -113,11 +113,17 @@ test("sanitizeTitle rejects reply-shaped output instead of truncating it into a 
   assert.equal(sanitizeTitle("**Verify Harness long turns**"), "Verify Harness long turns");
   assert.equal(sanitizeTitle("## Verify DWS shutdown"), "Verify DWS shutdown");
   assert.equal(sanitizeTitle("**Title: Verify Harness long turns**"), "Verify Harness long turns");
+  assert.equal(sanitizeTitle("Title: **Verify Harness long turns**"), "Verify Harness long turns");
+  assert.equal(sanitizeTitle("Chat title: __Verify Harness long turns__"), "Verify Harness long turns");
+  assert.equal(sanitizeTitle("Title: ## Verify DWS shutdown"), "Verify DWS shutdown");
+  assert.equal(sanitizeTitle('"**Verify Harness long turns**"'), "Verify Harness long turns");
   assert.equal(sanitizeTitle("**Fix** the thing"), undefined);
   assert.equal(sanitizeTitle("## Sorry, I can't help with that"), undefined);
   assert.equal(sanitizeTitle("**NONE**"), undefined);
   assert.equal(sanitizeTitle("__NONE__"), undefined);
   assert.equal(sanitizeTitle("## NONE"), undefined);
+  assert.equal(sanitizeTitle("Title: **NONE**"), undefined);
+  assert.equal(sanitizeTitle('"__NONE__"'), undefined);
   assert.equal(sanitizeTitle("*****"), undefined);
   assert.equal(sanitizeTitle("_____"), undefined);
   assert.equal(sanitizeTitle("NONE"), undefined);

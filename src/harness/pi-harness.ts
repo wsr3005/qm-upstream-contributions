@@ -386,11 +386,15 @@ export function sanitizeTitle(out: string | undefined): string | undefined {
   if (!out) return undefined;
   let t = (out.trim().split("\n")[0] ?? "").trim();
   if (!t || /^none$/i.test(t)) return undefined;
-  t = t.replace(/^\*\*(.+)\*\*$/, "$1").trim();
-  t = t.replace(/^__(.+)__$/, "$1").trim();
-  t = t.replace(/^#{1,6}\s+/, "").trim();
-  t = t.replace(/^(?:title|chat title)\s*[:-]\s*/i, "");
-  t = t.replace(/^["'“”‘’`]+|["'“”‘’`]+$/g, "").trim();
+  for (let i = 0; i < 4; i++) {
+    const before = t;
+    t = t.replace(/^["'“”‘’`]+|["'“”‘’`]+$/g, "").trim();
+    t = t.replace(/^\*\*(.+)\*\*$/, "$1").trim();
+    t = t.replace(/^__(.+)__$/, "$1").trim();
+    t = t.replace(/^#{1,6}\s+/, "").trim();
+    t = t.replace(/^(?:title|chat title)\s*[:-]\s*/i, "");
+    if (t === before) break;
+  }
   t = t.replace(/[\s.,;:!?]+$/g, "").trim();
   if (!t || /^none$/i.test(t) || /^[#*_`~\s-]+$/.test(t)) return undefined;
   // Reject reply-shaped output — the model answered the transcript instead of titling it.
