@@ -391,7 +391,7 @@ export function sanitizeTitle(out: string | undefined): string | undefined {
     t = t.replace(/^["'“”‘’`]+|["'“”‘’`]+$/g, "").trim();
     t = t.replace(/^\*\*(.+)\*\*$/, "$1").trim();
     t = t.replace(/^__(.+)__$/, "$1").trim();
-    t = t.replace(/^#{1,6}\s+(.+?)(?:\s+#{1,6})?$/, "$1").trim();
+    t = t.replace(/^#{1,6}\s+(.+?)(?:\s+#+)?$/, "$1").trim();
     t = t.replace(/^(?:title|chat title)\s*[:-]\s*/i, "");
     if (t === before) break;
   }

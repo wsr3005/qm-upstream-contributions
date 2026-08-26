@@ -133,6 +133,10 @@ test("sanitizeTitle rejects reply-shaped output instead of truncating it into a 
   assert.equal(sanitizeTitle("## NONE ##"), undefined);
   assert.equal(sanitizeTitle("# NONE #"), undefined);
   assert.equal(sanitizeTitle("Title: ## NONE ##"), undefined);
+  assert.equal(sanitizeTitle("## NONE #######"), undefined);
+  assert.equal(sanitizeTitle("Title: ## NONE #######"), undefined);
+  assert.equal(sanitizeTitle("### NONE ##########"), undefined);
+  assert.equal(sanitizeTitle("## Verify Harness #######"), "Verify Harness");
   assert.equal(sanitizeTitle("#123 release regression"), "#123 release regression");
   assert.equal(sanitizeTitle("Upgrade C#"), "Upgrade C#");
   assert.equal(sanitizeTitle("_internal API migration"), "_internal API migration");
