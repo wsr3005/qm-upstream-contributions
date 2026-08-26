@@ -411,11 +411,12 @@ export function sanitizeTitle(out: string | undefined): string | undefined {
   }
   const plainReply = /^(?:i|i['’]\w+|sorry|unfortunately|sure|okay|ok|here['’]?s|as an ai)\b/i;
   const emphasizedReply = /^(?:sorry|unfortunately|sure|okay|here['’]?s|as an ai)\b/i;
-  const emphasizedFirstPersonReply =
-    /^(?:i['’]\w+\b|i(?:\s|[\p{P}\p{S}])+(?:can(?:not|['’]t)|cannot|need|will|would|am|have|unable|already)\b)/iu;
+  const emphasizedFirstPersonReply = /^(?:i\b|i['’]\w+\b)/i;
+  const technicalDunderI = /^__i__\s+\S/.test(t);
   if (
     (replyView === t && plainReply.test(replyView)) ||
-    (replyView !== t && (emphasizedReply.test(replyView) || emphasizedFirstPersonReply.test(replyView)))
+    (replyView !== t &&
+      (emphasizedReply.test(replyView) || (emphasizedFirstPersonReply.test(replyView) && !technicalDunderI)))
   )
     return undefined;
   return t.length > MAX_TITLE_CHARS ? `${t.slice(0, MAX_TITLE_CHARS).trimEnd()}…` : t;
