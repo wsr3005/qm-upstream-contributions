@@ -423,12 +423,14 @@ export function sanitizeTitle(out: string | undefined): string | undefined {
   if (/^[*_~`]/.test(t)) {
     replyView = replyView.replace(/^[*_~`]+/, "").replace(/[*_~`]+(?=$|[\s\p{P}\p{S}])/gu, "");
   }
+  replyView = replyView.replace(/^((?:sorry|unfortunately|sure|okay|here['’]?s|as an ai))_+/iu, "$1");
   replyView = replyView.replace(
-    /^((?:i['’]\w+|i|sorry|unfortunately|sure|okay|ok|here['’]?s|as an ai))_+(?=(?:\s|[\p{P}\p{S}])+(?:i\b|can(?:not|['’]t)|cannot|will|would|must|need|am|have|think|believe|found|find|know|see|checked|agree|noticed|recommend|suggest|let me|we can|what i))/iu,
+    /^((?:i['’]\w+|i|ok))_+(?=(?:\s|[\p{P}\p{S}])+(?:i\b|can(?:not|['’]t)|cannot|will|would|must|need|am|have|think|believe|found|find|know|see|checked|agree|noticed|recommend|suggest|apologize|understand|should|was|already|appreciate|could|don['’]t|let me|we can|what i|but|however|for|this|there|unable|please|got|the))/iu,
     "$1",
   );
   replyView = replyView.replace(/\s+/g, " ").trim();
-  const firstPersonReply = /^(?:i['’]\w+\b|i\s+\S|i(?!(?:_|\/|\+|-\d|[⁰¹²³⁴⁵⁶⁷⁸⁹]))[\p{P}\p{S}]+\s*\S)/iu;
+  const technicalI = /^I(?:\/|\+|-|‑\d|−\d|–[A-Z]|[⁰¹²³⁴⁵⁶⁷⁸⁹])/.test(replyView);
+  const firstPersonReply = /^(?:i['’]\w+\b|i\s+\S|i(?!(?:_))[\p{P}\p{S}]+\s*\S)/iu;
   const conversationalReply = /^(?:sorry|unfortunately|sure|okay|ok|here['’]?s|as an ai)\b/i;
   const technicalDunderOk =
     /^__ok__\s+\S/.test(t) &&
@@ -440,7 +442,7 @@ export function sanitizeTitle(out: string | undefined): string | undefined {
       t,
     );
   if (
-    (firstPersonReply.test(replyView) || conversationalReply.test(replyView)) &&
+    ((firstPersonReply.test(replyView) && !technicalI) || conversationalReply.test(replyView)) &&
     !technicalDunderOk &&
     !technicalDunderI
   )
