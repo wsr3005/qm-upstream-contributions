@@ -399,7 +399,8 @@ export function sanitizeTitle(out: string | undefined): string | undefined {
   if (!t || /^none$/i.test(t) || /^[#*_`~\s-]+$/.test(t)) return undefined;
   if (/^(?:title|chat title)\s*[:-]\s*/i.test(t)) return undefined;
   if (/^#{1,6}\s+/.test(t)) return undefined;
-  if (/^(\*{1,3}|_{1,3}|~{2}|`{1,3}).+\1$/.test(t)) return undefined;
+  if (/^(\*{1,3}|~{2}|`{1,3}).+\1$/.test(t)) return undefined;
+  if (/^_{1,3}[^_]+_{1,3}$/.test(t)) return undefined;
   // Reject reply-shaped output — the model answered the transcript instead of titling it.
   if (t.length > 90 || t.split(/\s+/).length > 12) return undefined;
   if (/(^|\s)\*{2,3}(?![\\/])[^*\n]+\*{2,3}(?=$|[\s\p{P}\p{S}])/u.test(t)) return undefined;
@@ -409,9 +410,9 @@ export function sanitizeTitle(out: string | undefined): string | undefined {
       .replace(/(?<!\*)\*{3}(?!\*)([^*\n]+?)(?<!\*)\*{3}(?!\*)/g, "$1")
       .replace(/(?<!\*)\*{2}(?!\*)([^*\n]+?)(?<!\*)\*{2}(?!\*)/g, "$1")
       .replace(/(?<!\*)\*(?!\*)([^*\n]+?)(?<!\*)\*(?!\*)/g, "$1")
-      .replace(/(^|[\s\p{P}\p{S}])_{3}(?!_)([^_\n]+?)(?<!_)_{3}(?!_)/gu, "$1$2")
-      .replace(/(^|[\s\p{P}\p{S}])_{2}(?!_)([^_\n]+?)(?<!_)_{2}(?!_)/gu, "$1$2")
-      .replace(/(^|[\s\p{P}\p{S}])_(?!_)([^_\n]+?)(?<!_)_(?!_)/gu, "$1$2")
+      .replace(/(^|[\s\p{P}\p{S}])_{3}(?!_)([^_\n]+?)(?<!_)_{3}(?!_)(?=$|[\s\p{P}\p{S}])/gu, "$1$2")
+      .replace(/(^|[\s\p{P}\p{S}])_{2}(?!_)([^_\n]+?)(?<!_)_{2}(?!_)(?=$|[\s\p{P}\p{S}])/gu, "$1$2")
+      .replace(/(^|[\s\p{P}\p{S}])_(?!_)([^_\n]+?)(?<!_)_(?!_)(?=$|[\s\p{P}\p{S}])/gu, "$1$2")
       .replace(/(?<!~)~~(?!~)([^~\n]+?)(?<!~)~~(?!~)/g, "$1")
       .replace(/(?<!`)`{3}(?!`)([^`\n]+?)(?<!`)`{3}(?!`)/g, "$1")
       .replace(/(?<!`)`{2}(?!`)([^`\n]+?)(?<!`)`{2}(?!`)/g, "$1")
@@ -423,11 +424,11 @@ export function sanitizeTitle(out: string | undefined): string | undefined {
     replyView = replyView.replace(/^[*_~`]+/, "").replace(/[*_~`]+(?=$|[\s\p{P}\p{S}])/gu, "");
   }
   replyView = replyView.replace(
-    /^((?:i['’]\w+|i|sorry|unfortunately|sure|okay|ok|here['’]?s|as an ai))_+(?=$|[\s,.:;!?—–，：。！？])/iu,
+    /^((?:i['’]\w+|i|sorry|unfortunately|sure|okay|ok|here['’]?s|as an ai))_+(?=(?:\s|[\p{P}\p{S}])+(?:i\b|can(?:not|['’]t)|cannot|will|would|must|need|am|have|think|believe|found|find|know|see|checked|agree|noticed|recommend|suggest|let me|we can|what i))/iu,
     "$1",
   );
   replyView = replyView.replace(/\s+/g, " ").trim();
-  const firstPersonReply = /^(?:i['’]\w+\b|i(?:\s+|[,:;.!?—–，：。！？]+\s*)\S)/iu;
+  const firstPersonReply = /^(?:i['’]\w+\b|i\s+\S|i(?!(?:_|\/|\+|-\d|[⁰¹²³⁴⁵⁶⁷⁸⁹]))[\p{P}\p{S}]+\s*\S)/iu;
   const conversationalReply = /^(?:sorry|unfortunately|sure|okay|ok|here['’]?s|as an ai)\b/i;
   const technicalDunderOk =
     /^__ok__\s+\S/.test(t) &&
