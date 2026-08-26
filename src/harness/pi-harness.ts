@@ -413,16 +413,21 @@ export function sanitizeTitle(out: string | undefined): string | undefined {
       .replace(/(^|[\s\p{P}\p{S}])_{2}(?!_)([^_\n]+?)(?<!_)_{2}(?!_)/gu, "$1$2")
       .replace(/(^|[\s\p{P}\p{S}])_(?!_)([^_\n]+?)(?<!_)_(?!_)/gu, "$1$2")
       .replace(/(?<!~)~~(?!~)([^~\n]+?)(?<!~)~~(?!~)/g, "$1")
-      .replace(/(?<!`)`{1,3}(?!`)([^`\n]+?)(?<!`)`{1,3}(?!`)/g, "$1");
+      .replace(/(?<!`)`{3}(?!`)([^`\n]+?)(?<!`)`{3}(?!`)/g, "$1")
+      .replace(/(?<!`)`{2}(?!`)([^`\n]+?)(?<!`)`{2}(?!`)/g, "$1")
+      .replace(/(?<!`)`(?!`)([^`\n]+?)(?<!`)`(?!`)/g, "$1");
     if (next === replyView) break;
     replyView = next;
   }
   if (/^[*_~`]/.test(t)) {
     replyView = replyView.replace(/^[*_~`]+/, "").replace(/[*_~`]+(?=$|[\s\p{P}\p{S}])/gu, "");
   }
+  replyView = replyView.replace(
+    /^((?:i['’]\w+|i|sorry|unfortunately|sure|okay|ok|here['’]?s|as an ai))_+(?=$|[\s,.:;!?—–，：。！？])/iu,
+    "$1",
+  );
   replyView = replyView.replace(/\s+/g, " ").trim();
-  const firstPersonReply =
-    /^(?:i['’]\w+\b|i\s+\S|i[\p{P}\p{S}]+(?:can(?:not|['’]t)|cannot|will|would|must|need|am|have|apologize|refuse|decline|don['’]t|do not|understand|should|was|already|appreciate|could))/iu;
+  const firstPersonReply = /^(?:i['’]\w+\b|i(?:\s+|[,:;.!?—–，：。！？]+\s*)\S)/iu;
   const conversationalReply = /^(?:sorry|unfortunately|sure|okay|ok|here['’]?s|as an ai)\b/i;
   const technicalDunderOk =
     /^__ok__\s+\S/.test(t) &&
