@@ -12,6 +12,7 @@ import type {
 } from "./core-bridge";
 import type { EffortLevel, ModelOption } from "./model-options";
 import type { ComposerMenu } from "./composer";
+import type { ProductReservation } from "./product-reservation";
 
 interface PaneState {
   threadRef: string | null;
@@ -64,6 +65,7 @@ export interface ChatSurface {
   hasLiveRun(): boolean;
   signalLiveRun(kind: "abort" | "steer", text?: string): Promise<import("./core-bridge").SignalOutcome>;
   currentTurnOptions(): TurnOptions;
+  stageTurnOptions(agent: Agent, options: TurnOptions): void;
   newChat(context?: { scopeId: string; name: string | null }): string;
   teardown(): void;
   resetChatState(): void;
@@ -110,6 +112,11 @@ interface ComposerState {
   effortLevel: EffortLevel;
   fastMode: boolean | undefined;
   pasteView: { id: string; text: string; initial: string; dirty: boolean } | null;
+  productReservationInput: string;
+  productReservation: ProductReservation | null;
+  productReservationInFlight: ProductReservation | null;
+  productReservationError: string;
+  productReservationStatus: string;
 }
 
 export interface ComposerSurface {
@@ -121,6 +128,7 @@ export interface ComposerSurface {
   focusComposerEnd(): void;
   resizeComposer(): void;
   currentModelOption(): ModelOption;
+  formalTurnOptions(): Partial<TurnOptions>;
   carryModelPick(fromThreadRef: string | null, toThreadRef: string): void;
   refreshRuntimeSelection(scopeId: string | null, agent?: Agent): Promise<void>;
   onDragEnter(e: DragEvent): void;

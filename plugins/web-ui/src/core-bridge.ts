@@ -345,6 +345,11 @@ export interface TurnOptions {
   harness?: string;
   scopeId?: string | null;
   channelName?: string | null;
+  idempotencyKey?: string;
+  modelProviderId?: string;
+  modelProviderRevision?: number;
+  reservationAccepted?: () => void;
+  reservationRejected?: () => void;
 }
 
 export interface ActiveRun {
@@ -613,12 +618,19 @@ export async function queueTurn(
   agent: Agent,
   getTurnOptions?: () => TurnOptions,
 ): Promise<QueuedRun> {
-  const submit = await api<{ runId?: string }>("/api/turn", {
-    method: "POST",
-    body: JSON.stringify(turnRequestBody(threadRef, text, agent.state.model, agent, getTurnOptions)),
-  });
-  if (!submit.runId) throw new Error("Could not queue the message.");
-  return { runId: submit.runId, text };
+  const turnOptions = getTurnOptions?.() ?? {};
+  try {
+    const submit = await api<{ runId?: string }>("/api/turn", {
+      method: "POST",
+      body: JSON.stringify(turnRequestBody(threadRef, text, agent.state.model, agent, turnOptions)),
+    });
+    if (!submit.runId) throw new Error("Could not queue the message.");
+    turnOptions.reservationAccepted?.();
+    return { runId: submit.runId, text };
+  } catch (error) {
+    turnOptions.reservationRejected?.();
+    throw error;
+  }
 }
 
 export async function withdrawRun(runId: string): Promise<boolean> {
@@ -684,10 +696,9 @@ function turnRequestBody(
   text: string,
   model: Model<Api>,
   agent: Agent,
-  getTurnOptions?: () => TurnOptions,
+  turnOptions: TurnOptions = {},
   attachments: CoreAttachment[] = [],
 ): Record<string, unknown> {
-  const turnOptions = getTurnOptions?.() ?? {};
   const thinkingLevel =
     !turnOptions.harness || harnessSupportsEffort(turnOptions.harness)
       ? (turnOptions.effortLevel ?? agent.state.thinkingLevel ?? defaultEffortForModel(model))
@@ -703,6 +714,11 @@ function turnRequestBody(
     ...(timezone ? { timezone } : {}),
     ...(turnOptions.scopeId ? { scopeId: turnOptions.scopeId } : {}),
     ...(turnOptions.channelName ? { channelName: turnOptions.channelName } : {}),
+    ...(turnOptions.idempotencyKey ? { idempotencyKey: turnOptions.idempotencyKey } : {}),
+    ...(turnOptions.modelProviderId ? { modelProviderId: turnOptions.modelProviderId } : {}),
+    ...(turnOptions.modelProviderRevision !== undefined
+      ? { modelProviderRevision: turnOptions.modelProviderRevision }
+      : {}),
     ...(attachments.length ? { attachments } : {}),
   };
 }
@@ -723,11 +739,13 @@ async function drive(
   const work: WorkBlock = { status: "thinking", activity: [] };
   (partial as AssistantWork).work = work;
   const notify = (): void => onWork?.(work);
+  let turnOptions: TurnOptions | undefined;
   try {
     notify();
     stream.push({ type: "start", partial });
     stream.push({ type: "text_start", contentIndex: 0, partial });
 
+    turnOptions = getTurnOptions?.() ?? {};
     const { text, attachments } = opener
       ? { text: "", attachments: [] as CoreAttachment[] }
       : await latestUserTurn(agent);
@@ -735,11 +753,12 @@ async function drive(
     const submit = await api<{ status?: string; runId?: string; reply?: string }>("/api/turn", {
       method: "POST",
       body: JSON.stringify({
-        ...turnRequestBody(threadRef, text, model, agent, getTurnOptions, attachments),
+        ...turnRequestBody(threadRef, text, model, agent, turnOptions, attachments),
         ...(approval ? { approval } : {}),
         ...(opener ? { proactiveOpener: true } : {}),
       }),
     });
+    turnOptions.reservationAccepted?.();
 
     if (submit.runId) {
       await followRun(stream, partial, submit.runId, signal, notify, undefined, slot);
@@ -751,6 +770,7 @@ async function drive(
     notify();
     finish(stream, partial, { acc: "", lastProgressAt: now() }, submit.reply ?? "");
   } catch (e) {
+    turnOptions?.reservationRejected?.();
     work.status = "failed";
     work.finishedAt = Date.now();
     notify();

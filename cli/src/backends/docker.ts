@@ -1,7 +1,7 @@
 import { httpDeploymentLayerTransport, type DeploymentLayerTransport } from "../deployment-layer.ts";
 
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { CliError, bold, die, dim, errMessage, header, note, ok, step, warn } from "../log.ts";
@@ -44,6 +44,7 @@ export const dockerDeploymentLayerTransport: DeploymentLayerTransport = httpDepl
 
 const safe = (s: string): string => s.replace(/[^A-Za-z0-9_.-]/g, "-");
 const ORG_LABEL_KEY = "qm.org";
+const LOCAL_SANDBOX_PLATFORM = "linux/amd64";
 const orgLabelArgs = (ctx: DockerCtx): string[] => ["--label", `${ORG_LABEL_KEY}=${ctx.config.orgId}`];
 const baseHostPort = (ctx: DockerCtx): number => dockerBasePort(ctx.config);
 
@@ -59,6 +60,7 @@ interface DockerCtx {
   sandboxEnv: Record<string, string>;
   sandboxSecretKeys: Set<string>;
   missingSandboxSecrets: string[];
+  localDockerSocket?: { source: string; group: number };
   buildFrom: boolean;
   repoRoot?: string;
 }
@@ -74,6 +76,29 @@ function requireDocker(): void {
   } catch {
     die("the Docker daemon is not reachable — start Docker (or OrbStack) and retry.");
   }
+}
+
+export function localDockerSocket(): { source: string; group: number } {
+  const configuredHost = process.env.DOCKER_HOST?.trim();
+  const configuredContext = process.env.DOCKER_CONTEXT?.trim();
+  const endpoint = (
+    configuredHost ||
+    capture("docker", [
+      "context",
+      "inspect",
+      ...(configuredContext ? [configuredContext] : []),
+      "--format",
+      "{{.Endpoints.docker.Host}}",
+    ])
+  ).trim();
+  if (!/^unix:\/\/\/[^\r\n]+$/u.test(endpoint)) {
+    throw new CliError(`the Docker local sandbox backend requires a local Unix socket context; got ${endpoint}`);
+  }
+  const source = endpoint.slice("unix://".length);
+  if (!source.startsWith("/"))
+    throw new CliError(`the Docker local sandbox socket path must be absolute; got ${source}`);
+  const group = process.platform === "darwin" || !existsSync(source) ? 0 : statSync(source).gid;
+  return { source, group };
 }
 
 function docker(args: string[], allow?: RegExp): string {
@@ -119,6 +144,10 @@ function containerExists(name: string): boolean {
 
 function volumeExists(name: string): boolean {
   return inspectExists(["volume", "inspect", "-f", "{{.Name}}", name], /No such volume|not found/i);
+}
+
+function networkExists(name: string): boolean {
+  return inspectExists(["network", "inspect", "-f", "{{.Name}}", name], /No such network|not found/i);
 }
 
 function pgContainerPassword(ctx: DockerCtx): string | undefined {
@@ -340,6 +369,14 @@ function serviceEnv(ctx: DockerCtx, service: ServiceName): Record<string, string
     ...(service === "core" ? securityScreenEnv(config) : {}),
     ...secretValues(ctx, service),
   };
+  if (service === "core") Object.assign(env, ctx.sandboxEnv);
+  if (service === "core" && env.SANDBOX_BACKEND === "local") {
+    env.LOCAL_SANDBOX_CONTROLLER_CONTAINER = cname(ctx, "core");
+    if (env.SANDBOX_SECONDARY_BACKEND !== "sprites") {
+      delete env.SPRITES_TOKEN;
+      delete env.SPRITES_EGRESS_PROXY_URL;
+    }
+  }
   if (ctx.signingSecret) env.CORE_SIGNING_SECRET = ctx.signingSecret;
   if (service === "core") {
     env.DATABASE_URL = ctx.databaseUrl;
@@ -397,6 +434,7 @@ function pushEnvArgs(args: string[], env: Record<string, string>, secretKeys: Se
 
 function runArgs(ctx: DockerCtx, service: ServiceName, image: string): { args: string[]; cleanup: () => void } {
   const def = serviceDef(service);
+  const env = serviceEnv(ctx, service);
   const args = [
     "run",
     "-d",
@@ -410,9 +448,14 @@ function runArgs(ctx: DockerCtx, service: ServiceName, image: string): { args: s
     "--restart",
     "no",
   ];
-  const cleanup = pushEnvArgs(args, serviceEnv(ctx, service), secretEnvKeys(ctx, service));
+  const cleanup = pushEnvArgs(args, env, secretEnvKeys(ctx, service));
   if (service === "core") {
     args.push("-v", `${ctx.prefix}-coredata:/data`);
+    if (env.SANDBOX_BACKEND === "local") {
+      const socket = ctx.localDockerSocket;
+      if (!socket) throw new CliError("the Docker local sandbox socket was not validated before container startup");
+      args.push("--group-add", String(socket.group), "-v", `${socket.source}:/var/run/docker.sock`);
+    }
     for (const m of layerMounts(ctx)) args.push("-v", m);
     for (const m of skillMounts(ctx)) args.push("-v", m);
   }
@@ -536,6 +579,7 @@ export async function dockerUp(
     envFile: opts.envFile,
   });
   const plugins = discoverPlugins(configDir, config).plugins;
+  if (!opts.dryRun && config.sandbox?.backend === "local") ctx.localDockerSocket = localDockerSocket();
 
   header(`qm up — ${config.orgId} (target: docker${opts.buildFrom ? ", build-from-source" : ""})`);
   if (opts.dryRun) note(bold("DRY RUN — no containers will be started.\n"));
@@ -572,6 +616,7 @@ export async function dockerUp(
           : `plugin ${p.name}: build plugins/${p.name}/Dockerfile`,
       );
     }
+    if (config.sandbox?.backend === "local") step(`sandbox: pull ${config.sandbox.image}`);
     note("\n" + bold("Plan only. Re-run without --dry-run to apply."));
     return;
   }
@@ -586,6 +631,13 @@ export async function dockerUp(
   ensureNetwork(ctx);
   ctx.databaseUrl = ensurePostgres(ctx, false);
   if (!externalDatabaseUrl(ctx)) await waitPostgres(ctx);
+  if (config.sandbox?.backend === "local") {
+    step(`pulling local sandbox ${config.sandbox.image}`);
+    dockerInherit(
+      ["pull", "--platform", LOCAL_SANDBOX_PLATFORM, config.sandbox.image!],
+      `failed to pull ${config.sandbox.image}.`,
+    );
+  }
 
   for (const def of ordered(runnableServices(config.services))) {
     const image = resolveImage(ctx, def.name);
@@ -685,6 +737,13 @@ function listDeploymentContainers(orgId: string): string[] {
   return psNames(["-a", "--filter", `label=${ORG_LABEL_KEY}=${orgId}`]);
 }
 
+function listDeploymentResources(kind: "network" | "volume", orgId: string): string[] {
+  return docker([kind, "ls", "--filter", `label=${ORG_LABEL_KEY}=${orgId}`, "--format", "{{.Name}}"])
+    .split("\n")
+    .map((name) => name.trim())
+    .filter(Boolean);
+}
+
 export async function dockerLogs(config: QmConfig, service: string | undefined, opts: LogOpts = {}): Promise<void> {
   requireDocker();
   const prefix = dockerPrefix(config);
@@ -739,9 +798,22 @@ export async function dockerDown(config: QmConfig, opts: { purge?: boolean } = {
     docker(["rm", "-f", name], /No such container/);
   }
   if (opts.purge) {
-    warn("purging the network and Postgres volume (durable data will be lost)");
-    docker(["network", "rm", prefix], /not found|No such/);
-    docker(["volume", "rm", `${prefix}-pgdata`, `${prefix}-coredata`], /No such volume|not found|in use/);
+    warn("purging deployment networks and volumes, including local sandbox workspaces (durable data will be lost)");
+    const networks = [
+      ...new Set([...(networkExists(prefix) ? [prefix] : []), ...listDeploymentResources("network", config.orgId)]),
+    ];
+    const volumes = [
+      ...new Set([
+        ...(volumeExists(`${prefix}-pgdata`) ? [`${prefix}-pgdata`] : []),
+        ...(volumeExists(`${prefix}-coredata`) ? [`${prefix}-coredata`] : []),
+        ...listDeploymentResources("volume", config.orgId),
+      ]),
+    ];
+    if (networks.length > 0) docker(["network", "rm", ...networks], /not found|No such/);
+    const destroyMarkers = volumes.filter((name) => name.startsWith("qm-destroy-"));
+    const dataVolumes = volumes.filter((name) => !name.startsWith("qm-destroy-"));
+    for (const name of dataVolumes) docker(["volume", "rm", name], /No such volume|not found/);
+    for (const name of destroyMarkers) docker(["volume", "rm", name], /No such volume|not found/);
   }
   ok("down.");
 }

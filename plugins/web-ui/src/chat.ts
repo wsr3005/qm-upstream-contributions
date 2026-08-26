@@ -83,6 +83,7 @@ import {
 } from "./model-options";
 import { browserRenderableImage, formatBytes, icon, relTime } from "./ui";
 import { appState, renderSidebarTop, switchView, syncUrlFromState } from "./shell";
+import { createTurnOptionStager } from "./turn-option-stager";
 import { contextsState, scopeTitle } from "./contexts";
 import { openProjectPage, scopeToolCount, sessionTopbarTpl, setScopedSession } from "./session-scope";
 import {
@@ -192,6 +193,7 @@ export function createChatSurface(
   let workTicker: ReturnType<typeof setInterval> | null = null;
   let revealedTailLen = 0;
   let liveWorkExpanded = false;
+  const turnOptionStager = createTurnOptionStager();
 
   function notePendingSessionOnSend(): void {
     if (!chatState.threadRef || chatState.sessionId !== null) return;
@@ -338,7 +340,7 @@ export function createChatSurface(
     resetBackgroundPanel();
     chatState.resolvingApprovals.clear();
     const onWork = observeLiveWork(agent);
-    const normalStreamFn = makeCoreStreamFn(threadRef, agent, currentTurnOptions, onWork, runSlot);
+    const normalStreamFn = makeCoreStreamFn(threadRef, agent, () => nextTurnOptions(agent), onWork, runSlot);
     agent.streamFn = normalStreamFn;
     chatState.normalStreamFn = normalStreamFn;
     chatState.onWork = onWork;
@@ -411,7 +413,7 @@ export function createChatSurface(
     if (sessionsState.list.some((s) => s.id)) return false;
     proactiveOpenerStarted = true;
     agent.state.messages = [{ role: "user", content: "", opener: true } as unknown as AgentMessage];
-    agent.streamFn = makeOpenerStreamFn(threadRef, agent, currentTurnOptions, onWork, runSlot);
+    agent.streamFn = makeOpenerStreamFn(threadRef, agent, nonFormalTurnOptions, onWork, runSlot);
     void (async () => {
       try {
         await agent.continue();
@@ -436,6 +438,10 @@ export function createChatSurface(
   }
 
   function currentTurnOptions(): TurnOptions {
+    return { ...nonFormalTurnOptions(), ...ctx.composer.formalTurnOptions() };
+  }
+
+  function nonFormalTurnOptions(): TurnOptions {
     const { harnessId: harness } = ctx.composer.currentModelOption();
     return {
       ...(harnessSupportsEffort(harness) ? { effortLevel: ctx.composer.state.effortLevel } : {}),
@@ -446,6 +452,14 @@ export function createChatSurface(
       scopeId: chatState.scopeId,
       channelName: chatState.contextName,
     };
+  }
+
+  function stageTurnOptions(agent: Agent, options: TurnOptions): void {
+    turnOptionStager.stage(agent, options);
+  }
+
+  function nextTurnOptions(agent: Agent): TurnOptions {
+    return turnOptionStager.take(agent, nonFormalTurnOptions);
   }
 
   function inheritedHeader(): TemplateResult | typeof nothing {
@@ -523,7 +537,7 @@ export function createChatSurface(
         chatState.threadRef,
         agent,
         decision,
-        currentTurnOptions,
+        nonFormalTurnOptions,
         chatState.onWork ?? undefined,
         undefined,
         runSlot,
@@ -2242,6 +2256,7 @@ export function createChatSurface(
     hasLiveRun: () => hasLiveRun(runSlot),
     signalLiveRun: (kind, text) => signalLiveRun(runSlot, kind, text),
     currentTurnOptions,
+    stageTurnOptions,
     newChat,
     teardown: teardownActiveChat,
     resetChatState,

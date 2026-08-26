@@ -350,6 +350,9 @@ export const flySandboxRepository = (app: string): string => `registry.fly.io/${
 
 function publishedRepository(opts: SandboxPublishOpts): string {
   if (opts.app) return opts.app.includes("/") ? imageRepository(opts.app) : flySandboxRepository(opts.app);
+  if (opts.config.sandbox?.backend === "local" && opts.config.sandbox.image) {
+    return imageRepository(opts.config.sandbox.image);
+  }
   const app = opts.config.sandbox?.app;
   if (app) return flySandboxRepository(app);
   if (opts.config.sandbox?.image) return imageRepository(opts.config.sandbox.image);
