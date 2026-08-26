@@ -2,6 +2,19 @@ import assert from "node:assert/strict";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { test } from "node:test";
 import { createModelTestProxy, type ModelTestProxyEvidence } from "../src/harness/model-test-proxy.ts";
+import { modelTestError } from "../src/harness/harness.ts";
+
+test("model test failures distinguish upstream rejection from response verification", () => {
+  const signal = new AbortController().signal;
+  assert.equal(
+    modelTestError(signal, { upstreamRequests: 1, upstreamStatus: 401, responseCompleted: true }).category,
+    "provider_request_failed",
+  );
+  assert.equal(
+    modelTestError(signal, { upstreamRequests: 1, upstreamStatus: 200, responseCompleted: true }).category,
+    "response_verification_failed",
+  );
+});
 
 function body(req: IncomingMessage): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {

@@ -13,7 +13,13 @@ import { setCustomProviders } from "../src/model/custom-providers.ts";
 
 const realOpenCodeBinary = resolve(import.meta.dirname, "../node_modules/.bin/opencode");
 
-function fakeSidecar(dir: string, name: string, handlers: string, startupDelayMs = 0): string {
+function fakeSidecar(
+  dir: string,
+  name: string,
+  handlers: string,
+  startupDelayMs = 0,
+  sessionHandler = 'await readBody(req); return json(res, { id: "ses_main" });',
+): string {
   const script = join(dir, `${name}.js`);
   writeFileSync(
     script,
@@ -30,7 +36,7 @@ const capture = async (sessionId, body) =>
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://127.0.0.1");
   if (url.pathname === "/global/event") { res.writeHead(200, { "content-type": "text/event-stream" }); res.write("\\n"); return; }
-  if (req.method === "POST" && url.pathname === "/session") { await readBody(req); return json(res, { id: "ses_main" }); }
+  if (req.method === "POST" && url.pathname === "/session") { ${sessionHandler} }
   const message = url.pathname.match(/^\\/session\\/([^/]+)\\/message$/);
   ${handlers}
   return json(res, {});
@@ -135,6 +141,51 @@ test("OpenCode starts the paid request deadline after a cold custom runtime is r
   assert.equal(result.reply, "hello from fake");
   assert.equal(result.evidence?.upstreamRequests, 1);
   assert.equal(result.evidence?.responseModel, "upstream-luna");
+});
+
+test("OpenCode request timeout interrupts a hung session setup after runtime startup", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-opencode-model-timeout-"));
+  const harness = createOpenCodeHarness({
+    binaryPath: fakeSidecar(
+      dir,
+      "hung-session-model-test",
+      promptHandlers(okAssistant),
+      0,
+      "await readBody(req); await new Promise(() => {});",
+    ),
+  });
+  t.after(async () => {
+    await harness.turns.close?.();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const startedAt = Date.now();
+  await assert.rejects(
+    harness.models.testModel!({
+      model: "enterprise/luna",
+      expectedUpstreamModel: "upstream-luna",
+      maxOutputTokens: 128,
+      systemPrompt: "test",
+      prompt: "ping",
+      requestTimeoutMs: 50,
+      customProvider: {
+        apiKey: "secret",
+        spec: {
+          id: "enterprise",
+          name: "Enterprise",
+          protocol: "openai-responses",
+          baseUrl: "http://127.0.0.1:9",
+          models: [{ id: "enterprise/luna", upstreamId: "upstream-luna" }],
+        },
+      },
+    }),
+    (error: Error & { category?: string; attempt?: { upstreamRequests?: number } }) => {
+      assert.equal(error.name, "HarnessModelTestError");
+      assert.equal(error.category, "request_timeout");
+      assert.equal(error.attempt?.upstreamRequests, 0);
+      return true;
+    },
+  );
+  assert.ok(Date.now() - startedAt < 1_000);
 });
 
 function turnInput(entries: SessionEntry[], llmRows: HarnessLlmRequestRecord[]): HarnessTurnInput {

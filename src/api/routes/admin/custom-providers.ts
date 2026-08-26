@@ -574,7 +574,7 @@ export async function testCustomProvider(ctx: ApiCtx): Promise<void> {
   } catch (error) {
     const failureMetrics =
       error instanceof HarnessModelTestError
-        ? ` failureCategory=${error.category} upstreamRequests=${error.attempt.upstreamRequests} usageAvailable=${Boolean(error.attempt.evidence?.usage)}`
+        ? ` failureCategory=${error.category} upstreamRequests=${error.attempt.upstreamRequests} upstreamStatus=${error.attempt.upstreamStatus ?? "unknown"} usageAvailable=${Boolean(error.attempt.evidence?.usage)}`
         : "";
     const audited = await recordResult("failed", undefined, failureMetrics);
     if (!audited) {
@@ -608,6 +608,7 @@ export async function testCustomProvider(ctx: ApiCtx): Promise<void> {
             ? {
                 failureCategory: error.category,
                 upstreamRequests: error.attempt.upstreamRequests,
+                ...(error.attempt.upstreamStatus === undefined ? {} : { upstreamStatus: error.attempt.upstreamStatus }),
                 ...(error.attempt.evidence ? { usage: error.attempt.evidence.usage } : {}),
               }
             : {}),

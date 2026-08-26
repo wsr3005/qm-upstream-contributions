@@ -21,6 +21,7 @@ export interface ModelTestProxyEvidence {
 export interface ModelTestProxyAttempt {
   upstreamRequests: number;
   responseCompleted: boolean;
+  upstreamStatus?: number;
   evidence?: ModelTestProxyEvidence;
 }
 
@@ -492,6 +493,7 @@ export async function createModelTestProxy(
   let attempted = false;
   let upstreamRequests = 0;
   let responseCompleted = false;
+  let upstreamStatus: number | undefined;
   let evidence: ModelTestProxyEvidence | null = null;
   const server = createServer(async (req, res) => {
     if (attempted) return json(res, 400, { error: { message: "Model connection test permits one upstream request" } });
@@ -514,6 +516,7 @@ export async function createModelTestProxy(
         ...(prepared.body ? { body: prepared.body } : {}),
         ...(options.signal ? { signal: options.signal } : {}),
       });
+      upstreamStatus = upstream.status;
       if (upstream.status >= 300 && upstream.status < 400) {
         await upstream.body?.cancel();
         return json(res, 400, { error: { message: `Upstream model test rejected HTTP ${upstream.status} redirect` } });
@@ -557,7 +560,12 @@ export async function createModelTestProxy(
   }
   return {
     baseUrl: `http://127.0.0.1:${address.port}`,
-    attempt: () => ({ upstreamRequests, responseCompleted, ...(evidence ? { evidence } : {}) }),
+    attempt: () => ({
+      upstreamRequests,
+      responseCompleted,
+      ...(upstreamStatus === undefined ? {} : { upstreamStatus }),
+      ...(evidence ? { evidence } : {}),
+    }),
     evidence: () => {
       if (!isValidModelTestProxyEvidence(evidence, options.expectedModel, options.maxOutputTokens)) {
         throw new Error("model test response evidence did not match the requested model");

@@ -938,11 +938,28 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
           modelID: selectedCustomModel!.upstreamId?.trim() || selectedCustomModel!.id,
         }
       : modelRef(selectedModel);
+    const setupCancelled = new Error("OpenCode setup cancelled");
+    const awaitSetup = async <T>(operation: Promise<T>): Promise<T> => {
+      if (!turn.cancel) return operation;
+      if (turn.cancel.aborted) throw setupCancelled;
+      let rejectCancelled!: (error: Error) => void;
+      const cancelled = new Promise<never>((_, reject) => {
+        rejectCancelled = reject;
+      });
+      const onSetupCancel = () => rejectCancelled(setupCancelled);
+      turn.cancel.addEventListener("abort", onSetupCancel, { once: true });
+      try {
+        return await Promise.race([operation, cancelled]);
+      } finally {
+        turn.cancel.removeEventListener("abort", onSetupCancel);
+      }
+    };
     let created;
     try {
-      created = await rt.client.session.create({ body: { title: `qm:${turn.session.id}` } });
+      created = await awaitSetup(rt.client.session.create({ body: { title: `qm:${turn.session.id}` } }));
     } catch (error) {
       await releaseReservation(runtimeSpec.key);
+      if (error === setupCancelled) return { reply: "", stopped: true };
       throw error;
     }
     const session = created.data;

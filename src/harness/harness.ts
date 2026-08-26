@@ -205,6 +205,8 @@ export class HarnessModelTestError extends Error {
 export function modelTestError(signal: AbortSignal, attempt: ModelTestProxyAttempt): HarnessModelTestError {
   let category: HarnessModelTestFailureCategory = "runtime_startup_failed";
   if (signal.aborted) category = "request_timeout";
+  else if (attempt.upstreamStatus !== undefined && (attempt.upstreamStatus < 200 || attempt.upstreamStatus >= 300))
+    category = "provider_request_failed";
   else if (attempt.responseCompleted) category = "response_verification_failed";
   else if (attempt.upstreamRequests > 0) category = "provider_request_failed";
   return new HarnessModelTestError(category, attempt);

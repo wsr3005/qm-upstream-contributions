@@ -45,7 +45,11 @@ afterEach(() => setCustomProviders([], []));
 
 test("generation self-test durably exposes safe partial evidence after an upstream failure", async () => {
   const srv = start(undefined, undefined, async () => {
-    throw new HarnessModelTestError("provider_request_failed", { upstreamRequests: 1, responseCompleted: false });
+    throw new HarnessModelTestError("provider_request_failed", {
+      upstreamRequests: 1,
+      responseCompleted: false,
+      upstreamStatus: 401,
+    });
   });
   try {
     const put = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway`, {
@@ -70,6 +74,7 @@ test("generation self-test durably exposes safe partial evidence after an upstre
         message: "opencode could not complete the saved model request",
         failureCategory: "provider_request_failed",
         upstreamRequests: 1,
+        upstreamStatus: 401,
         requestId: "partial-evidence",
         providerRevision: 1,
         testedAt: 0,
@@ -84,6 +89,7 @@ test("generation self-test durably exposes safe partial evidence after an upstre
     const replayed = (await replay.json()) as Record<string, unknown>;
     assert.equal(replayed.failureCategory, "provider_request_failed");
     assert.equal(replayed.upstreamRequests, 1);
+    assert.equal(replayed.upstreamStatus, 401);
   } finally {
     await srv.close();
   }
