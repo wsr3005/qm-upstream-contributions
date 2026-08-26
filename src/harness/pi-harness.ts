@@ -403,23 +403,18 @@ export function sanitizeTitle(out: string | undefined): string | undefined {
   // Reject reply-shaped output — the model answered the transcript instead of titling it.
   if (t.length > 90 || t.split(/\s+/).length > 12) return undefined;
   if (/(^|\s)\*{2,3}(?![\\/])[^*\n]+\*{2,3}(?=$|[\s\p{P}\p{S}])/u.test(t)) return undefined;
-  let replyView = t;
-  for (let i = 0; i < 4; i++) {
-    const next = replyView.replace(/^(\*{1,3}|_{1,3}|~{2})(.+)\1(?=$|[\s\p{P}\p{S}])/u, "$2");
-    if (next === replyView) break;
-    replyView = next;
-  }
+  const replyView = t
+    .replace(/[*_~`]+/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
   const plainReply = /^(?:i|i['’]\w+|sorry|unfortunately|sure|okay|ok|here['’]?s|as an ai)\b/i;
-  const emphasizedReply = /^(?:sorry|unfortunately|sure|okay|here['’]?s|as an ai)\b/i;
-  const emphasizedFirstPersonReply = /^(?:i\b|i['’]\w+\b)/i;
+  const technicalDunderOk = /^__ok__\s+\S/.test(t) && !/^ok\b\s+(?:i\b|sorry|cannot|can['’]t)/i.test(replyView);
   const technicalDunderI =
-    /^__i__\s+(?:variable|identifier|index|field|property|parameter|symbol|type|value|loop)\b/.test(t);
-  if (
-    (replyView === t && plainReply.test(replyView)) ||
-    (replyView !== t &&
-      (emphasizedReply.test(replyView) || (emphasizedFirstPersonReply.test(replyView) && !technicalDunderI)))
-  )
-    return undefined;
+    /^__i__\s+\S/.test(t) &&
+    !/^i\b(?:\s|[\p{P}\p{S}])+(?:can(?:not|['’]t)|cannot|will|would|must|need|am|have|apologize|refuse|decline|don['’]t|do not|value\b|loop through\b)/iu.test(
+      replyView,
+    );
+  if (plainReply.test(replyView) && !technicalDunderOk && !technicalDunderI) return undefined;
   return t.length > MAX_TITLE_CHARS ? `${t.slice(0, MAX_TITLE_CHARS).trimEnd()}…` : t;
 }
 
