@@ -180,6 +180,37 @@ rl.on("line", (line) => {
   return path;
 }
 
+function lateTurnCodexBinary(dir: string): string {
+  const path = join(dir, "late-turn-codex");
+  const started = join(dir, "late-turn-started");
+  const interrupted = join(dir, "late-turn-interrupted");
+  writeFileSync(
+    path,
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin });
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") return send({ id: msg.id, result: {} });
+  if (msg.method === "initialized") return;
+  if (msg.method === "thread/start") return send({ id: msg.id, result: { thread: { id: "thread-late" } } });
+  if (msg.method === "turn/start") {
+    fs.writeFileSync(${JSON.stringify(started)}, msg.params.threadId);
+    return setTimeout(() => send({ id: msg.id, result: { turn: { id: "turn-late", status: "inProgress", items: [] } } }), 100);
+  }
+  if (msg.method === "turn/interrupt") {
+    fs.writeFileSync(${JSON.stringify(interrupted)}, msg.params.turnId);
+    return send({ id: msg.id, result: {} });
+  }
+});
+`,
+  );
+  chmodSync(path, 0o755);
+  return path;
+}
+
 function rotatingProviderCodexBinary(dir: string): string {
   const path = join(dir, "rotating-provider-codex");
   const log = join(dir, "runtime-log");
@@ -460,6 +491,34 @@ test("Codex request timeout interrupts a hung turn start after runtime startup",
     },
   );
   assert.ok(Date.now() - startedAt < 1_000);
+});
+
+test("Codex interrupts a late turn start after returning from user cancellation", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-codex-late-turn-"));
+  const harness = createCodexHarness({ binaryPath: lateTurnCodexBinary(dir), env: process.env });
+  t.after(async () => {
+    await harness.turns.close?.();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const cancel = new AbortController();
+  const scope = { kind: "org", id: "test" } as unknown as ScopeId;
+  const pending = harness.turns.runTurn({
+    session: { id: "late-turn" } as Session,
+    input: "hi",
+    systemPrompt: "be concise",
+    history: [],
+    tools: {} as HarnessTurnInput["tools"],
+    scopeLabel: scope,
+    orgScopeId: scope,
+    cancel: cancel.signal,
+    emit: async (entry) => ({ ...entry, sessionId: "late-turn", seq: 1, createdAt: Date.now() }) as SessionEntry,
+    recordModelCall: () => {},
+  });
+  while (!existsSync(join(dir, "late-turn-started"))) await new Promise((resolveWait) => setTimeout(resolveWait, 5));
+  cancel.abort();
+  assert.deepEqual(await pending, { reply: "", stopped: true });
+  await new Promise((resolveWait) => setTimeout(resolveWait, 250));
+  assert.equal(readFileSync(join(dir, "late-turn-interrupted"), "utf8"), "turn-late");
 });
 
 test("custom Codex runtime identity rotates with endpoint or key and strips built-in credentials", () => {

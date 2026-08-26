@@ -996,19 +996,17 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
           )
         : null;
     let timer: NodeJS.Timeout | undefined;
+    const turnStart = rt.server
+      .request<{ turn: CodexTurn }>("turn/start", {
+        threadId,
+        input,
+        ...(runtimeModel ? { model: runtimeModel } : {}),
+      })
+      .catch((error: unknown) => {
+        throw error instanceof CodexRpcError ? codexProviderFailure(error.message) : error;
+      });
     try {
-      const response = await Promise.race([
-        rt.server
-          .request<{ turn: CodexTurn }>("turn/start", {
-            threadId,
-            input,
-            ...(runtimeModel ? { model: runtimeModel } : {}),
-          })
-          .catch((error: unknown) => {
-            throw error instanceof CodexRpcError ? codexProviderFailure(error.message) : error;
-          }),
-        cancelled,
-      ]);
+      const response = await Promise.race([turnStart, cancelled]);
       turnId = response.turn.id;
       if (toolAbort.signal.aborted || turn.cancel?.aborted) await interrupt(false);
       const remainingWallMs = deadline ? Math.max(1, deadline - Date.now()) : 0;
@@ -1054,7 +1052,13 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
         ...(state.tapeWriteFailed ? { tapeWriteFailed: true } : {}),
       };
     } catch (error) {
-      if (error === turnCancelled) return { reply: "", stopped: true };
+      if (error === turnCancelled) {
+        if (!turnId)
+          void turnStart
+            .then((late) => rt.server.request("turn/interrupt", { threadId, turnId: late.turn.id }))
+            .catch(() => undefined);
+        return { reply: "", stopped: true };
+      }
       throw error;
     } finally {
       if (timer) clearTimeout(timer);
