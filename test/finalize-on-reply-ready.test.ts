@@ -94,7 +94,12 @@ function gatedSandbox() {
   };
 }
 
-function buildOrchestrator(sandbox: Sandbox, errors?: ErrorLog, harness = createMockHarness()) {
+function buildOrchestrator(
+  sandbox: Sandbox,
+  errors?: ErrorLog,
+  harness = createMockHarness(),
+  titleGenerationTimeoutMs?: number,
+) {
   const config = createMemoryConfigStore(ORG);
   const acl = createAclStore();
   const auditLog = createAuditLog();
@@ -121,6 +126,7 @@ function buildOrchestrator(sandbox: Sandbox, errors?: ErrorLog, harness = create
     memory: createMemoryService(workspace),
     deploy,
     acl,
+    ...(titleGenerationTimeoutMs !== undefined ? { titleGenerationTimeoutMs } : {}),
     ...(errors ? { errors } : {}),
   });
   return { orch, sessions };
@@ -210,19 +216,37 @@ test("initial title generation waits for the main harness turn", async () => {
   const events: string[] = [];
   const harness = createMockHarness();
   const runTurn = harness.turns.runTurn;
-  harness.turns.runTurn = async (input) => {
-    events.push("turn:start");
-    const result = await runTurn(input);
-    events.push("turn:end");
-    return result;
+  let guard = Promise.resolve();
+  const withGuard = async <T>(run: () => Promise<T>): Promise<T> => {
+    const previous = guard;
+    let release!: () => void;
+    guard = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await run();
+    } finally {
+      release();
+    }
   };
-  harness.models.generateTitle = async () => {
-    events.push("title");
-    assert.equal(events.at(-2), "turn:end");
-    return "Long harness title";
+  harness.turns.runTurn = (input) =>
+    withGuard(async () => {
+      events.push("turn:start");
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      const result = await runTurn(input);
+      events.push("turn:end");
+      return result;
+    });
+  harness.models.generateTitle = async (input) => {
+    await tick();
+    return withGuard(async () => {
+      events.push(input.signal?.aborted ? "title:aborted" : "title:ready");
+      return input.signal?.aborted ? undefined : "Long harness title";
+    });
   };
   const g = gatedSandbox();
-  const { orch, sessions } = buildOrchestrator(g.sandbox, undefined, harness);
+  const { orch, sessions } = buildOrchestrator(g.sandbox, undefined, harness, 10);
 
   const pending = orch.handleTurn({
     ...dm("dm:U1:title-order", "Explain this long-running task"),
@@ -234,7 +258,7 @@ test("initial title generation waits for the main harness turn", async () => {
   const result = await pending;
 
   assert.equal(result.status, "ok");
-  assert.deepEqual(events, ["turn:start", "turn:end", "title"]);
+  assert.deepEqual(events, ["turn:start", "turn:end", "title:ready"]);
   assert.equal((await sessions.get(result.sessionId!))?.title, "Long harness title");
 });
 
