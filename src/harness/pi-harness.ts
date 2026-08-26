@@ -403,18 +403,30 @@ export function sanitizeTitle(out: string | undefined): string | undefined {
   // Reject reply-shaped output — the model answered the transcript instead of titling it.
   if (t.length > 90 || t.split(/\s+/).length > 12) return undefined;
   if (/(^|\s)\*{2,3}(?![\\/])[^*\n]+\*{2,3}(?=$|[\s\p{P}\p{S}])/u.test(t)) return undefined;
-  const replyView = t
-    .replace(/[*_~`]+/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-  const plainReply = /^(?:i|i['’]\w+|sorry|unfortunately|sure|okay|ok|here['’]?s|as an ai)\b/i;
-  const technicalDunderOk = /^__ok__\s+\S/.test(t) && !/^ok\b\s+(?:i\b|sorry|cannot|can['’]t)/i.test(replyView);
-  const technicalDunderI =
-    /^__i__\s+\S/.test(t) &&
-    !/^i\b(?:\s|[\p{P}\p{S}])+(?:can(?:not|['’]t)|cannot|will|would|must|need|am|have|apologize|refuse|decline|don['’]t|do not|value\b|loop through\b)/iu.test(
+  let replyView = t;
+  for (let i = 0; i < 4; i++) {
+    const next = replyView
+      .replace(/(?<!\*)\*{3}(?!\*)([^*\n]+?)(?<!\*)\*{3}(?!\*)/g, "$1")
+      .replace(/(?<!\*)\*{2}(?!\*)([^*\n]+?)(?<!\*)\*{2}(?!\*)/g, "$1")
+      .replace(/(?<!\*)\*(?!\*)([^*\n]+?)(?<!\*)\*(?!\*)/g, "$1")
+      .replace(/(?<!_)_{3}(?!_)([^_\n]+?)(?<!_)_{3}(?!_)/g, "$1")
+      .replace(/(?<!_)_{2}(?!_)([^_\n]+?)(?<!_)_{2}(?!_)/g, "$1")
+      .replace(/(?<!_)_(?!_)([^_\n]+?)(?<!_)_(?!_)/g, "$1")
+      .replace(/(?<!~)~~(?!~)([^~\n]+?)(?<!~)~~(?!~)/g, "$1")
+      .replace(/(?<!`)`{1,3}(?!`)([^`\n]+?)(?<!`)`{1,3}(?!`)/g, "$1");
+    if (next === replyView) break;
+    replyView = next;
+  }
+  replyView = replyView.replace(/\s+/g, " ").trim();
+  const firstPersonReply =
+    /^(?:i['’]\w+\b|i(?:\s|[\p{P}\p{S}])+(?:can(?:not|['’]t)|cannot|will|would|must|need|am|have|apologize|refuse|decline|don['’]t|do not|understand|should|was|already|appreciate|could|value\b|loop through\b))/iu;
+  const conversationalReply = /^(?:sorry|unfortunately|sure|okay|ok|here['’]?s|as an ai)\b/i;
+  const technicalDunderOk =
+    /^__ok__\s+\S/.test(t) &&
+    !/^ok\b(?:\s|[\p{P}\p{S}])+(?:i\b|sorry|here['’]?s|unfortunately|sure|let me|we can|cannot|can['’]t)/iu.test(
       replyView,
     );
-  if (plainReply.test(replyView) && !technicalDunderOk && !technicalDunderI) return undefined;
+  if ((firstPersonReply.test(replyView) || conversationalReply.test(replyView)) && !technicalDunderOk) return undefined;
   return t.length > MAX_TITLE_CHARS ? `${t.slice(0, MAX_TITLE_CHARS).trimEnd()}…` : t;
 }
 
