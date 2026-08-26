@@ -60,6 +60,17 @@ test("production and unauthenticated-core escape hatch are parsed once", () => {
   assert.throws(() => loadConfig({ ALLOW_UNAUTHENTICATED_CORE: "sometimes" }), /not a recognized boolean/);
 });
 
+test("formal model test reservations parse their candidate and distinct signing secret", () => {
+  const candidateCommit = "a".repeat(40);
+  const reservationSecret = "formal-reservation-secret-0123456789abcdef";
+  const config = loadConfig({
+    MODEL_TEST_CANDIDATE_COMMIT: candidateCommit,
+    MODEL_TEST_RESERVATION_SECRET: reservationSecret,
+  });
+  assert.equal(config.modelTestCandidateCommit, candidateCommit);
+  assert.equal(config.modelTestReservationSecret, reservationSecret);
+});
+
 test("harness security posture defaults to auto and validates named modes", () => {
   assert.equal(loadConfig({}).securityPosture, "auto");
   assert.equal(loadConfig({}).securityScreenBackend, "model");

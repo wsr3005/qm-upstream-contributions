@@ -69,6 +69,19 @@ test("the paid model test forwards the core retry window", async () => {
   assert.equal(response.headers.get("retry-after"), "12");
 });
 
+test("the formal reservation preflight is forwarded without changing its receipt", async () => {
+  const reservation = { schemaVersion: "qm-model-test-browser-receipt-v3", signature: "a".repeat(64) };
+  const response = await fetch(`${base}/api/custom-providers/gateway/harness-test-reservation`, {
+    method: "POST",
+    headers: { cookie: "admin=U-admin", "content-type": "application/json" },
+    body: JSON.stringify({ reservation }),
+  });
+  assert.equal(response.status, 200);
+  const call = calls.at(-1)!;
+  assert.equal(call.url, "/v1/admin/custom-providers/gateway/harness-test-reservation");
+  assert.deepEqual(JSON.parse(call.body), { reservation });
+});
+
 test("the paid model test rejects signed-out callers before reaching core", async () => {
   const before = calls.length;
   const response = await fetch(`${base}/api/custom-providers/gateway/harness-test`, {

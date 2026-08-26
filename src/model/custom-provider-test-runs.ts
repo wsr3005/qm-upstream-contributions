@@ -10,6 +10,7 @@ export interface CustomProviderTestRunIdentity {
   providerRevision: number;
   rolloutFence: string;
   configurationFingerprint?: string;
+  reservationFingerprint?: string;
 }
 
 export interface CustomProviderTestRunResponse {
@@ -104,6 +105,7 @@ export function customProviderTestRequestFingerprint(identity: CustomProviderTes
     identity.providerRevision,
     identity.rolloutFence,
     identity.configurationFingerprint ?? null,
+    identity.reservationFingerprint ?? null,
   ]);
 }
 

@@ -1,6 +1,7 @@
 import "./support/auto-fake-sprites.ts";
 
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -11,6 +12,11 @@ import { buildApp, type BuiltApp } from "../src/wiring.ts";
 import { testConfig } from "./support/test-config.ts";
 import { resolveModel } from "../src/model/pi-models.ts";
 import { setCustomProviders } from "../src/model/custom-providers.ts";
+import {
+  CUSTOM_PROVIDER_TEST_RESERVATION_SCHEMA,
+  CUSTOM_PROVIDER_TEST_RESERVATION_TTL_MS,
+  signCustomProviderTestReservation,
+} from "../src/model/custom-provider-test-reservation.ts";
 
 const ADMIN = { "content-type": "application/json", "x-admin-actor": "admin-alice@default-org" };
 const ADMIN_BOB = { "content-type": "application/json", "x-admin-actor": "admin-bob@default-org" };
@@ -41,6 +47,7 @@ function start(
   runtimeSchemaReady?: boolean,
   customProviderHarnessTest?: BuiltApp["customProviderHarnessTest"],
   customProviderHarnessTestFence?: BuiltApp["customProviderHarnessTestFence"],
+  reservation?: { candidateCommit: string; secret: string },
 ): {
   base: string;
   built: BuiltApp;
@@ -61,6 +68,12 @@ function start(
     refreshCustomProviders: built.refreshCustomProviders,
     customProviderHarnessTest: customProviderHarnessTest ?? built.customProviderHarnessTest,
     customProviderHarnessTestFence: customProviderHarnessTestFence ?? built.customProviderHarnessTestFence,
+    ...(reservation
+      ? {
+          modelTestCandidateCommit: reservation.candidateCommit,
+          modelTestReservationSecret: reservation.secret,
+        }
+      : {}),
     modelCredentialFetch,
     harnessId: "pi",
     providerKeys: { anthropic: true, openai: false, openrouter: false },
@@ -74,6 +87,95 @@ function start(
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   };
 }
+
+test("a signed reservation is rechecked against the durable Provider before any paid call", async () => {
+  const candidateCommit = "a".repeat(40);
+  const secret = "route-formal-reservation-secret-00000001";
+  let paidCalls = 0;
+  const srv = start(
+    undefined,
+    undefined,
+    async (input) => {
+      paidCalls += 1;
+      return {
+        reply: "ready",
+        providerRevision: input.expectedRevision,
+        upstreamModelId: input.modelId,
+        evidence: modelTestEvidence(input.modelId),
+        maxOutputTokens: 128,
+      };
+    },
+    undefined,
+    { candidateCommit, secret },
+  );
+  try {
+    const put = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify({
+        ...BODY,
+        protocol: "openai-responses",
+        models: [{ id: "gpt-5.6-luna" }],
+        validate: false,
+      }),
+    });
+    assert.equal(put.status, 200);
+    const provider = (await put.json()) as { status: { revision: number } };
+    const createdAt = Date.now();
+    const selectionModelId = "acme-gateway/gpt-5.6-luna";
+    const requestId = `qa-${createHash("sha256").update(`browser:${candidateCommit}:base-v37:admin-pi`).digest("hex")}`;
+    const reservation = signCustomProviderTestReservation(
+      {
+        schemaVersion: CUSTOM_PROVIDER_TEST_RESERVATION_SCHEMA,
+        candidateCommit,
+        runAlias: "base-v37",
+        budgetRequestId: "admin-pi",
+        requestId,
+        orgScope: "org:default-org",
+        providerId: "acme-gateway",
+        selectionModelId,
+        upstreamModelId: "gpt-5.6-luna",
+        harness: "pi",
+        protocol: "openai-responses",
+        providerRevision: provider.status.revision,
+        createdAt,
+        expiresAt: createdAt + CUSTOM_PROVIDER_TEST_RESERVATION_TTL_MS,
+        storageKey: "qm-custom-provider-test-retry:org%3Adefault-org:acme-gateway:acme-gateway%2Fgpt-5.6-luna:pi",
+      },
+      secret,
+    );
+    const validation = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/harness-test-reservation`, {
+      method: "POST",
+      headers: ADMIN,
+      body: JSON.stringify({ reservation }),
+    });
+    assert.equal(validation.status, 200);
+
+    const update = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify({
+        ...BODY,
+        protocol: "openai-responses",
+        baseUrl: "https://changed.example/v1",
+        models: [{ id: "gpt-5.6-luna" }],
+        validate: false,
+      }),
+    });
+    assert.equal(update.status, 200);
+
+    const tested = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/harness-test`, {
+      method: "POST",
+      headers: ADMIN,
+      body: JSON.stringify({ modelId: selectionModelId, harness: "pi", requestId, reservation }),
+    });
+    assert.equal(tested.status, 409);
+    assert.equal(((await tested.json()) as { error: string }).error, "harness_test_reservation_invalid");
+    assert.equal(paidCalls, 0);
+  } finally {
+    await srv.close();
+  }
+});
 
 const BODY = {
   name: "Acme Gateway",

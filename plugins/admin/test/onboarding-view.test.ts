@@ -180,6 +180,37 @@ function customProvider(updatedAt: number, models = ["luna"]): Record<string, un
   };
 }
 
+function formalBrowserReceipt(providerRevision = 1) {
+  const createdAt = Date.now();
+  const candidateCommit = "a".repeat(40);
+  const runAlias = "base-v37";
+  const budgetRequestId = "admin-pi";
+  const requestId = `qa-${createHash("sha256")
+    .update(`browser:${candidateCommit}:${runAlias}:${budgetRequestId}`)
+    .digest("hex")}`;
+  const storageKey = ["qm-custom-provider-test-retry", "org:acme", "gateway", "gateway/gpt-5.6-luna", "pi"]
+    .map(encodeURIComponent)
+    .join(":");
+  return {
+    schemaVersion: "qm-model-test-browser-receipt-v3",
+    candidateCommit,
+    runAlias,
+    budgetRequestId,
+    requestId,
+    orgScope: "org:acme",
+    providerId: "gateway",
+    harness: "pi",
+    protocol: "openai-responses",
+    providerRevision,
+    selectionModelId: "gateway/gpt-5.6-luna",
+    upstreamModelId: "gpt-5.6-luna",
+    createdAt,
+    expiresAt: createdAt + 300_000,
+    storageKey,
+    signature: "b".repeat(64),
+  };
+}
+
 let nextFakeRequestId = 0;
 
 function createCustomProviderUi(
@@ -735,45 +766,57 @@ test("a formal browser receipt imports only after exact target and storage verif
     ...customProvider(1),
     models: [{ id: "gateway/gpt-5.6-luna", upstreamId: "gpt-5.6-luna" }],
   };
-  const harness = createCustomProviderUi(async () => ({ ok: true, data: { providers: [provider] } }), retryStorage);
+  let validatedReservation: unknown;
+  let testReservation: unknown;
+  const harness = createCustomProviderUi(async (method, path, body) => {
+    if (method === "POST" && path.endsWith("/harness-test-reservation")) {
+      validatedReservation = (body as { reservation: unknown }).reservation;
+      return { ok: true, data: { ok: true } };
+    }
+    if (method === "POST" && path.endsWith("/harness-test")) {
+      testReservation = (body as { reservation: unknown }).reservation;
+      return successfulHarnessResponse((body as { requestId: string }).requestId);
+    }
+    return { ok: true, data: { providers: [provider] } };
+  }, retryStorage);
   await harness.ui.loadCustomProviders();
-  const createdAt = Date.now();
-  const candidateCommit = "a".repeat(40);
-  const runAlias = "base-v36";
-  const budgetRequestId = "admin-pi";
-  const requestId = `qa-${createHash("sha256")
-    .update(`browser:${candidateCommit}:${runAlias}:${budgetRequestId}`)
-    .digest("hex")}`;
-  const storageKey = ["qm-custom-provider-test-retry", "org:acme", "gateway", "gateway/gpt-5.6-luna", "pi"]
-    .map(encodeURIComponent)
-    .join(":");
-  harness.receiptInput.value = JSON.stringify({
-    schemaVersion: "qm-model-test-browser-receipt-v2",
-    runAlias,
-    candidateCommit,
-    budgetRequestId,
-    requestId,
-    harness: "pi",
-    selectionModelId: "gateway/gpt-5.6-luna",
-    upstreamModelId: "gpt-5.6-luna",
-    storageKey,
-    value: {
-      identity: JSON.stringify(["gateway", "gateway/gpt-5.6-luna", "pi", "openai-responses", 1]),
-      requestId,
-      createdAt,
-      expiresAt: createdAt + 300_000,
-      retryAt: createdAt,
-    },
-  });
+  const receipt = formalBrowserReceipt();
+  harness.receiptInput.value = JSON.stringify(receipt);
 
   await harness.receiptImport.onclick?.();
 
   assert.equal(harness.receiptInput.value, "");
   assert.equal(harness.modelSelect.value, "0");
   assert.equal(harness.harnessSelect.value, "pi");
-  assert.equal(JSON.parse(retryStorage.get(storageKey) || "null").requestId, requestId);
+  assert.deepEqual(JSON.parse(JSON.stringify(validatedReservation)), receipt);
+  assert.equal(JSON.parse(retryStorage.get(receipt.storageKey) || "null").requestId, receipt.requestId);
+  assert.deepEqual(JSON.parse(retryStorage.get(receipt.storageKey) || "null").formalReservation, receipt);
   assert.match(harness.testStatus.textContent, /Formal pi receipt imported/);
   assert.equal(harness.testButton.disabled, false);
+  await harness.ui.runTest();
+  assert.deepEqual(JSON.parse(JSON.stringify(testReservation)), receipt);
+});
+
+test("a formal browser receipt rejected by Core is not stored or made runnable", async () => {
+  const retryStorage = new Map<string, string>();
+  const provider = {
+    ...customProvider(1),
+    models: [{ id: "gateway/gpt-5.6-luna", upstreamId: "gpt-5.6-luna" }],
+  };
+  const harness = createCustomProviderUi(
+    async (method) =>
+      method === "POST"
+        ? { ok: false, data: { message: "the formal test reservation is invalid" } }
+        : { ok: true, data: { providers: [provider] } },
+    retryStorage,
+  );
+  await harness.ui.loadCustomProviders();
+  harness.receiptInput.value = JSON.stringify(formalBrowserReceipt());
+
+  await harness.receiptImport.onclick?.();
+
+  assert.equal(retryStorage.size, 0);
+  assert.match(harness.testStatus.textContent, /formal test reservation is invalid/);
 });
 
 test("a formal browser receipt rejects a mismatched provider revision without storage", async () => {
@@ -784,34 +827,7 @@ test("a formal browser receipt rejects a mismatched provider revision without st
   };
   const harness = createCustomProviderUi(async () => ({ ok: true, data: { providers: [provider] } }), retryStorage);
   await harness.ui.loadCustomProviders();
-  const createdAt = Date.now();
-  const candidateCommit = "a".repeat(40);
-  const runAlias = "base-v36";
-  const budgetRequestId = "admin-pi";
-  const requestId = `qa-${createHash("sha256")
-    .update(`browser:${candidateCommit}:${runAlias}:${budgetRequestId}`)
-    .digest("hex")}`;
-  const storageKey = ["qm-custom-provider-test-retry", "org:acme", "gateway", "gateway/gpt-5.6-luna", "pi"]
-    .map(encodeURIComponent)
-    .join(":");
-  harness.receiptInput.value = JSON.stringify({
-    schemaVersion: "qm-model-test-browser-receipt-v2",
-    runAlias,
-    candidateCommit,
-    budgetRequestId,
-    requestId,
-    harness: "pi",
-    selectionModelId: "gateway/gpt-5.6-luna",
-    upstreamModelId: "gpt-5.6-luna",
-    storageKey,
-    value: {
-      identity: JSON.stringify(["gateway", "gateway/gpt-5.6-luna", "pi", "openai-responses", 2]),
-      requestId,
-      createdAt,
-      expiresAt: createdAt + 300_000,
-      retryAt: createdAt,
-    },
-  });
+  harness.receiptInput.value = JSON.stringify(formalBrowserReceipt(2));
 
   await harness.receiptImport.onclick?.();
 

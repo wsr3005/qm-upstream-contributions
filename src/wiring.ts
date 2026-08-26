@@ -426,6 +426,21 @@ export function buildApp(
   if (config.databaseUrl && !config.connectorSecretKey) {
     throw new Error("CONNECTOR_SECRET_KEY is required with durable storage");
   }
+  if (Boolean(config.modelTestReservationSecret) !== Boolean(config.modelTestCandidateCommit)) {
+    throw new Error("MODEL_TEST_RESERVATION_SECRET and MODEL_TEST_CANDIDATE_COMMIT must be configured together");
+  }
+  if (config.modelTestReservationSecret && config.modelTestReservationSecret.length < 32) {
+    throw new Error("MODEL_TEST_RESERVATION_SECRET must be at least 32 characters");
+  }
+  if (config.modelTestCandidateCommit && !/^[a-f0-9]{40}$/.test(config.modelTestCandidateCommit)) {
+    throw new Error("MODEL_TEST_CANDIDATE_COMMIT must be a full commit SHA");
+  }
+  const reusedModelTestSecret = [config.signingSecret, config.capabilitySecret, config.portalIdentitySecret].some(
+    (value) => value && value === config.modelTestReservationSecret,
+  );
+  if (reusedModelTestSecret) {
+    throw new Error("MODEL_TEST_RESERVATION_SECRET must differ from runtime authentication secrets");
+  }
   configurePgCaTrust({
     ...(config.databaseCaCert ? { cert: config.databaseCaCert } : {}),
     ...(config.databaseCaCertFile ? { certFile: config.databaseCaCertFile } : {}),
@@ -1781,6 +1796,8 @@ export function serverDeps(
     refreshCustomProviders: built.refreshCustomProviders,
     customProviderHarnessTest: built.customProviderHarnessTest,
     customProviderHarnessTestFence: built.customProviderHarnessTestFence,
+    ...(config.modelTestReservationSecret ? { modelTestReservationSecret: config.modelTestReservationSecret } : {}),
+    ...(config.modelTestCandidateCommit ? { modelTestCandidateCommit: config.modelTestCandidateCommit } : {}),
     mcpServers: built.mcpServers,
     mcpToolService: built.mcpToolService,
     ...(config.brandingDefault ? { brandingDefault: config.brandingDefault } : {}),
