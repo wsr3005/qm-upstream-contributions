@@ -120,6 +120,8 @@ export interface ServerDeps {
   customProviderHarnessTest?: CustomProviderHarnessTestRunner;
   customProviderHarnessTestFence?: () => Promise<string | null>;
   customProviderTestRuns?: CustomProviderTestRunStore;
+  modelTestReservationSecret?: string;
+  modelTestCandidateCommit?: string;
   brandingDefault?: OrgBranding;
   harnessId?: string;
   admin?: AdminService;

@@ -22,12 +22,51 @@ import {
   customProviderTestReceiptId,
   customProviderTestRequestFingerprint,
   type CustomProviderTestRunClaim,
+  type CustomProviderTestRunIdentity,
   type CustomProviderTestRunResponse,
 } from "../../../model/custom-provider-test-runs.ts";
 import { isValidModelTestProxyEvidence, MODEL_TEST_MAX_OUTPUT_TOKENS } from "../../../harness/model-test-proxy.ts";
+import {
+  customProviderTestReservationFingerprint,
+  parseCustomProviderTestReservation,
+  verifyCustomProviderTestReservation,
+  type CustomProviderTestReservation,
+} from "../../../model/custom-provider-test-reservation.ts";
 
 const TEST_HARNESSES = new Set<CustomProviderTestHarness>(["pi", "opencode", "codex"]);
 const TEST_REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const FORMAL_TEST_REQUEST_ID = /^qa-[a-f0-9]{64}$/;
+
+function reservationStorageKey(scope: string, providerId: string, modelId: string, harness: string): string {
+  return ["qm-custom-provider-test-retry", scope, providerId, modelId, harness].map(encodeURIComponent).join(":");
+}
+
+function verifiedReservation(
+  ctx: ApiCtx,
+  value: unknown,
+  target: {
+    providerId: string;
+    selectionModelId: string;
+    upstreamModelId: string;
+    harness: CustomProviderTestHarness;
+    protocol: CustomProviderProtocol;
+    providerRevision: number;
+    requestId: string;
+  },
+): CustomProviderTestReservation | null {
+  if (!ctx.deps.modelTestCandidateCommit || !ctx.deps.modelTestReservationSecret) return null;
+  const scope = orgScope(ctx.deps);
+  return verifyCustomProviderTestReservation(
+    value,
+    {
+      candidateCommit: ctx.deps.modelTestCandidateCommit,
+      orgScope: scope,
+      ...target,
+      storageKey: reservationStorageKey(scope, target.providerId, target.selectionModelId, target.harness),
+    },
+    ctx.deps.modelTestReservationSecret,
+  );
+}
 
 async function actor(ctx: ApiCtx) {
   const scope = orgScope(ctx.deps);
@@ -175,6 +214,7 @@ export async function testCustomProvider(ctx: ApiCtx): Promise<void> {
       models?: unknown;
       apiKey?: unknown;
     };
+    reservation?: unknown;
   };
   if (typeof body.modelId !== "string" || !body.modelId.trim()) {
     return sendJson(ctx.res, 400, { error: "bad_request", message: "modelId is required" });
@@ -196,6 +236,12 @@ export async function testCustomProvider(ctx: ApiCtx): Promise<void> {
   const requestId = body.requestId;
   const sendTestJson = (status: number, response: Record<string, unknown>) =>
     sendJson(ctx.res, status, { ...response, requestId });
+  if (FORMAL_TEST_REQUEST_ID.test(requestId) && body.reservation === undefined) {
+    return sendTestJson(409, {
+      error: "harness_test_reservation_required",
+      message: "this formal test request requires its signed reservation",
+    });
+  }
   const readRolloutFence = ctx.deps.customProviderHarnessTestFence ?? (async () => null);
   let draft: { provider: CustomProviderSpec; apiKey: string } | undefined;
   let configurationFingerprint: string | undefined;
@@ -282,7 +328,7 @@ export async function testCustomProvider(ctx: ApiCtx): Promise<void> {
   }
   const testHarness = harnessId as CustomProviderTestHarness;
   const upstreamModelId = model.id;
-  const testIdentity = {
+  const testIdentity: CustomProviderTestRunIdentity = {
     scopeId: orgScope(ctx.deps),
     providerId: id,
     modelId: selectedModelId,
@@ -291,6 +337,27 @@ export async function testCustomProvider(ctx: ApiCtx): Promise<void> {
     rolloutFence,
     ...(configurationFingerprint ? { configurationFingerprint } : {}),
   };
+  const reservation =
+    body.reservation === undefined
+      ? null
+      : verifiedReservation(ctx, body.reservation, {
+          providerId: id,
+          selectionModelId: selectedModelId,
+          upstreamModelId,
+          harness: testHarness,
+          protocol: provider.protocol,
+          providerRevision: revision,
+          requestId,
+        });
+  if (body.reservation !== undefined && !reservation) {
+    return sendTestJson(409, {
+      error: "harness_test_reservation_invalid",
+      message: "the formal test reservation is invalid, expired, or no longer matches the active saved model",
+    });
+  }
+  if (reservation) {
+    testIdentity.reservationFingerprint = customProviderTestReservationFingerprint(reservation);
+  }
   const requestIdHash = customProviderTestReceiptId(requestId);
   const requestFingerprint = customProviderTestRequestFingerprint(testIdentity);
   const auditCorrelation = `requestIdHash=${requestIdHash}`;
@@ -563,6 +630,62 @@ export async function testCustomProvider(ctx: ApiCtx): Promise<void> {
     });
   }
   return sendTestJson(response.status, response.body);
+}
+
+export async function validateCustomProviderTestReservation(ctx: ApiCtx): Promise<void> {
+  const authorized = await actor(ctx);
+  if (!authorized) return;
+  if (!ctx.deps.customProviders) return sendJson(ctx.res, 404, { error: "not_found" });
+  const id = ctx.params.provider;
+  if (!id) return sendJson(ctx.res, 404, { error: "not_found" });
+  if (!ctx.body || typeof ctx.body !== "object" || Array.isArray(ctx.body)) {
+    return sendJson(ctx.res, 400, { error: "bad_request", message: "a JSON object is required" });
+  }
+  const parsed = parseCustomProviderTestReservation((ctx.body as { reservation?: unknown }).reservation);
+  if (!parsed || parsed.providerId !== id) {
+    return sendJson(ctx.res, 409, {
+      error: "harness_test_reservation_invalid",
+      message: "the formal test reservation has an invalid format or Provider",
+    });
+  }
+  const state = await ctx.deps.customProviders.testableHarnessState(
+    id,
+    ctx.deps.customProviderHarnessTestFence ?? (async () => null),
+  );
+  const active = state.active;
+  const model = active ? runtimeModelForCustomProvider(active.provider, parsed.selectionModelId) : null;
+  const reservation =
+    active && model
+      ? verifiedReservation(ctx, parsed, {
+          providerId: id,
+          selectionModelId: parsed.selectionModelId,
+          upstreamModelId: model.id,
+          harness: parsed.harness,
+          protocol: active.provider.protocol,
+          providerRevision: active.revision,
+          requestId: parsed.requestId,
+        })
+      : null;
+  if (!reservation) {
+    return sendJson(ctx.res, 409, {
+      error: "harness_test_reservation_invalid",
+      message: "the formal test reservation is invalid, expired, or no longer matches the active saved model",
+    });
+  }
+  audit(ctx.deps, {
+    principalId: authorized.id,
+    action: "custom-providers.test-reservation",
+    resource: `${id}/${parsed.selectionModelId}/${parsed.harness}`,
+    scopeLabel: orgScope(ctx.deps),
+    status: "validated",
+    detail: `budgetRequestId=${parsed.budgetRequestId} candidateCommit=${parsed.candidateCommit}`,
+  });
+  return sendJson(ctx.res, 200, {
+    ok: true,
+    candidateCommit: parsed.candidateCommit,
+    budgetRequestId: parsed.budgetRequestId,
+    requestId: parsed.requestId,
+  });
 }
 
 export async function publishCustomProvider(ctx: ApiCtx): Promise<void> {

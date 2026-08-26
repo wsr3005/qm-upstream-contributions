@@ -7649,7 +7649,8 @@
             verified?.requestId !== saved.requestId ||
             verified?.createdAt !== saved.createdAt ||
             verified?.expiresAt !== saved.expiresAt ||
-            verified?.retryAt !== saved.retryAt
+            verified?.retryAt !== saved.retryAt ||
+            JSON.stringify(verified?.formalReservation ?? null) !== JSON.stringify(saved.formalReservation ?? null)
           ) {
             throw new Error("request receipt did not round-trip");
           }
@@ -7715,16 +7716,20 @@
           throw new Error("The receipt is not valid JSON.");
         }
         if (
-          receipt?.schemaVersion !== "qm-model-test-browser-receipt-v2" ||
+          receipt?.schemaVersion !== "qm-model-test-browser-receipt-v3" ||
           !/^[a-z0-9][a-z0-9-]{0,79}$/.test(receipt.runAlias || "") ||
           !/^[0-9a-f]{40}$/.test(receipt.candidateCommit || "") ||
           !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(receipt.budgetRequestId || "") ||
           !/^qa-[0-9a-f]{64}$/.test(receipt.requestId || "") ||
+          typeof receipt.orgScope !== "string" ||
+          typeof receipt.providerId !== "string" ||
           !["pi", "opencode", "codex"].includes(receipt.harness) ||
+          !["openai", "openai-responses", "anthropic"].includes(receipt.protocol) ||
+          !Number.isSafeInteger(receipt.providerRevision) ||
           typeof receipt.selectionModelId !== "string" ||
           typeof receipt.upstreamModelId !== "string" ||
           typeof receipt.storageKey !== "string" ||
-          !receipt.value
+          !/^[0-9a-f]{64}$/.test(receipt.signature || "")
         ) {
           throw new Error("The receipt is incomplete or has an unsupported format.");
         }
@@ -7742,6 +7747,9 @@
         );
         const target = customProviderTestTargets[targetIndex];
         if (!target) throw new Error("The receipt does not match a saved model on this page.");
+        if (receipt.orgScope !== orgScope() || receipt.providerId !== target.providerId) {
+          throw new Error("The receipt does not match this organization or saved Provider.");
+        }
         if (receipt.harness === "codex" && target.protocol !== "openai-responses") {
           throw new Error("The receipt Harness is not supported by the saved Provider protocol.");
         }
@@ -7750,19 +7758,33 @@
         }
         const expectedIdentity = customProviderTestIdentity(target, receipt.harness);
         const expectedStorageKey = customProviderTestRetryKey(target, receipt.harness);
-        const value = receipt.value;
+        const value = {
+          identity: expectedIdentity,
+          requestId: receipt.requestId,
+          createdAt: receipt.createdAt,
+          expiresAt: receipt.expiresAt,
+          retryAt: receipt.createdAt,
+          formalReservation: receipt,
+        };
         if (
-          value.identity !== expectedIdentity ||
-          value.requestId !== receipt.requestId ||
+          receipt.protocol !== target.protocol ||
+          receipt.providerRevision !== (target.providerRevision ?? target.providerUpdatedAt) ||
           receipt.storageKey !== expectedStorageKey ||
-          !Number.isFinite(value.createdAt) ||
-          value.createdAt > Date.now() ||
-          !Number.isFinite(value.expiresAt) ||
-          value.expiresAt <= Date.now() ||
-          value.expiresAt - value.createdAt > CUSTOM_PROVIDER_TEST_RETRY_TTL_MS ||
-          value.retryAt !== value.createdAt
+          !Number.isSafeInteger(receipt.createdAt) ||
+          receipt.createdAt > Date.now() ||
+          !Number.isSafeInteger(receipt.expiresAt) ||
+          receipt.expiresAt <= Date.now() ||
+          receipt.expiresAt - receipt.createdAt !== CUSTOM_PROVIDER_TEST_RETRY_TTL_MS
         ) {
           throw new Error("The receipt does not match the selected Harness target or is no longer valid.");
+        }
+        const validated = await api(
+          "POST",
+          "/api/custom-providers/" + encodeURIComponent(target.providerId) + "/harness-test-reservation",
+          { reservation: receipt },
+        );
+        if (!validated.ok) {
+          throw new Error(validated.data?.message || "The receipt was not accepted by the active QM runtime.");
         }
         const existing = readCustomProviderTestRetry(expectedIdentity, target, receipt.harness);
         if (!customProviderTestStorageAvailable) {
@@ -8324,6 +8346,9 @@
                 modelId: target.modelId,
                 harness,
                 requestId,
+                ...(customProviderTestRetry.formalReservation
+                  ? { reservation: customProviderTestRetry.formalReservation }
+                  : {}),
                 ...(target.draft ? { draft: target.draft } : {}),
               },
             );

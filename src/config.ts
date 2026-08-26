@@ -84,6 +84,8 @@ export interface Config {
   signingSecret?: string;
   capabilitySecret?: string;
   portalIdentitySecret?: string;
+  modelTestReservationSecret?: string;
+  modelTestCandidateCommit?: string;
   requireSignedPortalIdentity?: boolean;
   connectorSecretKey?: string;
   secretsBackend: "env" | "aws";
@@ -847,6 +849,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...((env.PORTAL_IDENTITY_SECRET ?? env.CORE_SIGNING_SECRET)
       ? { portalIdentitySecret: env.PORTAL_IDENTITY_SECRET ?? env.CORE_SIGNING_SECRET }
       : {}),
+    ...(env.MODEL_TEST_RESERVATION_SECRET ? { modelTestReservationSecret: env.MODEL_TEST_RESERVATION_SECRET } : {}),
+    ...(env.MODEL_TEST_CANDIDATE_COMMIT ? { modelTestCandidateCommit: env.MODEL_TEST_CANDIDATE_COMMIT } : {}),
     requireSignedPortalIdentity: env.REQUIRE_SIGNED_PORTAL_IDENTITY === "1",
     ...(env.CONNECTOR_SECRET_KEY ? { connectorSecretKey: env.CONNECTOR_SECRET_KEY } : {}),
     secretsBackend: secretsBackendEnvStrict(env.SECRETS_BACKEND, env.SECRETS_PREFIX ?? ""),

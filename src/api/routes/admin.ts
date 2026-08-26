@@ -44,6 +44,7 @@ import {
   publishCustomProvider,
   putCustomProvider,
   testCustomProvider,
+  validateCustomProviderTestReservation,
 } from "./admin/custom-providers.ts";
 import { deleteMcpServer, getMcpServers, putMcpServer } from "./admin/mcp-servers.ts";
 import { listSecurityFlags, releaseSecurityTaint } from "./admin/security.ts";
@@ -83,6 +84,12 @@ const routes: ReadonlyArray<Route<ApiCtx>> = [
     path: "/v1/admin/custom-providers/:provider/harness-test",
     auth: "either",
     handle: testCustomProvider,
+  },
+  {
+    method: "POST",
+    path: "/v1/admin/custom-providers/:provider/harness-test-reservation",
+    auth: "either",
+    handle: validateCustomProviderTestReservation,
   },
   {
     method: "POST",
