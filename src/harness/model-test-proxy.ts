@@ -21,12 +21,45 @@ export interface ModelTestProxyEvidence {
 export interface ModelTestProxyAttempt {
   upstreamRequests: number;
   responseCompleted: boolean;
+  clientDisconnected?: boolean;
+  streamed?: boolean;
+  terminalEventObserved?: boolean;
+  responseModelObserved?: boolean;
+  usageObserved?: boolean;
+  textDeltaObserved?: boolean;
+  unknownEventTypeObserved?: boolean;
+  observedEventTypes?: string[];
   upstreamStatus?: number;
   evidence?: ModelTestProxyEvidence;
 }
 
 export const MODEL_TEST_MAX_OUTPUT_TOKENS = 128;
 const MODEL_TEST_MAX_REQUEST_BYTES = 512 * 1024;
+const OBSERVABLE_EVENT_TYPES = new Set([
+  "content_block_delta",
+  "content_block_start",
+  "content_block_stop",
+  "error",
+  "message_delta",
+  "message_start",
+  "message_stop",
+  "ping",
+  "response.completed",
+  "response.content_part.added",
+  "response.content_part.done",
+  "response.created",
+  "response.failed",
+  "response.in_progress",
+  "response.incomplete",
+  "response.output_item.added",
+  "response.output_item.done",
+  "response.output_text.delta",
+  "response.output_text.done",
+  "response.reasoning_summary_part.added",
+  "response.reasoning_summary_part.done",
+  "response.reasoning_summary_text.delta",
+  "response.reasoning_summary_text.done",
+]);
 
 const UNFORWARDED_HEADERS = new Set([
   "connection",
@@ -343,6 +376,9 @@ function textDelta(payload: Record<string, unknown>): string {
 }
 
 function writeChunk(res: ServerResponse, chunk: Buffer): Promise<void> {
+  if (res.destroyed || res.closed || !res.writable || res.writableEnded) {
+    return Promise.reject(new Error("model test client disconnected"));
+  }
   if (res.write(chunk)) return Promise.resolve();
   return new Promise((resolveWrite, reject) => {
     const cleanup = () => {
@@ -368,7 +404,23 @@ function writeChunk(res: ServerResponse, chunk: Buffer): Promise<void> {
   });
 }
 
-function createResponseObserver(startedAt: number, streamed: boolean, maxOutputTokens: number, anthropic: boolean) {
+interface ResponseObservation {
+  streamed: boolean;
+  terminalEventObserved: boolean;
+  responseModelObserved: boolean;
+  usageObserved: boolean;
+  textDeltaObserved: boolean;
+  unknownEventTypeObserved: boolean;
+  observedEventTypes: string[];
+}
+
+function createResponseObserver(
+  startedAt: number,
+  streamed: boolean,
+  maxOutputTokens: number,
+  anthropic: boolean,
+  report: (observation: ResponseObservation) => void,
+) {
   const decoder = new TextDecoder();
   const chunks: Buffer[] = [];
   const responseModels = new Set<string>();
@@ -378,14 +430,44 @@ function createResponseObserver(startedAt: number, streamed: boolean, maxOutputT
   let firstTokenAt: number | null = null;
   let invalidPayload = false;
   let invalidModel = false;
+  let terminalEventObserved = false;
+  let usageObserved = false;
+  let textDeltaObserved = false;
+  let unknownEventTypeObserved = false;
+  const observedEventTypes = new Set<string>();
+  const publish = () =>
+    report({
+      streamed,
+      terminalEventObserved,
+      responseModelObserved: responseModels.size > 0,
+      usageObserved,
+      textDeltaObserved,
+      unknownEventTypeObserved,
+      observedEventTypes: [...observedEventTypes],
+    });
   const observePayload = (payload: Record<string, unknown>, at: number) => {
+    if (typeof payload.type === "string") {
+      if (OBSERVABLE_EVENT_TYPES.has(payload.type)) observedEventTypes.add(payload.type);
+      else unknownEventTypeObserved = true;
+      terminalEventObserved ||=
+        payload.type === "response.completed" ||
+        payload.type === "response.failed" ||
+        payload.type === "response.incomplete" ||
+        payload.type === "message_stop";
+    }
     const observedModels = modelsFromPayload(payload);
     invalidModel ||= observedModels.invalid;
     for (const model of observedModels.values) responseModels.add(model);
     const observedUsage = usageFromPayload(payload);
+    usageObserved ||= observedUsage.values.length > 0;
     usage.invalid ||= observedUsage.invalid;
     for (const value of observedUsage.values) mergeUsage(usage, value, maxOutputTokens);
-    if (!firstTokenAt && textDelta(payload)) firstTokenAt = at;
+    const delta = textDelta(payload);
+    if (delta) {
+      textDeltaObserved = true;
+      firstTokenAt ??= at;
+    }
+    publish();
   };
   const drainEvents = (at: number, final: boolean) => {
     while (pending) {
@@ -399,7 +481,13 @@ function createResponseObserver(startedAt: number, streamed: boolean, maxOutputT
         .filter((line) => line.startsWith("data:"))
         .map((line) => line.slice(5).trimStart())
         .join("\n");
-      if (!data || data === "[DONE]") continue;
+      if (!data) continue;
+      if (data === "[DONE]") {
+        observedEventTypes.add("[DONE]");
+        terminalEventObserved = true;
+        publish();
+        continue;
+      }
       try {
         const payload = JSON.parse(data) as unknown;
         if (!isRecord(payload)) invalidPayload = true;
@@ -416,6 +504,7 @@ function createResponseObserver(startedAt: number, streamed: boolean, maxOutputT
       chunks.push(chunk);
       if (!streamed) {
         firstTokenAt ??= at;
+        publish();
         return;
       }
       pending += decoder.decode(chunk, { stream: true });
@@ -434,6 +523,7 @@ function createResponseObserver(startedAt: number, streamed: boolean, maxOutputT
           return null;
         }
       }
+      publish();
       const observedUsage = completeUsage(usage, anthropic);
       const responseModel = responseModels.size === 1 ? responseModels.values().next().value : undefined;
       if (invalidPayload || invalidModel || !responseModel || !observedUsage || !firstTokenAt) return null;
@@ -455,11 +545,14 @@ async function forwardResponseBody(
   streamed: boolean,
   maxOutputTokens: number,
   anthropic: boolean,
+  report: (observation: ResponseObservation) => void,
+  disconnected: () => void,
   max = 16 * 1024 * 1024,
 ): Promise<Omit<ModelTestProxyEvidence, "requestedModel" | "upstreamRequests"> | null> {
   if (!response.body) return null;
-  const observer = createResponseObserver(startedAt, streamed, maxOutputTokens, anthropic);
+  const observer = createResponseObserver(startedAt, streamed, maxOutputTokens, anthropic, report);
   const reader = response.body.getReader();
+  let clientWritable = true;
   while (true) {
     const next = await reader.read();
     if (next.done) {
@@ -472,7 +565,14 @@ async function forwardResponseBody(
       await reader.cancel();
       throw error;
     }
-    await writeChunk(res, chunk);
+    if (clientWritable) {
+      try {
+        await writeChunk(res, chunk);
+      } catch {
+        clientWritable = false;
+        disconnected();
+      }
+    }
   }
 }
 
@@ -488,13 +588,28 @@ export async function createModelTestProxy(
   baseUrl: string;
   attempt(): ModelTestProxyAttempt;
   evidence(): ModelTestProxyEvidence;
+  settled(): Promise<void>;
   close(): Promise<void>;
 }> {
   let attempted = false;
   let upstreamRequests = 0;
   let responseCompleted = false;
+  let clientDisconnected = false;
+  let observation: ResponseObservation = {
+    streamed: false,
+    terminalEventObserved: false,
+    responseModelObserved: false,
+    usageObserved: false,
+    textDeltaObserved: false,
+    unknownEventTypeObserved: false,
+    observedEventTypes: [],
+  };
   let upstreamStatus: number | undefined;
   let evidence: ModelTestProxyEvidence | null = null;
+  let resolveSettled!: () => void;
+  const settled = new Promise<void>((resolve) => {
+    resolveSettled = resolve;
+  });
   const server = createServer(async (req, res) => {
     if (attempted) return json(res, 400, { error: { message: "Model connection test permits one upstream request" } });
     attempted = true;
@@ -539,14 +654,22 @@ export async function createModelTestProxy(
         upstream.headers.get("content-type")?.toLowerCase().includes("text/event-stream") ?? false,
         options.maxOutputTokens,
         new URL(req.url ?? "/", "http://127.0.0.1").pathname.endsWith("/messages"),
+        (next) => {
+          observation = next;
+        },
+        () => {
+          clientDisconnected = true;
+        },
       );
       responseCompleted = true;
       evidence = observed ? { ...observed, requestedModel: options.expectedModel, upstreamRequests } : null;
-      res.end();
+      if (!res.destroyed) res.end();
     } catch {
       if (!res.headersSent && !res.destroyed)
         json(res, 400, { error: { message: "Upstream model test request failed" } });
       else res.destroy();
+    } finally {
+      resolveSettled();
     }
   });
   await new Promise<void>((resolveListen, reject) => {
@@ -563,15 +686,27 @@ export async function createModelTestProxy(
     attempt: () => ({
       upstreamRequests,
       responseCompleted,
+      clientDisconnected,
+      streamed: observation.streamed,
+      terminalEventObserved: observation.terminalEventObserved,
+      responseModelObserved: observation.responseModelObserved,
+      usageObserved: observation.usageObserved,
+      textDeltaObserved: observation.textDeltaObserved,
+      unknownEventTypeObserved: observation.unknownEventTypeObserved,
+      observedEventTypes: observation.observedEventTypes,
       ...(upstreamStatus === undefined ? {} : { upstreamStatus }),
       ...(evidence ? { evidence } : {}),
     }),
+    settled: () => settled,
     evidence: () => {
       if (!isValidModelTestProxyEvidence(evidence, options.expectedModel, options.maxOutputTokens)) {
         throw new Error("model test response evidence did not match the requested model");
       }
       return evidence;
     },
-    close: () => closeServer(server),
+    close: async () => {
+      await closeServer(server);
+      resolveSettled();
+    },
   };
 }

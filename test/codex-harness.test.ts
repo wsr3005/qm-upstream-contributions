@@ -159,6 +159,42 @@ rl.on("line", (line) => {
   return path;
 }
 
+function disconnectingProviderCodexBinary(dir: string): string {
+  const path = join(dir, "disconnecting-provider-codex");
+  writeFileSync(
+    path,
+    `#!/usr/bin/env node
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin });
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+let providerBaseUrl;
+rl.on("line", async (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") return send({ id: msg.id, result: {} });
+  if (msg.method === "initialized") return;
+  if (msg.method === "thread/start") {
+    providerBaseUrl = msg.params.config?.model_providers?.gateway?.base_url;
+    return send({ id: msg.id, result: { thread: { id: "thread-disconnect" }, model: "gpt-5.6-luna" } });
+  }
+  if (msg.method === "turn/start") {
+    send({ id: msg.id, result: { turn: { id: "turn-disconnect", status: "inProgress", items: [] } } });
+    const response = await fetch(providerBaseUrl + "/responses", {
+      method: "POST",
+      headers: { authorization: "Bearer " + process.env.QM_CODEX_PROVIDER_KEY, "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.6-luna", stream: true, max_output_tokens: 128 }),
+    });
+    const reader = response.body.getReader();
+    await reader.read();
+    await reader.cancel();
+    return send({ method: "turn/completed", params: { threadId: "thread-disconnect", turn: { id: "turn-disconnect", status: "failed", error: { message: "provider stream failed" }, items: [] } } });
+  }
+});
+`,
+  );
+  chmodSync(path, 0o755);
+  return path;
+}
+
 function hungTurnCodexBinary(dir: string): string {
   const path = join(dir, "hung-turn-codex");
   writeFileSync(
@@ -491,6 +527,84 @@ test("Codex request timeout interrupts a hung turn start after runtime startup",
     },
   );
   assert.ok(Date.now() - startedAt < 1_000);
+});
+
+test("Codex model testing preserves paid evidence after the app-server rejects a stream", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-codex-model-disconnect-"));
+  const upstream = createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(
+        `data: ${JSON.stringify({ type: "response.output_text.delta", delta: "works", response: { model: "gpt-5.6-luna" } })}\n\n`,
+      );
+      setTimeout(
+        () =>
+          res.end(
+            `data: ${JSON.stringify({ type: "response.completed", response: { model: "gpt-5.6-luna", usage: { input_tokens: 11, output_tokens: 2, total_tokens: 13 } } })}\n\n`,
+          ),
+        25,
+      );
+    });
+  });
+  await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  const baseUrl = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
+  const harness = createCodexHarness({ binaryPath: disconnectingProviderCodexBinary(dir), env: process.env });
+  t.after(async () => {
+    await harness.turns.close?.();
+    upstream.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  await assert.rejects(
+    harness.models.testModel!({
+      model: "gateway/gpt-luna",
+      expectedUpstreamModel: "gpt-5.6-luna",
+      maxOutputTokens: 128,
+      systemPrompt: "test",
+      prompt: "ping",
+      requestTimeoutMs: 1_000,
+      customProvider: {
+        apiKey: "sk-disconnect",
+        spec: {
+          id: "gateway",
+          name: "Gateway",
+          protocol: "openai-responses",
+          baseUrl,
+          models: [{ id: "gateway/gpt-luna", upstreamId: "gpt-5.6-luna" }],
+        },
+      },
+    }),
+    (error: Error & { category?: string; attempt?: Record<string, unknown> }) => {
+      assert.equal(error.name, "HarnessModelTestError");
+      assert.equal(error.category, "response_verification_failed");
+      assert.deepEqual(
+        {
+          upstreamRequests: error.attempt?.upstreamRequests,
+          responseCompleted: error.attempt?.responseCompleted,
+          clientDisconnected: error.attempt?.clientDisconnected,
+          terminalEventObserved: error.attempt?.terminalEventObserved,
+          usageObserved: error.attempt?.usageObserved,
+          observedEventTypes: error.attempt?.observedEventTypes,
+        },
+        {
+          upstreamRequests: 1,
+          responseCompleted: true,
+          clientDisconnected: true,
+          terminalEventObserved: true,
+          usageObserved: true,
+          observedEventTypes: ["response.output_text.delta", "response.completed"],
+        },
+      );
+      assert.deepEqual((error.attempt?.evidence as { usage?: unknown })?.usage, {
+        inputTokens: 11,
+        outputTokens: 2,
+        totalTokens: 13,
+        cachedInputTokens: 0,
+        cacheCreationInputTokens: 0,
+      });
+      return true;
+    },
+  );
 });
 
 test("Codex interrupts a late turn start after returning from user cancellation", async (t) => {

@@ -22,7 +22,7 @@ import {
   defineHarness,
   envelopeWithoutMessages,
   HarnessModelTestError,
-  modelTestError,
+  settledModelTestError,
   type Harness,
   type HarnessModelTestInput,
   type HarnessTurnInput,
@@ -1361,7 +1361,7 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
           };
         } catch (error) {
           if (error instanceof HarnessModelTestError) throw error;
-          throw modelTestError(controller.signal, proxy.attempt());
+          throw await settledModelTestError(controller.signal, proxy);
         } finally {
           if (timer) clearTimeout(timer);
           if (runtimeReservation) await releaseReservation(runtimeReservation);

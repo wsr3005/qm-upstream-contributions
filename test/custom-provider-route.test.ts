@@ -48,6 +48,14 @@ test("generation self-test durably exposes safe partial evidence after an upstre
     throw new HarnessModelTestError("provider_request_failed", {
       upstreamRequests: 1,
       responseCompleted: false,
+      clientDisconnected: true,
+      streamed: true,
+      terminalEventObserved: false,
+      responseModelObserved: true,
+      usageObserved: false,
+      textDeltaObserved: true,
+      unknownEventTypeObserved: true,
+      observedEventTypes: ["response.created", "response.output_text.delta"],
       upstreamStatus: 401,
     });
   });
@@ -74,6 +82,15 @@ test("generation self-test durably exposes safe partial evidence after an upstre
         message: "opencode could not complete the saved model request",
         failureCategory: "provider_request_failed",
         upstreamRequests: 1,
+        responseCompleted: false,
+        clientDisconnected: true,
+        streamed: true,
+        terminalEventObserved: false,
+        responseModelObserved: true,
+        usageObserved: false,
+        textDeltaObserved: true,
+        unknownEventTypeObserved: true,
+        observedEventTypes: ["response.created", "response.output_text.delta"],
         upstreamStatus: 401,
         requestId: "partial-evidence",
         providerRevision: 1,
@@ -90,6 +107,7 @@ test("generation self-test durably exposes safe partial evidence after an upstre
     assert.equal(replayed.failureCategory, "provider_request_failed");
     assert.equal(replayed.upstreamRequests, 1);
     assert.equal(replayed.upstreamStatus, 401);
+    assert.deepEqual(replayed.observedEventTypes, ["response.created", "response.output_text.delta"]);
   } finally {
     await srv.close();
   }

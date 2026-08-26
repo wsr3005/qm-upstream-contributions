@@ -574,7 +574,7 @@ export async function testCustomProvider(ctx: ApiCtx): Promise<void> {
   } catch (error) {
     const failureMetrics =
       error instanceof HarnessModelTestError
-        ? ` failureCategory=${error.category} upstreamRequests=${error.attempt.upstreamRequests} upstreamStatus=${error.attempt.upstreamStatus ?? "unknown"} usageAvailable=${Boolean(error.attempt.evidence?.usage)}`
+        ? ` failureCategory=${error.category} upstreamRequests=${error.attempt.upstreamRequests} upstreamStatus=${error.attempt.upstreamStatus ?? "unknown"} responseCompleted=${error.attempt.responseCompleted} clientDisconnected=${error.attempt.clientDisconnected ?? false} streamed=${error.attempt.streamed ?? false} terminalEventObserved=${error.attempt.terminalEventObserved ?? false} responseModelObserved=${error.attempt.responseModelObserved ?? false} usageObserved=${error.attempt.usageObserved ?? false} textDeltaObserved=${error.attempt.textDeltaObserved ?? false} unknownEventTypeObserved=${error.attempt.unknownEventTypeObserved ?? false} observedEventTypes=${error.attempt.observedEventTypes?.join(",") || "none"} usageAvailable=${Boolean(error.attempt.evidence?.usage)}`
         : "";
     const audited = await recordResult("failed", undefined, failureMetrics);
     if (!audited) {
@@ -608,6 +608,15 @@ export async function testCustomProvider(ctx: ApiCtx): Promise<void> {
             ? {
                 failureCategory: error.category,
                 upstreamRequests: error.attempt.upstreamRequests,
+                responseCompleted: error.attempt.responseCompleted,
+                clientDisconnected: error.attempt.clientDisconnected ?? false,
+                streamed: error.attempt.streamed ?? false,
+                terminalEventObserved: error.attempt.terminalEventObserved ?? false,
+                responseModelObserved: error.attempt.responseModelObserved ?? false,
+                usageObserved: error.attempt.usageObserved ?? false,
+                textDeltaObserved: error.attempt.textDeltaObserved ?? false,
+                unknownEventTypeObserved: error.attempt.unknownEventTypeObserved ?? false,
+                observedEventTypes: error.attempt.observedEventTypes ?? [],
                 ...(error.attempt.upstreamStatus === undefined ? {} : { upstreamStatus: error.attempt.upstreamStatus }),
                 ...(error.attempt.evidence ? { usage: error.attempt.evidence.usage } : {}),
               }

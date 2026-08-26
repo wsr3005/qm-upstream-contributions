@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, request, type IncomingMessage, type ServerResponse } from "node:http";
 import { test } from "node:test";
 import { createModelTestProxy, type ModelTestProxyEvidence } from "../src/harness/model-test-proxy.ts";
 import { modelTestError } from "../src/harness/harness.ts";
@@ -127,6 +127,111 @@ test("model test proxy caps and verifies one streaming Chat Completions request"
   }
 });
 
+test("model test proxy drains paid usage after its harness client disconnects", async () => {
+  const server = await upstream(async (req, res) => {
+    await body(req);
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write(
+      `data: ${JSON.stringify({ type: "response.output_text.delta", delta: "works", response: { model: "gpt-5.6-luna" } })}\n\n`,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    res.end(
+      `data: ${JSON.stringify({ type: "response.completed", response: { model: "gpt-5.6-luna", usage: { input_tokens: 11, output_tokens: 2, total_tokens: 13 } } })}\n\n`,
+    );
+  });
+  const proxy = await createModelTestProxy(server.baseUrl, {
+    expectedModel: "gpt-5.6-luna",
+    maxOutputTokens: 128,
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const client = request(
+        `${proxy.baseUrl}/responses`,
+        { method: "POST", headers: { "content-type": "application/json" } },
+        (response) => {
+          response.once("data", () => {
+            response.destroy();
+            resolve();
+          });
+        },
+      );
+      client.once("error", reject);
+      client.end(JSON.stringify({ model: "gpt-5.6-luna", stream: true, max_output_tokens: 128 }));
+    });
+    await proxy.settled();
+    assert.deepEqual(proxy.attempt(), {
+      upstreamRequests: 1,
+      responseCompleted: true,
+      clientDisconnected: true,
+      streamed: true,
+      terminalEventObserved: true,
+      responseModelObserved: true,
+      usageObserved: true,
+      textDeltaObserved: true,
+      unknownEventTypeObserved: false,
+      observedEventTypes: ["response.output_text.delta", "response.completed"],
+      upstreamStatus: 200,
+      evidence: proxy.evidence(),
+    });
+    assert.equal(proxy.evidence().usage.totalTokens, 13);
+  } finally {
+    await proxy.close();
+    await server.close();
+  }
+});
+
+test("model test proxy records only fixed event categories from an untrusted provider", async () => {
+  const events: Record<string, unknown>[] = Array.from({ length: 1_000 }, (_, index) => ({
+    type: `untrusted_${index}`,
+  }));
+  events.push(
+    { type: "response.output_text.delta", delta: "works", response: { model: "gpt-5.6-luna" } },
+    {
+      type: "response.completed",
+      response: {
+        model: "gpt-5.6-luna",
+        usage: { input_tokens: 11, output_tokens: 2, total_tokens: 13 },
+      },
+    },
+  );
+  const server = await upstream(async (req, res) => {
+    await body(req);
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""));
+  });
+  const proxy = await createModelTestProxy(server.baseUrl, {
+    expectedModel: "gpt-5.6-luna",
+    maxOutputTokens: 128,
+  });
+  try {
+    const response = await fetch(`${proxy.baseUrl}/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.6-luna", stream: true, max_output_tokens: 128 }),
+    });
+    await response.arrayBuffer();
+    assert.equal(proxy.attempt().unknownEventTypeObserved, true);
+    assert.deepEqual(proxy.attempt().observedEventTypes, ["response.output_text.delta", "response.completed"]);
+  } finally {
+    await proxy.close();
+    await server.close();
+  }
+});
+
+test("model test proxy settles when closed before receiving a request", async () => {
+  const server = await upstream(async (_req, res) => {
+    res.end();
+  });
+  const proxy = await createModelTestProxy(server.baseUrl, {
+    expectedModel: "gpt-5.6-luna",
+    maxOutputTokens: 128,
+  });
+  const settled = proxy.settled();
+  await proxy.close();
+  await settled;
+  await server.close();
+});
+
 test("model test proxy rejects unverifiable response models without a retry", async () => {
   let calls = 0;
   let received: Record<string, unknown> = {};
@@ -195,6 +300,8 @@ test("model test proxy merges Anthropic streaming usage", async () => {
     });
     assert.equal(received.max_tokens, 128);
     assert.equal("tools" in received, false);
+    assert.equal(proxy.attempt().unknownEventTypeObserved, false);
+    assert.deepEqual(proxy.attempt().observedEventTypes, ["message_start", "content_block_delta", "message_delta"]);
   } finally {
     await proxy.close();
     await server.close();

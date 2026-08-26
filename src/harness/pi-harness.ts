@@ -62,7 +62,7 @@ import {
   defineHarness,
   envelopeWithoutMessages,
   HarnessModelTestError,
-  modelTestError,
+  settledModelTestError,
   type Harness,
   type HarnessCompactInput,
   type HarnessDetectInput,
@@ -2219,7 +2219,7 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
           };
         } catch (error) {
           if (!proxy || error instanceof HarnessModelTestError) throw error;
-          throw modelTestError(controller.signal, proxy.attempt());
+          throw await settledModelTestError(controller.signal, proxy);
         } finally {
           clearTimeout(timer);
           await proxy?.close();

@@ -212,6 +212,14 @@ export function modelTestError(signal: AbortSignal, attempt: ModelTestProxyAttem
   return new HarnessModelTestError(category, attempt);
 }
 
+export async function settledModelTestError(
+  signal: AbortSignal,
+  proxy: { attempt(): ModelTestProxyAttempt; settled(): Promise<void> },
+): Promise<HarnessModelTestError> {
+  if (proxy.attempt().upstreamRequests > 0) await proxy.settled();
+  return modelTestError(signal, proxy.attempt());
+}
+
 export interface HarnessModelTestResult {
   reply?: string;
   maxOutputTokens?: number;
