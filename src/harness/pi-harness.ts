@@ -409,24 +409,36 @@ export function sanitizeTitle(out: string | undefined): string | undefined {
       .replace(/(?<!\*)\*{3}(?!\*)([^*\n]+?)(?<!\*)\*{3}(?!\*)/g, "$1")
       .replace(/(?<!\*)\*{2}(?!\*)([^*\n]+?)(?<!\*)\*{2}(?!\*)/g, "$1")
       .replace(/(?<!\*)\*(?!\*)([^*\n]+?)(?<!\*)\*(?!\*)/g, "$1")
-      .replace(/(?<!_)_{3}(?!_)([^_\n]+?)(?<!_)_{3}(?!_)/g, "$1")
-      .replace(/(?<!_)_{2}(?!_)([^_\n]+?)(?<!_)_{2}(?!_)/g, "$1")
-      .replace(/(?<!_)_(?!_)([^_\n]+?)(?<!_)_(?!_)/g, "$1")
+      .replace(/(^|[\s\p{P}\p{S}])_{3}(?!_)([^_\n]+?)(?<!_)_{3}(?!_)/gu, "$1$2")
+      .replace(/(^|[\s\p{P}\p{S}])_{2}(?!_)([^_\n]+?)(?<!_)_{2}(?!_)/gu, "$1$2")
+      .replace(/(^|[\s\p{P}\p{S}])_(?!_)([^_\n]+?)(?<!_)_(?!_)/gu, "$1$2")
       .replace(/(?<!~)~~(?!~)([^~\n]+?)(?<!~)~~(?!~)/g, "$1")
       .replace(/(?<!`)`{1,3}(?!`)([^`\n]+?)(?<!`)`{1,3}(?!`)/g, "$1");
     if (next === replyView) break;
     replyView = next;
   }
+  if (/^[*_~`]/.test(t)) {
+    replyView = replyView.replace(/^[*_~`]+/, "").replace(/[*_~`]+(?=$|[\s\p{P}\p{S}])/gu, "");
+  }
   replyView = replyView.replace(/\s+/g, " ").trim();
   const firstPersonReply =
-    /^(?:i['’]\w+\b|i(?:\s|[\p{P}\p{S}])+(?:can(?:not|['’]t)|cannot|will|would|must|need|am|have|apologize|refuse|decline|don['’]t|do not|understand|should|was|already|appreciate|could|value\b|loop through\b))/iu;
+    /^(?:i['’]\w+\b|i\s+\S|i[\p{P}\p{S}]+(?:can(?:not|['’]t)|cannot|will|would|must|need|am|have|apologize|refuse|decline|don['’]t|do not|understand|should|was|already|appreciate|could))/iu;
   const conversationalReply = /^(?:sorry|unfortunately|sure|okay|ok|here['’]?s|as an ai)\b/i;
   const technicalDunderOk =
     /^__ok__\s+\S/.test(t) &&
     !/^ok\b(?:\s|[\p{P}\p{S}])+(?:i\b|sorry|here['’]?s|unfortunately|sure|let me|we can|cannot|can['’]t)/iu.test(
       replyView,
     );
-  if ((firstPersonReply.test(replyView) || conversationalReply.test(replyView)) && !technicalDunderOk) return undefined;
+  const technicalDunderI =
+    /^__i__\s+(?:variable|iterator|counter|argument|attribute|key|local|identifier|index|field|property|parameter|symbol|type)\b/.test(
+      t,
+    );
+  if (
+    (firstPersonReply.test(replyView) || conversationalReply.test(replyView)) &&
+    !technicalDunderOk &&
+    !technicalDunderI
+  )
+    return undefined;
   return t.length > MAX_TITLE_CHARS ? `${t.slice(0, MAX_TITLE_CHARS).trimEnd()}…` : t;
 }
 
