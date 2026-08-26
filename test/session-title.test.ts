@@ -147,6 +147,14 @@ test("sanitizeTitle rejects reply-shaped output instead of truncating it into a 
   assert.equal(sanitizeTitle("Preserve foo__bar identifier"), "Preserve foo__bar identifier");
   assert.equal(sanitizeTitle("Match **/*.ts files"), "Match **/*.ts files");
   assert.equal(sanitizeTitle("Use **kwargs safely"), "Use **kwargs safely");
+  assert.equal(sanitizeTitle("**Sorry**, I cannot help with that"), undefined);
+  assert.equal(sanitizeTitle("**Sorry**: I cannot help"), undefined);
+  assert.equal(sanitizeTitle("***Sorry*** I cannot help"), undefined);
+  assert.equal(sanitizeTitle("***Sorry***, I cannot help"), undefined);
+  assert.equal(sanitizeTitle("__Sorry__ I cannot help"), undefined);
+  assert.equal(sanitizeTitle("__Sorry__, I cannot help"), undefined);
+  assert.equal(sanitizeTitle("## **Sorry**, I cannot help ##"), undefined);
+  assert.equal(sanitizeTitle("**Fix** **Harness**"), undefined);
   assert.equal(sanitizeTitle('"__NONE__"'), undefined);
   assert.equal(sanitizeTitle("*****"), undefined);
   assert.equal(sanitizeTitle("_____"), undefined);

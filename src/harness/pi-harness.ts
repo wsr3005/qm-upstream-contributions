@@ -389,8 +389,8 @@ export function sanitizeTitle(out: string | undefined): string | undefined {
   for (let i = 0; i < 4; i++) {
     const before = t;
     t = t.replace(/^["'“”‘’`]+|["'“”‘’`]+$/g, "").trim();
-    t = t.replace(/^\*\*(.+)\*\*$/, "$1").trim();
-    t = t.replace(/^__(.+)__$/, "$1").trim();
+    t = t.replace(/^\*\*([^*]+)\*\*$/, "$1").trim();
+    t = t.replace(/^__([^_]+)__$/, "$1").trim();
     t = t.replace(/^#{1,6}\s+(.+?)(?:\s+#+)?$/, "$1").trim();
     t = t.replace(/^(?:title|chat title)\s*[:-]\s*/i, "");
     if (t === before) break;
@@ -402,8 +402,9 @@ export function sanitizeTitle(out: string | undefined): string | undefined {
   if (/^(\*{1,3}|_{1,3}|~{2}|`{1,3}).+\1$/.test(t)) return undefined;
   // Reject reply-shaped output — the model answered the transcript instead of titling it.
   if (t.length > 90 || t.split(/\s+/).length > 12) return undefined;
-  if (/^\*\*[^*]+\*\*\s+\S/.test(t)) return undefined;
-  if (/^(?:i|i['’]\w+|sorry|unfortunately|sure|okay|ok|here['’]?s|as an ai)\b/i.test(t)) return undefined;
+  if (/(^|\s)\*{2,3}[^*\n]+\*{2,3}(?=$|[\s,.:;!?])/.test(t)) return undefined;
+  const replyView = t.replace(/^(\*{1,3}|_{2,3})(.+?)\1(?=[\s,:;.!?-]|$)/, "$2");
+  if (/^(?:i|i['’]\w+|sorry|unfortunately|sure|okay|ok|here['’]?s|as an ai)\b/i.test(replyView)) return undefined;
   return t.length > MAX_TITLE_CHARS ? `${t.slice(0, MAX_TITLE_CHARS).trimEnd()}…` : t;
 }
 
