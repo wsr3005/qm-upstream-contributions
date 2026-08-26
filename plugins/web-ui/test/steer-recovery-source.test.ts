@@ -39,7 +39,7 @@ test("a message typed mid-turn is never dropped by the run-slot window — it qu
   assert.match(body, /if \(!text \|\| !threadRef\) return;/);
   assert.match(
     body,
-    /if \(!\(await enqueueTurn\(agent, threadRef, text\)\)\) composerState\.draft = text;/,
+    /if \(!\(await enqueueTurn\(agent, threadRef, text, turnOptions\)\)\) composerState\.draft = text;/,
     "a queue core never took goes back in the composer",
   );
   assert.ok(composer.indexOf("function steerWhenLive") < 0, "the held-steer shim is gone with its window");

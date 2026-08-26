@@ -29,6 +29,7 @@ import {
   type PendingApproval,
   type QueuedRun,
   type RuntimeConfig,
+  type TurnOptions,
 } from "./core-bridge";
 import { errMessage, swallow } from "../../chassis/src/errors";
 import { icon } from "./ui";
@@ -54,6 +55,11 @@ import { bumpSessionActivity, dropPendingSession, renderList } from "./sessions"
 import { appState } from "./shell";
 import { base64ToText, bytesToBase64, insertIntoDraft, pasteChipLabel } from "./paste-text";
 import { clearDraft, newChatDraftKey, saveDraft } from "./drafts";
+import {
+  assertProductReservationTarget,
+  parseProductReservation,
+  type ProductReservation,
+} from "./product-reservation";
 
 export type ComposerMenu = "effort" | "harness" | "model" | "settings";
 
@@ -247,6 +253,11 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
     effortLevel: loadStoredEffort(defaultEffortForModel(modelOptionFor(defaultModelValue()).model)),
     fastMode: loadStoredFastMode(),
     pasteView: null as { id: string; text: string; initial: string; dirty: boolean } | null,
+    productReservationInput: "",
+    productReservation: null as ProductReservation | null,
+    productReservationInFlight: null as ProductReservation | null,
+    productReservationError: "",
+    productReservationStatus: "",
   };
 
   const pastedTextIds = new Set<string>();
@@ -280,7 +291,7 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
     return composerState.fastMode ?? orgFastModeDefault;
   }
 
-  function resetComposer(): void {
+  function resetComposerContent(): void {
     composerState.draft = "";
     composerState.attachments = [];
     composerState.pasteView = null;
@@ -292,6 +303,15 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
     composerState.slashDismissed = false;
   }
 
+  function resetComposer(): void {
+    resetComposerContent();
+    composerState.productReservationInput = "";
+    composerState.productReservation = null;
+    composerState.productReservationInFlight = null;
+    composerState.productReservationError = "";
+    composerState.productReservationStatus = "";
+  }
+
   function scopeKey(): string | null {
     return runtimeScopeKey(ctx.chat.state.scopeId);
   }
@@ -299,6 +319,87 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
   function currentModelOption(): ModelOption {
     const picked = ctx.chat.state.threadRef ? threadModelPicks.get(ctx.chat.state.threadRef) : undefined;
     return modelOptionFor(picked ?? defaultModelValue(scopeKey()), scopeKey());
+  }
+
+  function productReservationTarget(): { harness: string; model: string } {
+    const selected = currentModelOption();
+    return { harness: selected.harnessId, model: selected.model.id };
+  }
+
+  function productReservationTargetError(): string {
+    if (!composerState.productReservation) return "";
+    try {
+      assertProductReservationTarget(composerState.productReservation, productReservationTarget());
+      return "";
+    } catch (error) {
+      return errMessage(error, "Reservation does not match the composer.");
+    }
+  }
+
+  function formalTurnOptions(): Partial<TurnOptions> {
+    const reservation = composerState.productReservationInFlight;
+    if (!reservation) return {};
+    return {
+      idempotencyKey: reservation.idempotencyKey,
+      modelProviderId: reservation.modelProviderId,
+      modelProviderRevision: reservation.modelProviderRevision,
+      reservationAccepted: () => {
+        if (composerState.productReservation !== reservation) return;
+        composerState.productReservation = null;
+        composerState.productReservationInFlight = null;
+        composerState.productReservationInput = "";
+        composerState.productReservationError = "";
+        composerState.productReservationStatus = `Consumed ${reservation.requestId}`;
+        composerState.openMenu = null;
+        ctx.chat.drawActiveChat();
+      },
+      reservationRejected: () => {
+        if (composerState.productReservationInFlight !== reservation) return;
+        composerState.productReservationInFlight = null;
+        composerState.productReservationStatus = "Ready for retry";
+        ctx.chat.drawActiveChat();
+      },
+    };
+  }
+
+  function acquireProductReservation(): boolean {
+    if (composerState.productReservationInFlight) return false;
+    const reservation = composerState.productReservation;
+    if (!reservation) return true;
+    const targetError = productReservationTargetError();
+    if (targetError) {
+      composerState.productReservationError = targetError;
+      return false;
+    }
+    composerState.productReservationInFlight = reservation;
+    composerState.productReservationError = "";
+    composerState.productReservationStatus = "Submitting one turn";
+    return true;
+  }
+
+  function importProductReservation(agent: Agent): void {
+    try {
+      const reservation = parseProductReservation(composerState.productReservationInput);
+      assertProductReservationTarget(reservation, productReservationTarget());
+      composerState.productReservation = reservation;
+      composerState.productReservationInFlight = null;
+      composerState.productReservationError = "";
+      composerState.productReservationStatus = "Ready for one turn";
+    } catch (error) {
+      composerState.productReservation = null;
+      composerState.productReservationError = errMessage(error, "Could not import reservation.");
+      composerState.productReservationStatus = "";
+    }
+    ctx.chat.drawActiveChat(agent);
+  }
+
+  function clearProductReservation(agent: Agent): void {
+    composerState.productReservationInput = "";
+    composerState.productReservation = null;
+    composerState.productReservationInFlight = null;
+    composerState.productReservationError = "";
+    composerState.productReservationStatus = "";
+    ctx.chat.drawActiveChat(agent);
   }
 
   async function refreshRuntimeSelection(scopeId: string | null, agent?: Agent): Promise<void> {
@@ -390,6 +491,7 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
         composerState.effortLevel !== effectiveEffort ||
         fastOn !== effectiveFast);
     const inputBlocked = runtimePending || ctx.chat.state.resolvingApprovals.size > 0 || approvalPauses.length > 0;
+    const reservationError = productReservationTargetError();
     const attachingDisabled = inputBlocked;
     let placeholder = "Ask anything";
     if (inputBlocked) placeholder = runtimePending ? "Loading runtime…" : "Approve or deny to continue";
@@ -406,6 +508,8 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
             </button>
           </div>`
         : html`<div class="composer-note">Loading runtime settings…</div>`;
+    } else if (reservationError) {
+      composerNotice = html`<div class="composer-error">${reservationError}</div>`;
     } else if (composerState.error) {
       composerNotice = html`<div class="composer-error">${composerState.error}</div>`;
     }
@@ -471,6 +575,7 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
               `
             : nothing
         }
+        ${productReservationControl(agent, inputBlocked || Boolean(composerState.productReservationInFlight))}
         ${queuedStrip(agent)}
         ${
           approvalPauses.length
@@ -921,6 +1026,90 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
     `;
   }
 
+  function productReservationControl(agent: Agent, disabled: boolean): TemplateResult {
+    const reservation = composerState.productReservation;
+    const targetError = productReservationTargetError();
+    return html`
+      <details class="product-reservation-panel">
+        <summary>
+          Formal acceptance reservation ${reservation ? html`<span>Ready · ${reservation.requestId}</span>` : nothing}
+        </summary>
+        <div class="product-reservation">
+          <textarea
+            aria-label="Product reservation JSON"
+            placeholder="Paste reserve-product JSON"
+            ?disabled=${disabled}
+            .value=${live(composerState.productReservationInput)}
+            @input=${(event: InputEvent) => {
+              composerState.productReservationInput = (event.currentTarget as HTMLTextAreaElement).value;
+              composerState.productReservation = null;
+              composerState.productReservationError = "";
+              composerState.productReservationStatus = "";
+              ctx.chat.drawActiveChat(agent);
+            }}
+          ></textarea>
+          <div class="product-reservation-actions">
+            <button
+              class="settings-chip"
+              type="button"
+              ?disabled=${disabled || !composerState.productReservationInput.trim()}
+              @click=${() => importProductReservation(agent)}
+            >
+              Import reservation
+            </button>
+            <button
+              class="settings-chip"
+              type="button"
+              ?disabled=${disabled || (!composerState.productReservationInput && !reservation)}
+              @click=${() => clearProductReservation(agent)}
+            >
+              Clear
+            </button>
+          </div>
+          ${
+            composerState.productReservationError
+              ? html`<div class="product-reservation-error">${composerState.productReservationError}</div>`
+              : nothing
+          }
+          ${targetError ? html`<div class="product-reservation-error">${targetError}</div>` : nothing}
+          ${
+            composerState.productReservationStatus
+              ? html`<div class="product-reservation-status">${composerState.productReservationStatus}</div>`
+              : nothing
+          }
+          ${
+            reservation
+              ? html`<dl class="product-reservation-readback">
+                  <dt>Schema</dt>
+                  <dd>${reservation.schemaVersion}</dd>
+                  <dt>Run</dt>
+                  <dd>${reservation.runAlias}</dd>
+                  <dt>Candidate</dt>
+                  <dd>${reservation.candidateCommit}</dd>
+                  <dt>Request</dt>
+                  <dd>${reservation.requestId}</dd>
+                  <dt>Harness</dt>
+                  <dd>${reservation.harness}</dd>
+                  <dt>Model</dt>
+                  <dd>${reservation.model}</dd>
+                  <dt>Upstream</dt>
+                  <dd>${reservation.upstreamModelId}</dd>
+                  <dt>Provider</dt>
+                  <dd>${reservation.modelProviderId}</dd>
+                  <dt>Revision</dt>
+                  <dd>${reservation.modelProviderRevision}</dd>
+                  <dt>Idempotency</dt>
+                  <dd>${reservation.idempotencyKey}</dd>
+                  <dt>Principal</dt>
+                  <dd>${reservation.principalCorrelation}</dd>
+                </dl>`
+              : nothing
+          }
+        </div>
+      </details>
+    `;
+  }
+
   function menuControl(args: {
     kind: ComposerMenu;
     glyph?: IconNode;
@@ -1173,6 +1362,8 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
       Boolean(composerState.draft.trim() || composerState.attachments.length) &&
       !composerState.processingFiles &&
       activeRuntimeConfig !== null &&
+      !productReservationTargetError() &&
+      !composerState.productReservationInFlight &&
       ctx.chat.state.resolvingApprovals.size === 0 &&
       !ctx.chat.hasUnresolvedApproval()
     );
@@ -1181,7 +1372,7 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
   function syncComposerControls(agent: Agent): void {
     if (!ctx.chat.state.host || agent !== ctx.chat.state.agent) return;
     const send = ctx.chat.state.host.querySelector<HTMLButtonElement>(".send-btn");
-    if (send) send.disabled = agent.state.isStreaming ? !composerState.draft.trim() : !composerCanSend();
+    if (send) send.disabled = !composerCanSend() || (agent.state.isStreaming && !composerState.draft.trim());
   }
 
   function clearComposerDom(agent: Agent): void {
@@ -1243,18 +1434,25 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
     const threadRef = ctx.chat.state.threadRef;
     const text = composerState.draft.trim();
     if (!text || !threadRef) return;
+    if (!acquireProductReservation()) return ctx.chat.drawActiveChat(agent);
+    const turnOptions = ctx.chat.currentTurnOptions();
     clearActiveDraft();
     composerState.draft = "";
     composerState.error = "";
     ctx.chat.drawActiveChat(agent);
     clearComposerDom(agent);
-    if (!(await enqueueTurn(agent, threadRef, text))) composerState.draft = text;
+    if (!(await enqueueTurn(agent, threadRef, text, turnOptions))) composerState.draft = text;
     ctx.chat.drawActiveChat(agent);
   }
 
-  async function enqueueTurn(agent: Agent, threadRef: string, text: string): Promise<boolean> {
+  async function enqueueTurn(
+    agent: Agent,
+    threadRef: string,
+    text: string,
+    turnOptions: TurnOptions = ctx.chat.currentTurnOptions(),
+  ): Promise<boolean> {
     try {
-      const queued = await queueTurn(threadRef, text, agent, ctx.chat.currentTurnOptions);
+      const queued = await queueTurn(threadRef, text, agent, () => turnOptions);
       setQueuedRuns(threadRef, [...queuedRunsFor(threadRef), queued]);
       bumpSessionActivity(threadRef);
       return true;
@@ -1374,9 +1572,13 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
     if (composerState.pasteView) closePasteView(agent);
     if (ctx.chat.state.resolvingApprovals.size > 0) return;
     if (ctx.chat.hasUnresolvedApproval()) return;
+    if (!composerCanSend()) return;
     if (agent.state.isStreaming) return queueDraft(agent);
     const text = composerState.draft.trim();
     if (!text && composerState.attachments.length === 0) return;
+    if (!acquireProductReservation()) return ctx.chat.drawActiveChat(agent);
+    const turnOptions = ctx.chat.currentTurnOptions();
+    ctx.chat.stageTurnOptions(agent, turnOptions);
     if (ctx.chat.state.threadRef) {
       bumpSessionActivity(ctx.chat.state.threadRef);
       ctx.chat.state.pendingSend = ctx.chat.state.threadRef;
@@ -1385,7 +1587,7 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
     const attachments = composerState.attachments;
     ctx.chat.notePendingSessionOnSend();
     clearActiveDraft();
-    resetComposer();
+    resetComposerContent();
     ctx.chat.drawActiveChat(agent);
     clearComposerDom(agent);
     try {
@@ -1395,6 +1597,7 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
         await agent.prompt(text);
       }
     } catch (err) {
+      turnOptions.reservationRejected?.();
       ctx.chat.state.pendingSend = null;
       if (ctx.chat.state.threadRef && ctx.chat.state.sessionId === null) dropPendingSession(ctx.chat.state.threadRef);
       renderList();
@@ -1663,6 +1866,7 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
     focusComposerEnd,
     resizeComposer,
     currentModelOption,
+    formalTurnOptions,
     carryModelPick,
     refreshRuntimeSelection,
     onDragEnter,
