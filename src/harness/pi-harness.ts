@@ -61,6 +61,8 @@ import {
 import {
   defineHarness,
   envelopeWithoutMessages,
+  HarnessModelTestError,
+  modelTestError,
   type Harness,
   type HarnessCompactInput,
   type HarnessDetectInput,
@@ -2179,13 +2181,15 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
       },
 
       async testModel(input) {
+        const controller = new AbortController();
         const proxy = input.customProvider
           ? await createModelTestProxy(input.customProvider.spec.baseUrl, {
-              ...(input.signal ? { signal: input.signal } : {}),
+              signal: controller.signal,
               expectedModel: input.expectedUpstreamModel,
               maxOutputTokens: input.maxOutputTokens,
             })
           : null;
+        const timer = setTimeout(() => controller.abort(), input.requestTimeoutMs);
         try {
           const customProvider =
             input.customProvider && proxy
@@ -2204,7 +2208,7 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
           if (!keyForModel(providerRuntime.keys, resolved)) return {};
           const model = { ...resolved, maxTokens: Math.min(resolved.maxTokens, input.maxOutputTokens) };
           const reply = await oneShot("pi-model-test", model, providerRuntime.keys, input.systemPrompt, input.prompt, {
-            ...(input.signal ? { signal: input.signal } : {}),
+            signal: controller.signal,
             disableRetries: true,
             customProviders: providerRuntime.customProviders,
           });
@@ -2213,7 +2217,11 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
             maxOutputTokens: model.maxTokens,
             ...(proxy ? { evidence: proxy.evidence() } : {}),
           };
+        } catch (error) {
+          if (!proxy || error instanceof HarnessModelTestError) throw error;
+          throw modelTestError(controller.signal, proxy.attempt());
         } finally {
+          clearTimeout(timer);
           await proxy?.close();
         }
       },

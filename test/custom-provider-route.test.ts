@@ -12,6 +12,7 @@ import { buildApp, type BuiltApp } from "../src/wiring.ts";
 import { testConfig } from "./support/test-config.ts";
 import { resolveModel } from "../src/model/pi-models.ts";
 import { setCustomProviders } from "../src/model/custom-providers.ts";
+import { HarnessModelTestError } from "../src/harness/harness.ts";
 import {
   CUSTOM_PROVIDER_TEST_RESERVATION_SCHEMA,
   CUSTOM_PROVIDER_TEST_RESERVATION_TTL_MS,
@@ -41,6 +42,52 @@ function modelTestEvidence(model: string) {
 }
 
 afterEach(() => setCustomProviders([], []));
+
+test("generation self-test durably exposes safe partial evidence after an upstream failure", async () => {
+  const srv = start(undefined, undefined, async () => {
+    throw new HarnessModelTestError("provider_request_failed", { upstreamRequests: 1, responseCompleted: false });
+  });
+  try {
+    const put = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify({ ...BODY, validate: false }),
+    });
+    assert.equal(put.status, 200);
+    const body = JSON.stringify({ modelId: "acme-large", harness: "opencode", requestId: "partial-evidence" });
+    const first = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/harness-test`, {
+      method: "POST",
+      headers: ADMIN,
+      body,
+    });
+    assert.equal(first.status, 502);
+    const firstResult = (await first.json()) as Record<string, unknown>;
+    assert.ok(Number.isFinite(firstResult.testedAt));
+    assert.deepEqual(
+      { ...firstResult, testedAt: 0 },
+      {
+        error: "provider_test_failed",
+        message: "opencode could not complete the saved model request",
+        failureCategory: "provider_request_failed",
+        upstreamRequests: 1,
+        requestId: "partial-evidence",
+        providerRevision: 1,
+        testedAt: 0,
+      },
+    );
+    const replay = await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway/harness-test`, {
+      method: "POST",
+      headers: ADMIN,
+      body,
+    });
+    assert.equal(replay.status, 502);
+    const replayed = (await replay.json()) as Record<string, unknown>;
+    assert.equal(replayed.failureCategory, "provider_request_failed");
+    assert.equal(replayed.upstreamRequests, 1);
+  } finally {
+    await srv.close();
+  }
+});
 
 function start(
   modelCredentialFetch: typeof fetch = async () => new Response(null, { status: 200 }),

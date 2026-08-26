@@ -18,6 +18,12 @@ export interface ModelTestProxyEvidence {
   upstreamRequests: number;
 }
 
+export interface ModelTestProxyAttempt {
+  upstreamRequests: number;
+  responseCompleted: boolean;
+  evidence?: ModelTestProxyEvidence;
+}
+
 export const MODEL_TEST_MAX_OUTPUT_TOKENS = 128;
 const MODEL_TEST_MAX_REQUEST_BYTES = 512 * 1024;
 
@@ -477,9 +483,15 @@ function closeServer(server: ReturnType<typeof createServer>): Promise<void> {
 export async function createModelTestProxy(
   baseUrl: string,
   options: { signal?: AbortSignal; expectedModel: string; maxOutputTokens: number },
-): Promise<{ baseUrl: string; evidence(): ModelTestProxyEvidence; close(): Promise<void> }> {
+): Promise<{
+  baseUrl: string;
+  attempt(): ModelTestProxyAttempt;
+  evidence(): ModelTestProxyEvidence;
+  close(): Promise<void>;
+}> {
   let attempted = false;
   let upstreamRequests = 0;
+  let responseCompleted = false;
   let evidence: ModelTestProxyEvidence | null = null;
   const server = createServer(async (req, res) => {
     if (attempted) return json(res, 400, { error: { message: "Model connection test permits one upstream request" } });
@@ -525,6 +537,7 @@ export async function createModelTestProxy(
         options.maxOutputTokens,
         new URL(req.url ?? "/", "http://127.0.0.1").pathname.endsWith("/messages"),
       );
+      responseCompleted = true;
       evidence = observed ? { ...observed, requestedModel: options.expectedModel, upstreamRequests } : null;
       res.end();
     } catch {
@@ -544,6 +557,7 @@ export async function createModelTestProxy(
   }
   return {
     baseUrl: `http://127.0.0.1:${address.port}`,
+    attempt: () => ({ upstreamRequests, responseCompleted, ...(evidence ? { evidence } : {}) }),
     evidence: () => {
       if (!isValidModelTestProxyEvidence(evidence, options.expectedModel, options.maxOutputTokens)) {
         throw new Error("model test response evidence did not match the requested model");

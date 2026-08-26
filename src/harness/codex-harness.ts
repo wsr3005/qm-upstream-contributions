@@ -16,6 +16,8 @@ import { parseSecurityScreenVerdict, SECURITY_SCREEN_SYSTEM_PROMPT } from "../se
 import { CodexAppServer, CodexRpcError } from "./codex-app-server.ts";
 import {
   defineHarness,
+  HarnessModelTestError,
+  modelTestError,
   type Harness,
   type HarnessModelTestInput,
   type HarnessTurnInput,
@@ -1127,20 +1129,41 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
       testModel: async (input) => {
         if (!input.customProvider)
           throw new NonRetryableTurnError("Codex model test requires a custom provider snapshot");
+        const controller = new AbortController();
         const proxy = await createModelTestProxy(input.customProvider.spec.baseUrl, {
-          ...(input.signal ? { signal: input.signal } : {}),
+          signal: controller.signal,
           expectedModel: input.expectedUpstreamModel,
           maxOutputTokens: input.maxOutputTokens,
         });
+        let timer: NodeJS.Timeout | undefined;
+        let runtimeReservation: string | undefined;
         try {
           const customProvider = {
             ...input.customProvider,
             spec: { ...input.customProvider.spec, baseUrl: proxy.baseUrl },
           };
+          const selected = customProvider.spec.models.find((candidate) => candidate.id === input.model);
+          if (!selected) throw new HarnessModelTestError("runtime_startup_failed", proxy.attempt());
+          const binding: CodexCustomProviderBinding = {
+            id: customProvider.spec.id,
+            name: customProvider.spec.name,
+            baseUrl: customProvider.spec.baseUrl,
+            apiKey: customProvider.apiKey,
+            modelId: selected.upstreamId?.trim() || selected.id,
+          };
+          const runtimeSpec = codexCustomRuntimeSpec(opts.env ?? {}, binding, true);
+          runtimeReservation = runtimeSpec.key;
+          reservations.set(runtimeSpec.key, (reservations.get(runtimeSpec.key) ?? 0) + 1);
+          try {
+            await ensureRuntime({ ...runtimeSpec, providerBaseUrl: binding.baseUrl });
+          } catch {
+            throw new HarnessModelTestError("runtime_startup_failed", proxy.attempt());
+          }
+          timer = setTimeout(() => controller.abort(), input.requestTimeoutMs);
           const reply = await single(
             input.systemPrompt,
             input.prompt,
-            input.signal,
+            controller.signal,
             undefined,
             input.model,
             true,
@@ -1151,7 +1174,12 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
             maxOutputTokens: input.maxOutputTokens,
             evidence: proxy.evidence(),
           };
+        } catch (error) {
+          if (error instanceof HarnessModelTestError) throw error;
+          throw modelTestError(controller.signal, proxy.attempt());
         } finally {
+          if (timer) clearTimeout(timer);
+          if (runtimeReservation) await releaseReservation(runtimeReservation);
           await proxy.close();
         }
       },

@@ -13,7 +13,7 @@ import type { OverheardEntryPayload } from "./replay.ts";
 import type { ToolContext } from "../tools/primitives.ts";
 import type { SecurityScreenVerdict } from "../security/security-posture.ts";
 import type { CustomProviderSpec } from "../model/custom-providers.ts";
-import type { ModelTestProxyEvidence } from "./model-test-proxy.ts";
+import type { ModelTestProxyAttempt, ModelTestProxyEvidence } from "./model-test-proxy.ts";
 
 interface HarnessImage {
   mimeType: string;
@@ -180,11 +180,34 @@ export interface HarnessModelTestInput {
   maxOutputTokens: number;
   systemPrompt: string;
   prompt: string;
-  signal?: AbortSignal;
+  requestTimeoutMs: number;
   customProvider?: {
     spec: CustomProviderSpec;
     apiKey: string;
   };
+}
+
+export type HarnessModelTestFailureCategory =
+  "runtime_startup_failed" | "request_timeout" | "provider_request_failed" | "response_verification_failed";
+
+export class HarnessModelTestError extends Error {
+  readonly category: HarnessModelTestFailureCategory;
+  readonly attempt: ModelTestProxyAttempt;
+
+  constructor(category: HarnessModelTestFailureCategory, attempt: ModelTestProxyAttempt) {
+    super(category);
+    this.name = "HarnessModelTestError";
+    this.category = category;
+    this.attempt = attempt;
+  }
+}
+
+export function modelTestError(signal: AbortSignal, attempt: ModelTestProxyAttempt): HarnessModelTestError {
+  let category: HarnessModelTestFailureCategory = "runtime_startup_failed";
+  if (signal.aborted) category = "request_timeout";
+  else if (attempt.responseCompleted) category = "response_verification_failed";
+  else if (attempt.upstreamRequests > 0) category = "provider_request_failed";
+  return new HarnessModelTestError(category, attempt);
 }
 
 export interface HarnessModelTestResult {

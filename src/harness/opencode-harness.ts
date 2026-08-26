@@ -21,6 +21,8 @@ import { NonRetryableTurnError } from "../core/turn-error.ts";
 import {
   defineHarness,
   envelopeWithoutMessages,
+  HarnessModelTestError,
+  modelTestError,
   type Harness,
   type HarnessModelTestInput,
   type HarnessTurnInput,
@@ -1299,21 +1301,33 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
       testModel: async (input) => {
         if (!input.customProvider)
           throw new NonRetryableTurnError("OpenCode model test requires a custom provider snapshot");
+        const controller = new AbortController();
         const proxy = await createModelTestProxy(input.customProvider.spec.baseUrl, {
-          ...(input.signal ? { signal: input.signal } : {}),
+          signal: controller.signal,
           expectedModel: input.expectedUpstreamModel,
           maxOutputTokens: input.maxOutputTokens,
         });
+        let timer: NodeJS.Timeout | undefined;
+        let runtimeReservation: string | undefined;
         try {
           const customProvider = {
             ...input.customProvider,
             spec: { ...input.customProvider.spec, baseUrl: proxy.baseUrl },
           };
+          const runtimeSpec = await resolveRuntimeSpec(customProvider, false);
+          runtimeReservation = runtimeSpec.key;
+          reservations.set(runtimeSpec.key, (reservations.get(runtimeSpec.key) ?? 0) + 1);
+          try {
+            await ensureRuntime(runtimeSpec);
+          } catch {
+            throw new HarnessModelTestError("runtime_startup_failed", proxy.attempt());
+          }
+          timer = setTimeout(() => controller.abort(), input.requestTimeoutMs);
           const reply = await single(
             input.systemPrompt,
             input.prompt,
             undefined,
-            input.signal,
+            controller.signal,
             input.model,
             customProvider,
             false,
@@ -1323,7 +1337,12 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
             maxOutputTokens: input.maxOutputTokens,
             evidence: proxy.evidence(),
           };
+        } catch (error) {
+          if (error instanceof HarnessModelTestError) throw error;
+          throw modelTestError(controller.signal, proxy.attempt());
         } finally {
+          if (timer) clearTimeout(timer);
+          if (runtimeReservation) await releaseReservation(runtimeReservation);
           await proxy.close();
         }
       },

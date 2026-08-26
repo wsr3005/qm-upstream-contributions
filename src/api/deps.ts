@@ -67,7 +67,7 @@ export type CustomProviderHarnessTestRunner = (input: {
   harnessId: CustomProviderTestHarness;
   expectedRevision: number;
   rolloutFence: string;
-  signal: AbortSignal;
+  requestTimeoutMs: number;
   draft?: { provider: CustomProviderSpec; apiKey: string };
 }) => Promise<{
   reply?: string;

@@ -13,7 +13,7 @@ import { setCustomProviders } from "../src/model/custom-providers.ts";
 
 const realOpenCodeBinary = resolve(import.meta.dirname, "../node_modules/.bin/opencode");
 
-function fakeSidecar(dir: string, name: string, handlers: string): string {
+function fakeSidecar(dir: string, name: string, handlers: string, startupDelayMs = 0): string {
   const script = join(dir, `${name}.js`);
   writeFileSync(
     script,
@@ -35,7 +35,7 @@ const server = http.createServer(async (req, res) => {
   ${handlers}
   return json(res, {});
 });
-server.listen(port, "127.0.0.1", () => console.log("opencode server listening on http://127.0.0.1:" + port));
+setTimeout(() => server.listen(port, "127.0.0.1", () => console.log("opencode server listening on http://127.0.0.1:" + port)), ${startupDelayMs});
 `,
   );
   const bin = join(dir, name);
@@ -76,6 +76,66 @@ const okAssistant = `{
   },
   parts: [{ id: "prt_1", sessionID: "ses_main", messageID: "msg_1", type: "text", text: "hello from fake" }],
 }`;
+
+test("OpenCode starts the paid request deadline after a cold custom runtime is ready", async (t) => {
+  const upstream = createServer(async (req, res) => {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    const payload = JSON.parse(body) as { model?: string };
+    assert.equal(payload.model, "upstream-luna");
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end(
+      `data: ${JSON.stringify({ type: "response.output_text.delta", delta: "ready", model: "upstream-luna" })}\n\ndata: ${JSON.stringify({ type: "response.completed", response: { model: "upstream-luna", usage: { input_tokens: 5, output_tokens: 1, total_tokens: 6 } } })}\n\ndata: [DONE]\n\n`,
+    );
+  });
+  await new Promise<void>((resolveListen) => upstream.listen(0, "127.0.0.1", resolveListen));
+  const upstreamAddress = upstream.address() as AddressInfo;
+  const dir = mkdtempSync(join(tmpdir(), "qm-opencode-model-test-"));
+  const handlers = `
+  if (req.method === "POST" && message) {
+    await readBody(req);
+    const config = JSON.parse(process.env.OPENCODE_CONFIG_CONTENT);
+    const provider = config.provider.enterprise;
+    const response = await fetch(provider.options.baseURL + "/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer " + provider.options.apiKey },
+      body: JSON.stringify({ model: "upstream-luna", stream: true, max_output_tokens: 128, input: "ping" }),
+    });
+    await response.text();
+    return json(res, ${okAssistant});
+  }
+  if (req.method === "GET" && message) return json(res, [${okAssistant}]);
+`;
+  const harness = createOpenCodeHarness({ binaryPath: fakeSidecar(dir, "cold-model-test", handlers, 150) });
+  t.after(async () => {
+    await harness.turns.close?.();
+    await new Promise<void>((resolveClose) => upstream.close(() => resolveClose()));
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const startedAt = Date.now();
+  const result = await harness.models.testModel!({
+    model: "enterprise/luna",
+    expectedUpstreamModel: "upstream-luna",
+    maxOutputTokens: 128,
+    systemPrompt: "test",
+    prompt: "ping",
+    requestTimeoutMs: 100,
+    customProvider: {
+      apiKey: "secret",
+      spec: {
+        id: "enterprise",
+        name: "Enterprise",
+        protocol: "openai-responses",
+        baseUrl: `http://127.0.0.1:${upstreamAddress.port}`,
+        models: [{ id: "enterprise/luna", upstreamId: "upstream-luna" }],
+      },
+    },
+  });
+  assert.ok(Date.now() - startedAt >= 150);
+  assert.equal(result.reply, "hello from fake");
+  assert.equal(result.evidence?.upstreamRequests, 1);
+  assert.equal(result.evidence?.responseModel, "upstream-luna");
+});
 
 function turnInput(entries: SessionEntry[], llmRows: HarnessLlmRequestRecord[]): HarnessTurnInput {
   const scope = { kind: "org", id: "test" } as unknown as ScopeId;

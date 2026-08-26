@@ -1019,7 +1019,7 @@ export function buildApp(
       maxOutputTokens: MODEL_TEST_MAX_OUTPUT_TOKENS,
       systemPrompt: "You are testing a model connection for an organization administrator. Do not use tools.",
       prompt: "Reply with a short confirmation that the model connection works.",
-      signal: input.signal,
+      requestTimeoutMs: input.requestTimeoutMs,
       customProvider: { spec: active.provider, apiKey: active.apiKey },
     });
     const finalState = input.draft

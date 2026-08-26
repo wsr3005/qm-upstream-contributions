@@ -26,6 +26,7 @@ import {
   type CustomProviderTestRunResponse,
 } from "../../../model/custom-provider-test-runs.ts";
 import { isValidModelTestProxyEvidence, MODEL_TEST_MAX_OUTPUT_TOKENS } from "../../../harness/model-test-proxy.ts";
+import { HarnessModelTestError } from "../../../harness/harness.ts";
 import {
   customProviderTestReservationFingerprint,
   parseCustomProviderTestReservation,
@@ -488,7 +489,7 @@ export async function testCustomProvider(ctx: ApiCtx): Promise<void> {
       harnessId: testHarness,
       expectedRevision: revision,
       rolloutFence,
-      signal: AbortSignal.timeout(60_000),
+      requestTimeoutMs: 60_000,
       ...(draft ? { draft } : {}),
     });
     const finalState = draft
@@ -571,7 +572,11 @@ export async function testCustomProvider(ctx: ApiCtx): Promise<void> {
           };
     }
   } catch (error) {
-    const audited = await recordResult("failed");
+    const failureMetrics =
+      error instanceof HarnessModelTestError
+        ? ` failureCategory=${error.category} upstreamRequests=${error.attempt.upstreamRequests} usageAvailable=${Boolean(error.attempt.evidence?.usage)}`
+        : "";
+    const audited = await recordResult("failed", undefined, failureMetrics);
     if (!audited) {
       response = {
         status: 503,
@@ -599,6 +604,13 @@ export async function testCustomProvider(ctx: ApiCtx): Promise<void> {
         body: {
           error: "provider_test_failed",
           message: `${testHarness} could not complete the saved model request`,
+          ...(error instanceof HarnessModelTestError
+            ? {
+                failureCategory: error.category,
+                upstreamRequests: error.attempt.upstreamRequests,
+                ...(error.attempt.evidence ? { usage: error.attempt.evidence.usage } : {}),
+              }
+            : {}),
         },
       };
     }
