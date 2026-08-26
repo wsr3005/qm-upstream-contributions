@@ -231,6 +231,31 @@ test("OpenCode request timeout aborts a hung prompt after session setup", async 
   assert.ok(Date.now() - startedAt < 1_000);
 });
 
+test("OpenCode returns a stopped turn when user cancellation aborts a prompt request", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-opencode-user-cancel-"));
+  const promptStarted = join(dir, "prompt-started");
+  const harness = createOpenCodeHarness({
+    binaryPath: fakeSidecar(
+      dir,
+      "user-cancel",
+      `if (req.method === "POST" && message) {
+        await readBody(req);
+        require("node:fs").writeFileSync(${JSON.stringify(promptStarted)}, message[1]);
+        await new Promise(() => {});
+      }`,
+    ),
+  });
+  t.after(async () => {
+    await harness.turns.close?.();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const cancel = new AbortController();
+  const pending = harness.turns.runTurn({ ...turnInput([], []), cancel: cancel.signal });
+  while (!existsSync(promptStarted)) await new Promise((resolveWait) => setTimeout(resolveWait, 5));
+  cancel.abort();
+  assert.deepEqual(await pending, { reply: "", stopped: true });
+});
+
 function turnInput(entries: SessionEntry[], llmRows: HarnessLlmRequestRecord[]): HarnessTurnInput {
   const scope = { kind: "org", id: "test" } as unknown as ScopeId;
   const session = { id: "session-1" } as Session;

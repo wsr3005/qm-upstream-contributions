@@ -1234,6 +1234,10 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
         modelCalls: state.captures.length,
         ...(tapeWriteFailed ? { tapeWriteFailed: true } : {}),
       };
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError" && (turn.cancel?.aborted || state.stopped))
+        return { reply: "", stopped: true };
+      throw error;
     } finally {
       if (timer) clearTimeout(timer);
       if (!signalsStopped) await stopSignals?.();
