@@ -128,6 +128,11 @@ test("sanitizeTitle rejects reply-shaped output instead of truncating it into a 
   assert.equal(sanitizeTitle("Title: Title: Title: Title: Title: NONE"), undefined);
   assert.equal(sanitizeTitle("Title: ***Verify Harness long turns***"), undefined);
   assert.equal(sanitizeTitle("Title: ~~Verify Harness long turns~~"), undefined);
+  assert.equal(sanitizeTitle("#123 release regression"), "#123 release regression");
+  assert.equal(sanitizeTitle("Upgrade C#"), "Upgrade C#");
+  assert.equal(sanitizeTitle("_internal API migration"), "_internal API migration");
+  assert.equal(sanitizeTitle("~/config migration"), "~/config migration");
+  assert.equal(sanitizeTitle("Match glob*"), "Match glob*");
   assert.equal(sanitizeTitle('"__NONE__"'), undefined);
   assert.equal(sanitizeTitle("*****"), undefined);
   assert.equal(sanitizeTitle("_____"), undefined);
