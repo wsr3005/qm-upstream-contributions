@@ -397,6 +397,8 @@ export function sanitizeTitle(out: string | undefined): string | undefined {
   }
   t = t.replace(/[\s.,;:!?]+$/g, "").trim();
   if (!t || /^none$/i.test(t) || /^[#*_`~\s-]+$/.test(t)) return undefined;
+  if (/^(?:title|chat title)\s*[:-]\s*/i.test(t)) return undefined;
+  if (/^[#*_`~]|[#*_`~]$/.test(t)) return undefined;
   // Reject reply-shaped output — the model answered the transcript instead of titling it.
   if (t.length > 90 || t.split(/\s+/).length > 12) return undefined;
   if (/\*\*|__|^#/.test(t)) return undefined;
