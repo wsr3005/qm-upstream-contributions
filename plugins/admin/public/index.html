@@ -4057,6 +4057,26 @@
                 <button id="custom-provider-test" disabled>Run paid Harness test</button
                 ><span class="status" id="st-custom-provider-test" role="status" aria-live="polite"></span>
               </div>
+              <details class="body setup-form">
+                <summary>Formal acceptance receipt</summary>
+                <label
+                  >Reserved budget receipt
+                  <textarea
+                    id="custom-provider-test-receipt"
+                    rows="5"
+                    spellcheck="false"
+                    placeholder="Paste the JSON emitted by reserve-browser"
+                    disabled
+                  ></textarea>
+                </label>
+                <p class="muted">
+                  Imports one short-lived, candidate-bound receipt into this browser after checking its Harness,
+                  Provider, model, revision, storage key, and timestamps. Importing does not call the model.
+                </p>
+                <div class="foot custom-provider-test-foot">
+                  <button id="custom-provider-test-receipt-import" disabled>Import receipt</button>
+                </div>
+              </details>
             </section>
           </div>
 
@@ -7687,6 +7707,86 @@
           target.providerRevision ?? target.providerUpdatedAt,
         ]);
       }
+      async function importCustomProviderTestReceipt(text) {
+        let receipt;
+        try {
+          receipt = JSON.parse(text);
+        } catch {
+          throw new Error("The receipt is not valid JSON.");
+        }
+        if (
+          receipt?.schemaVersion !== "qm-model-test-browser-receipt-v2" ||
+          !/^[a-z0-9][a-z0-9-]{0,79}$/.test(receipt.runAlias || "") ||
+          !/^[0-9a-f]{40}$/.test(receipt.candidateCommit || "") ||
+          !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(receipt.budgetRequestId || "") ||
+          !/^qa-[0-9a-f]{64}$/.test(receipt.requestId || "") ||
+          !["pi", "opencode", "codex"].includes(receipt.harness) ||
+          typeof receipt.selectionModelId !== "string" ||
+          typeof receipt.upstreamModelId !== "string" ||
+          typeof receipt.storageKey !== "string" ||
+          !receipt.value
+        ) {
+          throw new Error("The receipt is incomplete or has an unsupported format.");
+        }
+        const requestDigest = await crypto.subtle.digest(
+          "SHA-256",
+          new TextEncoder().encode(`browser:${receipt.candidateCommit}:${receipt.runAlias}:${receipt.budgetRequestId}`),
+        );
+        const expectedRequestId =
+          "qa-" + Array.from(new Uint8Array(requestDigest), (value) => value.toString(16).padStart(2, "0")).join("");
+        if (receipt.requestId !== expectedRequestId) {
+          throw new Error("The receipt request ID is not bound to its candidate and budget reservation.");
+        }
+        const targetIndex = customProviderTestTargets.findIndex(
+          (target) => !target.draft && target.modelId === receipt.selectionModelId,
+        );
+        const target = customProviderTestTargets[targetIndex];
+        if (!target) throw new Error("The receipt does not match a saved model on this page.");
+        if (receipt.harness === "codex" && target.protocol !== "openai-responses") {
+          throw new Error("The receipt Harness is not supported by the saved Provider protocol.");
+        }
+        if (receipt.upstreamModelId !== (target.upstreamModelId || target.modelId)) {
+          throw new Error("The receipt upstream model does not match the saved model.");
+        }
+        const expectedIdentity = customProviderTestIdentity(target, receipt.harness);
+        const expectedStorageKey = customProviderTestRetryKey(target, receipt.harness);
+        const value = receipt.value;
+        if (
+          value.identity !== expectedIdentity ||
+          value.requestId !== receipt.requestId ||
+          receipt.storageKey !== expectedStorageKey ||
+          !Number.isFinite(value.createdAt) ||
+          value.createdAt > Date.now() ||
+          !Number.isFinite(value.expiresAt) ||
+          value.expiresAt <= Date.now() ||
+          value.expiresAt - value.createdAt > CUSTOM_PROVIDER_TEST_RETRY_TTL_MS ||
+          value.retryAt !== value.createdAt
+        ) {
+          throw new Error("The receipt does not match the selected Harness target or is no longer valid.");
+        }
+        const existing = readCustomProviderTestRetry(expectedIdentity, target, receipt.harness);
+        if (!customProviderTestStorageAvailable) {
+          throw new Error("The existing request receipt could not be read safely in this browser.");
+        }
+        if (existing && existing.requestId !== receipt.requestId) {
+          throw new Error("A different paid request receipt is already active for this Harness target.");
+        }
+        const retry = { ...value, storageKey: receipt.storageKey };
+        if (!persistCustomProviderTestRetry(retry)) {
+          throw new Error("The receipt could not be stored and verified in this browser.");
+        }
+        const verified = readCustomProviderTestRetry(expectedIdentity, target, receipt.harness);
+        if (!verified || verified.requestId !== receipt.requestId) {
+          throw new Error("The stored receipt could not be read back exactly.");
+        }
+        $("custom-provider-test-model").value = String(targetIndex);
+        syncCustomProviderTestHarnesses();
+        $("custom-provider-test-harness").value = receipt.harness;
+        customProviderTestRetry = verified;
+        customProviderTestBlockedRetry = null;
+        syncCustomProviderTestControls();
+        return receipt;
+      }
       function customProviderTestRetryBlocked() {
         const target = customProviderTestTargets[Number($("custom-provider-test-model").value)];
         if (!target || !customProviderTestBlockedRetry) return false;
@@ -7759,6 +7859,8 @@
         $("custom-provider-test").disabled = unavailable || running || customProviderTestRetryBlocked();
         $("custom-provider-test-model").disabled = unavailable || running;
         $("custom-provider-test-harness").disabled = unavailable || running;
+        $("custom-provider-test-receipt").disabled = unavailable || running;
+        $("custom-provider-test-receipt-import").disabled = unavailable || running;
         [
           "custom-provider-id",
           "custom-provider-name",
@@ -8103,6 +8205,21 @@
         clearCustomProviderTestResult();
         restoreCustomProviderTestRetry();
         syncCustomProviderTestControls();
+      };
+      $("custom-provider-test-receipt-import").onclick = async () => {
+        try {
+          const receipt = await importCustomProviderTestReceipt($("custom-provider-test-receipt").value.trim());
+          $("custom-provider-test-receipt").value = "";
+          showCustomProviderTestStatus(
+            "Formal " + receipt.harness + " receipt imported. Running the test may incur one model charge.",
+            "ok",
+          );
+        } catch (error) {
+          showCustomProviderTestStatus(
+            error instanceof Error ? error.message : "The receipt could not be imported.",
+            "err",
+          );
+        }
       };
       [
         "custom-provider-id",

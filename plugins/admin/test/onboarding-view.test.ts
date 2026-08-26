@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash, webcrypto } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
@@ -206,6 +207,8 @@ function createCustomProviderUi(
   });
   harnessSelect.value = "pi";
   element("custom-provider-test", "button").disabled = true;
+  element("custom-provider-test-receipt", "textarea").disabled = true;
+  element("custom-provider-test-receipt-import", "button").disabled = true;
   element("custom-provider-rows", "tbody");
   element("custom-provider-empty");
   element("custom-provider-save", "button");
@@ -226,7 +229,9 @@ function createCustomProviderUi(
   const context = vm.createContext({
     $: (id: string) => element(id),
     api: (method: string, path: string, body?: unknown) => apiHandler(method, path, body),
-    crypto: { randomUUID: () => `request-${++nextFakeRequestId}` },
+    crypto: { randomUUID: () => `request-${++nextFakeRequestId}`, subtle: webcrypto.subtle },
+    TextEncoder,
+    Uint8Array,
     confirm: () => true,
     document: { createElement: (tagName: string) => fakeElement(tagName) },
     localStorage: {
@@ -287,6 +292,8 @@ function createCustomProviderUi(
     modelSelect,
     harnessSelect,
     testButton: element("custom-provider-test"),
+    receiptInput: element("custom-provider-test-receipt"),
+    receiptImport: element("custom-provider-test-receipt-import"),
     providerSave: element("custom-provider-save"),
     providerInputs: [
       element("custom-provider-id"),
@@ -687,6 +694,9 @@ test("custom provider setup exposes an explicit paid generation test", () => {
   assert.match(html, /Automatic provider retries are\s+disabled/);
   assert.match(html, /Each click starts a new test/);
   assert.match(html, /same durable request receipt for five minutes without another model charge/);
+  assert.match(html, /id="custom-provider-test-receipt"/);
+  assert.match(html, /id="custom-provider-test-receipt-import" disabled>Import receipt/);
+  assert.match(html, /Importing does not call the model/);
   assert.match(html, /modelId: target\.modelId,\s*harness,\s*requestId,/);
   assert.match(html, /id="st-custom-provider"\s+role="status"\s+aria-live="polite"\s+aria-atomic="true"/);
   assert.match(html, /id="st-custom-provider-test" role="status" aria-live="polite"/);
@@ -717,6 +727,96 @@ test("custom provider current form tests the default gpt-5.6-luna model before s
     models: [{ id: "gpt-5.6-luna", name: "GPT 5.6 Luna" }],
   });
   assert.match(harness.testStatus.textContent, /Gateway endpoint · pi · gpt-5\.6-luna/);
+});
+
+test("a formal browser receipt imports only after exact target and storage verification", async () => {
+  const retryStorage = new Map<string, string>();
+  const provider = {
+    ...customProvider(1),
+    models: [{ id: "gateway/gpt-5.6-luna", upstreamId: "gpt-5.6-luna" }],
+  };
+  const harness = createCustomProviderUi(async () => ({ ok: true, data: { providers: [provider] } }), retryStorage);
+  await harness.ui.loadCustomProviders();
+  const createdAt = Date.now();
+  const candidateCommit = "a".repeat(40);
+  const runAlias = "base-v36";
+  const budgetRequestId = "admin-pi";
+  const requestId = `qa-${createHash("sha256")
+    .update(`browser:${candidateCommit}:${runAlias}:${budgetRequestId}`)
+    .digest("hex")}`;
+  const storageKey = ["qm-custom-provider-test-retry", "org:acme", "gateway", "gateway/gpt-5.6-luna", "pi"]
+    .map(encodeURIComponent)
+    .join(":");
+  harness.receiptInput.value = JSON.stringify({
+    schemaVersion: "qm-model-test-browser-receipt-v2",
+    runAlias,
+    candidateCommit,
+    budgetRequestId,
+    requestId,
+    harness: "pi",
+    selectionModelId: "gateway/gpt-5.6-luna",
+    upstreamModelId: "gpt-5.6-luna",
+    storageKey,
+    value: {
+      identity: JSON.stringify(["gateway", "gateway/gpt-5.6-luna", "pi", "openai-responses", 1]),
+      requestId,
+      createdAt,
+      expiresAt: createdAt + 300_000,
+      retryAt: createdAt,
+    },
+  });
+
+  await harness.receiptImport.onclick?.();
+
+  assert.equal(harness.receiptInput.value, "");
+  assert.equal(harness.modelSelect.value, "0");
+  assert.equal(harness.harnessSelect.value, "pi");
+  assert.equal(JSON.parse(retryStorage.get(storageKey) || "null").requestId, requestId);
+  assert.match(harness.testStatus.textContent, /Formal pi receipt imported/);
+  assert.equal(harness.testButton.disabled, false);
+});
+
+test("a formal browser receipt rejects a mismatched provider revision without storage", async () => {
+  const retryStorage = new Map<string, string>();
+  const provider = {
+    ...customProvider(1),
+    models: [{ id: "gateway/gpt-5.6-luna", upstreamId: "gpt-5.6-luna" }],
+  };
+  const harness = createCustomProviderUi(async () => ({ ok: true, data: { providers: [provider] } }), retryStorage);
+  await harness.ui.loadCustomProviders();
+  const createdAt = Date.now();
+  const candidateCommit = "a".repeat(40);
+  const runAlias = "base-v36";
+  const budgetRequestId = "admin-pi";
+  const requestId = `qa-${createHash("sha256")
+    .update(`browser:${candidateCommit}:${runAlias}:${budgetRequestId}`)
+    .digest("hex")}`;
+  const storageKey = ["qm-custom-provider-test-retry", "org:acme", "gateway", "gateway/gpt-5.6-luna", "pi"]
+    .map(encodeURIComponent)
+    .join(":");
+  harness.receiptInput.value = JSON.stringify({
+    schemaVersion: "qm-model-test-browser-receipt-v2",
+    runAlias,
+    candidateCommit,
+    budgetRequestId,
+    requestId,
+    harness: "pi",
+    selectionModelId: "gateway/gpt-5.6-luna",
+    upstreamModelId: "gpt-5.6-luna",
+    storageKey,
+    value: {
+      identity: JSON.stringify(["gateway", "gateway/gpt-5.6-luna", "pi", "openai-responses", 2]),
+      requestId,
+      createdAt,
+      expiresAt: createdAt + 300_000,
+      retryAt: createdAt,
+    },
+  });
+
+  await harness.receiptImport.onclick?.();
+
+  assert.equal(retryStorage.size, 0);
+  assert.match(harness.testStatus.textContent, /does not match the selected Harness target/);
 });
 
 test("custom providers load once when an unrelated onboarding request fails", async () => {
