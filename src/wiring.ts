@@ -435,11 +435,18 @@ export function buildApp(
   if (config.modelTestCandidateCommit && !/^[a-f0-9]{40}$/.test(config.modelTestCandidateCommit)) {
     throw new Error("MODEL_TEST_CANDIDATE_COMMIT must be a full commit SHA");
   }
-  const reusedModelTestSecret = [config.signingSecret, config.capabilitySecret, config.portalIdentitySecret].some(
-    (value) => value && value === config.modelTestReservationSecret,
-  );
+  const reusedModelTestSecret = [
+    ["CORE_SIGNING_SECRET", config.signingSecret],
+    ["CAPABILITY_SECRET", config.capabilitySecret],
+    ["PORTAL_IDENTITY_SECRET", config.portalIdentitySecret],
+    ["CONNECTOR_SECRET_KEY", config.connectorSecretKey],
+    ["SKILL_SIGNING_SECRET", config.skillSigningSecret],
+    ["SLACK_SIGNING_SECRET", config.slack?.signingSecret],
+    ["AWS_DEPLOY_GATE_SECRET", config.awsDeploy.gateSecret],
+    ["DEPLOY_APPS_SESSION_SECRET", config.deployAppsSessionSecret],
+  ].find(([, value]) => config.modelTestReservationSecret && value === config.modelTestReservationSecret)?.[0];
   if (reusedModelTestSecret) {
-    throw new Error("MODEL_TEST_RESERVATION_SECRET must differ from runtime authentication secrets");
+    throw new Error(`MODEL_TEST_RESERVATION_SECRET must differ from ${reusedModelTestSecret}`);
   }
   configurePgCaTrust({
     ...(config.databaseCaCert ? { cert: config.databaseCaCert } : {}),
@@ -449,6 +456,7 @@ export function buildApp(
     ["CORE_SIGNING_SECRET", config.signingSecret],
     ["CAPABILITY_SECRET", config.capabilitySecret],
     ["PORTAL_IDENTITY_SECRET", config.portalIdentitySecret],
+    ["MODEL_TEST_RESERVATION_SECRET", config.modelTestReservationSecret],
   ].find(([, value]) => config.connectorSecretKey && config.connectorSecretKey === value)?.[0];
   if (reusedConnectorKey) {
     throw new Error(`CONNECTOR_SECRET_KEY must differ from ${reusedConnectorKey}`);
