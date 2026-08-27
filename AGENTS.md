@@ -57,8 +57,11 @@ Two habits that keep task-focused changes from scarring the rest of the repo:
   `/dev-instance` skill and exercise it through a browser against the configured Slack
   development workspace before opening a PR. Do this Slack QA in **Firefox**, never the
   Slack Mac app, and don't ask permission first — do it on your own; don't wait to be
-  asked. Skip it for trivial refactors, docs, config, or pure-logic changes already
-  covered by tests.
+  asked. This is contributor verification for the shared upstream change. A private
+  deployment layer may define different product acceptance surfaces; complete both when
+  they apply, and never present upstream Slack QA as that deployment's product acceptance.
+  Skip it for trivial refactors, docs, config, or pure-logic changes already covered by
+  tests.
 - **Demo every front-end change in the PR.** Anything an operator or user sees
   rendered — admin/web/portal UI, Slack surfaces, emails — ships with a way for a
   reviewer to see the result without booting it. Prefer a link to a live demo app
@@ -73,9 +76,12 @@ Two habits that keep task-focused changes from scarring the rest of the repo:
 Organizations run qm from private forks of this repository. A private fork is a
 standalone private repository whose history begins as a clone of qm. Everything
 organization-specific is confined to `deploy/layers/<org>/`, and every file outside
-that directory, which these rules call core, stays byte-identical to upstream. Core
-here covers the plugins, the CLI, the docs, and CI as much as the runtime under
-`src/`. A private fork is created with a plain clone and never with
+that directory, which these rules call core, stays byte-identical to an allowed public
+source. That source is normally upstream. A deployment layer may explicitly record an
+immutable, independently reviewed public qm contribution commit or composite before it
+merges upstream; it may not create a private-only core commit. Core here covers the
+plugins, the CLI, the docs, and CI as much as the runtime under `src/`. A private fork is
+created with a plain clone and never with
 GitHub's fork feature, because a GitHub fork of a public repository cannot be made
 private and its commits stay fetchable by SHA from the public side. The README section
 "Customize your instance" gives the creation procedure.
@@ -84,11 +90,14 @@ Before you act, determine which repository this checkout is by running `git remo
 If `origin` points at `yc-software/qm`, you are in upstream qm. If `origin`
 points anywhere else, you are in a private fork, and five rules apply. Do not edit core;
 a change to core belongs in upstream qm, and the `upstream-pr` skill sends it there
-without leaking organization context. Keep every organization-specific file under
-`deploy/layers/<org>/`. Sync from upstream with the `update-qm` skill, which merges and
-never rebases. Pass `--repo` to every `gh` command, because `gh` may otherwise pick the
-upstream repository through the `upstream` remote and read or edit the wrong
-repository's pull requests. Never reference an upstream issue or pull request by number
+without leaking organization context. If a deployment uses a public contribution before
+merge, its layer must record the immutable public ref, independent review, and composition
+policy; the private branch must match that public source exactly and later sync must check
+equivalence. Keep every organization-specific file under `deploy/layers/<org>/`. Sync from
+upstream with the `update-qm` skill, which merges and never rebases. Pass `--repo` to every
+`gh` command, because `gh` may otherwise pick the upstream repository through the
+`upstream` remote and read or edit the wrong repository's pull requests. Never reference
+an upstream issue or pull request by number
 (`yc-software/qm#123`) in a fork's PRs, issues, comments, or commit messages: GitHub
 mirrors such mentions onto the referenced upstream item as a permanent timeline event,
 so the fork's existence and the mentioning title become visible to whoever GitHub
